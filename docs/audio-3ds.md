@@ -1,0 +1,13 @@
+# Native audio
+
+AssaultCube's existing sound scheduler, map sound definitions, voice commands, music fades and CubeScript hooks use the OpenAL entry points in `source/3ds/include/AL/`. The New 2DS/3DS backend implements those calls with one NDSP stereo PCM output. This leaves source priority and channel counts under the original scheduler. The mixer applies distance attenuation and listener orientation to mono effects and preserves stereo channels. It uses linear interpolation and a fixed point cursor for pitch, looping, queued playback and source offsets.
+
+NDSP plays up to two 640-frame blocks in sequence from a pool of three linear-memory buffers. At the DSP sample rate each block lasts about 19.6 ms, leaving headroom for the 16.7 ms frame interval. `alcProcessContext()` refills the output after the engine updates sound locations and the listener. Applet callbacks record a pause request, and the game thread applies it while retaining queued PCM. Application cleanup stops NDSP before releasing the PCM storage.
+
+On New 2DS/3DS, the PCM mixer can refill on ARM11 core 2. The game thread waits for the previous refill before changing or reading mixer state. Systems where the worker cannot start refill synchronously. In the eight-bot Venison fixture, the measured audio phase on the game thread fell from 6.680 ms to below 0.1 ms per frame in the latest runs. This measurement excludes mixer work on core 2.
+
+The build uses devkitPro's Tremor headers. Soundtrack playback queues two 16 KiB PCM chunks and decodes more as playback consumes them. Short Vorbis effects transfer their PCM allocation directly to the mixer. Long effects use lossless 4,096-frame blocks with a bounded decoded cache for mixing. The port releases ambient clips when map sound slots reset unless a general sound also uses the clip. The desktop audio layer uses its ordinary Vorbisfile and OpenAL libraries.
+
+The port calls libctru's `ndspInit()`. Libctru looks for the console's existing `sdmc:/3ds/dspfirm.cdc` and then for a component supplied by the homebrew loader through `hb:ndsp`. If initialization fails, AssaultCube uses its existing audio-disabled path.
+
+Mono panning is an approximation of desktop OpenAL spatialization. The audio interfaces cover the operations AssaultCube calls, and concurrent voices and decoded effects use CPU time and memory according to the active map and sound settings. Azahar initialized NDSP using DSP firmware and loaded map sounds during gameplay. Sound output, latency, music continuity across applet transitions, and the cost of mixing at the display refresh rate remain to be measured on New 2DS/3DS hardware.

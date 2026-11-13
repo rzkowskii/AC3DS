@@ -1,0 +1,10 @@
+/build*/
+/.deps/
+/romfs/
+/dist/
+*.elf
+*.3dsx
+*.smdh
+*.map
+*.shbin
+.DS_Store
