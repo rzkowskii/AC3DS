@@ -1419,6 +1419,7 @@ void ac3ds_install_handheld_menus()
 
         // Online play never pauses; this menu only runs ordinary client commands.
         newmenu "Match menu online"
+        menutitle "Match menu"
         menuitem "Resume" [ closecurmenu ]
         menuitem "Chat" [ closecurmenu; saycommand ]
         menuitem "Team chat" [ closecurmenu; key_teamchat ]
