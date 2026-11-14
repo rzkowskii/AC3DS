@@ -921,7 +921,8 @@ void gl_drawhud(int w, int h, int curfps, int nquads, int curvert, bool underwat
     playerent *targetplayer = playerincrosshair();
     bool menu = menuvisible();
 #ifdef __3DS__
-    bool handheldmenu = menu && ac3ds_menu_panel() == Ac3dsMenu::Standard;
+    // Handheld menus and the handheld server list draw last, over the HUD.
+    bool handheldmenu = menu && (ac3ds_menu_panel() == Ac3dsMenu::Standard || ac3ds_menu_panel() == Ac3dsMenu::ServerBrowser);
 #endif
     bool command = getcurcommand(NULL) ? true : false;
     bool reloading = lastmillis < p->weaponsel->reloading + p->weaponsel->info.reloadtime;

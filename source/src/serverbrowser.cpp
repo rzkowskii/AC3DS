@@ -1298,6 +1298,53 @@ void refreshservers(void *menu, bool init)
     }
 }
 
+#ifdef __3DS__
+// Handheld server browser: the rows the menu currently lists, in menu order,
+// for the top-screen list and the lower-screen card (menus.cpp, system.cpp).
+#include "ac3ds_servers.h"
+
+int ac3ds_server_rows(void *menu, Ac3dsServerRow *rows, int max, int &selected)
+{
+    selected = -1;
+    if(!menu) return 0;
+    const int sel = ((gmenu *)menu)->menusel;
+    serverinfo *curserver = getconnectedserverinfo();
+    int n = 0;
+    loopv(servers)
+    {
+        serverinfo &si = *servers[i];
+        if(si.menuline_to <= si.menuline_from) continue; // not listed
+        if(n >= max) break;
+        Ac3dsServerRow &r = rows[n];
+        r.item = si.menuline_from;
+        r.responded = si.address.host != ENET_HOST_ANY && si.ping != 9999;
+        r.compatible = si.protocol == PROTOCOL_VERSION;
+        filtertext(r.desc, si.sdesc[0] ? si.sdesc : si.name, FTXT_NOCOLOR, sizeof(r.desc) - 1);
+        copystring(r.map, si.map[0] ? si.map : "", sizeof(r.map));
+        copystring(r.mode, si.map[0] ? modestr(si.mode, true) : "", sizeof(r.mode));
+        formatstring(r.address)("%s:%d", si.name, si.port);
+        r.players = si.numplayers;
+        r.maxclients = si.maxclients;
+        r.ping = si.ping;
+        r.minremain = si.minremain;
+        r.full = si.numplayers >= si.maxclients;
+        r.password = (si.pongflags & (1 << PONGFLAG_PASSWORD)) != 0;
+        r.banned = ((si.pongflags >> PONGFLAG_BANNED) & 1) || ((si.pongflags >> PONGFLAG_BLACKLIST) & 1);
+        r.connected = &si == curserver;
+        if(sel >= si.menuline_from && sel < si.menuline_to) selected = n;
+        ++n;
+    }
+    return n;
+}
+
+int ac3ds_server_total() { return servers.length(); }
+const char *ac3ds_server_sort_name()
+{
+    static const char *const names[NUMSERVSORT] = { "ping", "players", "max players", "time left", "map", "mode", "IP", "name" };
+    return serversort >= 0 && serversort < NUMSERVSORT ? names[serversort] : "";
+}
+#endif
+
 bool serverskey(void *menu, int code, bool isdown)
 {
     int fk[] = { SDLK_1, SDLK_2, SDLK_3, SDLK_4, SDLK_5, SDLK_6, SDLK_7, SDLK_8, SDLK_9, SDLK_0 }, gogetem = 1;

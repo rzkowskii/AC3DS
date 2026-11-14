@@ -2017,6 +2017,8 @@ int main(int argc, char **argv)
 }
 
 #ifdef __3DS__
+// QA: tap the match screen at x y.
+COMMANDF(ac3dstap, "ii", (int *x, int *y) { extern void ac3ds_qa_tap(int, int); ac3ds_qa_tap(*x, *y); });
 // QA: save the lower screen as profile/screenshots/<name>.bmp
 COMMANDF(bottomshot, "s", (const char *name)
 {

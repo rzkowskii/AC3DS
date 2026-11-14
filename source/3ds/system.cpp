@@ -8,6 +8,7 @@
 #include "audio_3ds.h"
 #include "system.h"
 #include "crash_3ds.h"
+#include "ac3ds_servers.h"
 
 extern void pushevent(const SDL_Event &event);
 
@@ -850,28 +851,42 @@ namespace
 }
 
 // ---------------------------------------------------------------------------
-// Match screen: the lower screen during play. A rotating radar built from the
-// map's own GPU-rendered minimap fills the middle and doubles as the stylus
-// look area; large buttons sit along the top and bottom edges where thumbs and
-// the stylus reach them without covering the radar.
+// Match screen: the lower screen during play. The map fills the whole screen
+// and doubles as the stylus look area. Only the two actions players reach for
+// mid-fight sit on it (RELOAD top centre, GRENADE bottom centre), plus a small
+// MAP/RADAR toggle; everything else lives in a drawer that slides out from a
+// small tab in the top-left corner, so it is always reachable but never in
+// the way.
 namespace
 {
-    constexpr int hud_top_bar = 40, radar_top = 42, radar_bottom = 192, hud_bottom_bar = 196;
+    constexpr int radar_top = 0, radar_bottom = touch_height;
     struct HudButton { int x0, y0, x1, y1, code; const char *label; bool large; };
+    enum { HUD_MAPTOGGLE = 1 }; // local actions, not key codes
     const HudButton hud_buttons[] = {
-        {2, 2, 76, 38, KEYCODE_MATCHMENU, "MENU", false},
-        {80, 2, 240, 38, KEYCODE_RELOAD, "RELOAD", true},
-        {244, 2, 318, 38, KEYCODE_SCORES, "SCORES", false},
-        {2, hud_bottom_bar, 106, 238, KEYCODE_GRENADE, "GRENADE", false},
-        {108, hud_bottom_bar, 212, 238, KEYCODE_NEXTWEAPON, "WEAPON", false},
-        {214, hud_bottom_bar, 318, 238, KEYCODE_SCOPE, "SCOPE", false},
+        {100, 4, 220, 40, KEYCODE_RELOAD, "RELOAD", true},
+        {92, 200, 228, 236, KEYCODE_GRENADE, "GRENADE", true},
+        {262, 206, 316, 236, HUD_MAPTOGGLE, "MAP", false},
     };
     constexpr int hud_button_count = sizeof(hud_buttons) / sizeof(hud_buttons[0]);
 
-    // Vote strip across the top of the radar while a vote waits for this player.
+    // The drawer tab and its items.
+    const HudButton drawer_tab = {0, 4, 30, 40, 0, "", false};
+    constexpr int drawer_width = 124;
+    const HudButton drawer_items[] = {
+        {6, 48, 118, 88, KEYCODE_MATCHMENU, "MENU", false},
+        {6, 94, 118, 134, KEYCODE_SCORES, "SCORES", false},
+        {6, 140, 118, 180, KEYCODE_NEXTWEAPON, "WEAPON", false},
+        {6, 186, 118, 226, KEYCODE_CHAT, "CHAT", false},
+    };
+    constexpr int drawer_item_count = sizeof(drawer_items) / sizeof(drawer_items[0]);
+    bool drawer_open = false;
+    int drawer_offset = -drawer_width; // slides from -drawer_width (hidden) to 0
+    bool map_overview = false;          // whole map, north up, instead of the close radar
+
+    // Vote buttons below RELOAD while a vote waits for this player.
     const HudButton vote_buttons[] = {
-        {4, radar_top + 2, 158, radar_top + 32, KEYCODE_VOTEYES, "VOTE YES", false},
-        {162, radar_top + 2, 316, radar_top + 32, KEYCODE_VOTENO, "VOTE NO", false},
+        {4, 48, 158, 80, KEYCODE_VOTEYES, "VOTE YES", false},
+        {162, 48, 316, 80, KEYCODE_VOTENO, "VOTE NO", false},
     };
     u64 vote_shown_tick = 0;
     const void *vote_shown_for = NULL;
@@ -881,8 +896,8 @@ namespace
         return curvote && curvote->millis >= totalmillis && curvote->result == VOTE_NEUTRAL && !curvote->localplayervoted;
     }
 
-    // Touches are ignored briefly after the strip appears, so a tap meant for
-    // the radar cannot cast a vote by accident.
+    // Touches are ignored briefly after the vote buttons appear, so a tap meant
+    // for the map cannot cast a vote by accident.
     bool vote_armed()
     {
         if(!vote_pending()) { vote_shown_for = NULL; return false; }
@@ -890,7 +905,7 @@ namespace
         return svcGetSystemTick() - vote_shown_tick >= SYSCLOCK_ARM11 / 2;
     }
 
-    // Minimap copy from the GPU (RGB565, half the minimap texture size).
+    // Minimap copy from the GPU (RGB565).
     u16 *minimap_pixels = NULL;
     int minimap_w = 0, minimap_h = 0, minimap_wait = 0;
     bool minimap_request = false, minimap_valid = false;
@@ -898,15 +913,44 @@ namespace
     int staging_w = 0, staging_h = 0;
     float minimap_x0 = 0, minimap_y0 = 0, minimap_span = 1;
     u64 radar_drawn_tick = 0;
-    int pressed_hud_button = -1;
+    int pressed_hud_code = 0;
 
     const u16 radar_void = RGB565(1, 3, 2), hud_rvsf = RGB565(6, 26, 31), hud_cla = RGB565(31, 12, 8);
     const u16 hud_self = RGB565(31, 61, 10), hud_outline = RGB565(0, 0, 0);
+
+    inline bool hit(const HudButton &b, const touchPosition &t)
+    {
+        return t.px >= b.x0 && t.px < b.x1 && t.py >= b.y0 && t.py < b.y1;
+    }
 
     inline void plot(u16 *screen, int x, int y, u16 color)
     {
         if(x >= 0 && x < touch_width && y >= radar_top && y < radar_bottom)
             screen[x * touch_height + touch_height - 1 - y] = color;
+    }
+
+    // 50% blend toward a tint: translucent buttons keep the map visible.
+    void shade_rect(u16 *screen, int x0, int y0, int x1, int y1, u16 tint)
+    {
+        x0 = max(x0, 0); y0 = max(y0, 0); x1 = min(x1, touch_width); y1 = min(y1, touch_height);
+        const u16 half = (tint & 0xF7DE) >> 1;
+        for(int x = x0; x < x1; ++x)
+        {
+            u16 *column = screen + x * touch_height;
+            for(int y = y0; y < y1; ++y)
+            {
+                u16 &c = column[touch_height - 1 - y];
+                c = u16(((c & 0xF7DE) >> 1) + half);
+            }
+        }
+    }
+
+    void frame_rect(u16 *screen, int x0, int y0, int x1, int y1, u16 color)
+    {
+        fill_rect(screen, max(x0, 0), y0, x1, y0 + 2, color);
+        fill_rect(screen, max(x0, 0), y1 - 2, x1, y1, color);
+        if(x0 >= 0) fill_rect(screen, x0, y0, x0 + 2, y1, color);
+        fill_rect(screen, x1 - 2, y0, x1, y1, color);
     }
 
     void draw_dot(u16 *screen, int x, int y, int r, u16 color)
@@ -919,41 +963,86 @@ namespace
         }
     }
 
-    // Filled triangle for the local player, pointing up (forward).
-    void draw_self(u16 *screen, int cx, int cy)
+    // Player arrow pointing along screen angle `a` (0 = up), outlined.
+    void draw_arrow(u16 *screen, int cx, int cy, float a)
     {
-        for(int row = 0; row < 12; ++row)
+        const float c = cosf(a), s = sinf(a);
+        for(int pass = 0; pass < 2; ++pass)
         {
-            const int half = row / 2;
-            for(int i = -half - 1; i <= half + 1; ++i)
-                plot(screen, cx + i, cy - 6 + row, (i < -half || i > half) ? hud_outline : hud_self);
+            const float grow = pass ? 0.0f : 1.6f;
+            const u16 color = pass ? hud_self : hud_outline;
+            for(int row = 0; row < 13; ++row)
+            {
+                const float half = row * 0.5f + grow;
+                for(float i = -half; i <= half; i += 0.5f)
+                {
+                    const float lx = i, ly = row - 7.0f - grow * 0.5f; // tip at the top
+                    plot(screen, cx + int(lx * c - ly * s), cy + int(lx * s + ly * c), color);
+                }
+            }
         }
     }
 
     bool hud_button_enabled(int code)
     {
-        if(!player1 || player1->state != CS_ALIVE) return code == KEYCODE_MATCHMENU || code == KEYCODE_SCORES;
+        if(code == HUD_MAPTOGGLE || code == KEYCODE_MATCHMENU || code == KEYCODE_SCORES || code == KEYCODE_CHAT) return true;
+        if(!player1 || player1->state != CS_ALIVE) return false;
         const weapon *gun = player1->weaponsel;
         switch(code)
         {
             case KEYCODE_RELOAD: return gun && reloadable_gun(gun->type) && gun->ammo > 0 && gun->mag < gun->info.magsize;
             case KEYCODE_GRENADE: return player1->weapons[GUN_GRENADE] && player1->weapons[GUN_GRENADE]->mag > 0;
-            case KEYCODE_SCOPE: return gun && gun->type == GUN_SNIPER;
             default: return true;
         }
     }
 
-    void draw_hud_button(u16 *screen, const HudButton &b, bool enabled, bool active)
+    bool reloading_now()
     {
-        const u16 frame = active ? accent : enabled ? border : surface;
-        fill_rect(screen, b.x0, b.y0, b.x1, b.y1, frame);
-        fill_rect(screen, b.x0 + 2, b.y0 + 2, b.x1 - 2, b.y1 - 2, active ? RGB565(8, 22, 10) : surface);
+        if(!player1 || player1->state != CS_ALIVE || !player1->weaponsel) return false;
+        const weapon &gun = *player1->weaponsel;
+        return gun.reloading && lastmillis < gun.reloading + gun.info.reloadtime;
+    }
+
+    void draw_hud_button(u16 *screen, const HudButton &b, bool enabled, bool active, int dx = 0)
+    {
+        const int x0 = b.x0 + dx, x1 = b.x1 + dx;
+        if(x1 <= 0) return;
+        shade_rect(screen, x0 + 2, b.y0 + 2, x1 - 2, b.y1 - 2, active ? accent : RGB565(2, 6, 4));
+        frame_rect(screen, x0, b.y0, x1, b.y1, active ? accent : enabled ? border : surface);
         const u16 color = enabled ? text : muted;
-        const int len = int(strlen(b.label));
+        const char *label = b.code == HUD_MAPTOGGLE && map_overview ? "RADAR" : b.label;
+        const int len = int(strlen(label));
         if(b.large)
-            draw_label_large(screen, (b.x0 + b.x1 - 16 * len) / 2, (b.y0 + b.y1 - 16) / 2, b.label, color);
-        else
-            draw_label(screen, (b.x0 + b.x1 - 8 * len) / 2, (b.y0 + b.y1 - 8) / 2, b.label, color, b.x1);
+            draw_label_large(screen, (x0 + x1 - 16 * len) / 2, (b.y0 + b.y1 - 16) / 2, label, color);
+        else if(x0 >= 0)
+            draw_label(screen, (x0 + x1 - 8 * len) / 2, (b.y0 + b.y1 - 8) / 2, label, color, x1);
+    }
+
+    void draw_drawer(u16 *screen)
+    {
+        if(drawer_offset > -drawer_width)
+        {
+            shade_rect(screen, 0, 0, drawer_width + drawer_offset, touch_height, RGB565(1, 4, 2));
+            shade_rect(screen, 0, 0, drawer_width + drawer_offset, touch_height, RGB565(1, 4, 2));
+            fill_rect(screen, max(0, drawer_width + drawer_offset - 2), 0, max(0, drawer_width + drawer_offset), touch_height, border);
+            for(const HudButton &b : drawer_items)
+                draw_hud_button(screen, b, hud_button_enabled(b.code), pressed_hud_code == b.code, drawer_offset);
+        }
+        // Tab: three bars; rides inside the drawer's top-right corner when open.
+        const int tx = max(0, drawer_width + drawer_offset - 34);
+        HudButton tab = drawer_tab;
+        tab.x0 += tx; tab.x1 += tx;
+        shade_rect(screen, tab.x0, tab.y0, tab.x1, tab.y1, RGB565(2, 6, 4));
+        frame_rect(screen, tab.x0, tab.y0, tab.x1, tab.y1, drawer_open ? accent : border);
+        for(int k = 0; k < 3; ++k) fill_rect(screen, tab.x0 + 8, tab.y0 + 10 + k * 7, tab.x1 - 8, tab.y0 + 13 + k * 7, text);
+    }
+
+    bool tab_hit(const touchPosition &t)
+    {
+        HudButton tab = drawer_tab;
+        const int tx = max(0, drawer_width + drawer_offset - 34);
+        tab.x0 += tx; tab.x1 += tx;
+        return hit(tab, t);
     }
 
     void radar_probe()
@@ -966,20 +1055,20 @@ namespace
         loopv(players) if(players[i] && players[i]->state == CS_ALIVE) ++alive;
         if(alive < 4) return;
         done = true;
-                        // Orientation probe: count players on lit pixels per transform.
-                        int hits[8] = {}, total = 0;
-                        auto lit = [&](int x, int y) {
-                            if(x < 0 || y < 0 || x >= minimap_w || y >= minimap_h) return false;
-                            const u16 c = minimap_pixels[y * minimap_w + x];
-                            return ((c >> 11) & 31) + ((c >> 5) & 63) / 2 + (c & 31) > 6; };
-                        auto probe = [&](const vec &o) {
-                            const float k = minimap_w / minimap_span;
-                            const int u = int((o.x - minimap_x0) * k), v = int((o.y - minimap_y0) * k), m = minimap_w - 1;
-                            const int cand[8][2] = {{u, v}, {m - u, v}, {u, m - v}, {m - u, m - v}, {v, u}, {m - v, u}, {v, m - u}, {m - v, m - u}};
-                            for(int t = 0; t < 8; ++t) if(lit(cand[t][0], cand[t][1])) ++hits[t];
-                            ++total; };
-                        loopv(players) if(players[i] && players[i]->state == CS_ALIVE) probe(players[i]->o);
-                        clientlogf("radar probe: %d players, hits %d %d %d %d %d %d %d %d", total, hits[0], hits[1], hits[2], hits[3], hits[4], hits[5], hits[6], hits[7]);
+        // Orientation probe: count players on lit pixels per transform.
+        int hits[8] = {}, total = 0;
+        auto lit = [&](int x, int y) {
+            if(x < 0 || y < 0 || x >= minimap_w || y >= minimap_h) return false;
+            const u16 c = minimap_pixels[y * minimap_w + x];
+            return ((c >> 11) & 31) + ((c >> 5) & 63) / 2 + (c & 31) > 6; };
+        auto probe = [&](const vec &o) {
+            const float k = minimap_w / minimap_span;
+            const int u = int((o.x - minimap_x0) * k), v = int((o.y - minimap_y0) * k), m = minimap_w - 1;
+            const int cand[8][2] = {{u, v}, {m - u, v}, {u, m - v}, {m - u, m - v}, {v, u}, {m - v, u}, {v, m - u}, {m - v, m - u}};
+            for(int t = 0; t < 8; ++t) if(lit(cand[t][0], cand[t][1])) ++hits[t];
+            ++total; };
+        loopv(players) if(players[i] && players[i]->state == CS_ALIVE) probe(players[i]->o);
+        clientlogf("radar probe: %d players, hits %d %d %d %d %d %d %d %d", total, hits[0], hits[1], hits[2], hits[3], hits[4], hits[5], hits[6], hits[7]);
     }
 
     void draw_radar(u16 *screen)
@@ -993,14 +1082,19 @@ namespace
         float yawdeg = 0;
         const bool radar = ac3ds_radar_view(p, view, spect3rd, baseteam, yawdeg);
         if(!radar) view = player1;
-        const float yaw = yawdeg * RAD, c = cosf(yaw), s = sinf(yaw);
-        const float zoom = 2.2f; // screen pixels per world unit
+        // Close radar: centred on the player, forward up. Overview: the whole
+        // map, north up, like the PC's full map.
+        const bool overview = map_overview && minimap_valid;
+        const float yaw = overview ? 0.0f : yawdeg * RAD, c = cosf(yaw), s = sinf(yaw);
+        const float zoom = overview ? (radar_bottom - radar_top - 8) / minimap_span : 2.2f; // pixels per world unit
+        vec centre = view ? view->o : vec(0, 0, 0);
+        if(overview) centre = vec(minimap_x0 + minimap_span / 2, minimap_y0 + minimap_span / 2, 0);
         if(minimap_valid && view)
         {
             const float k = minimap_w / minimap_span;
             // Minimap pixel coordinates in 16.16 fixed point, stepped per pixel.
             // The transfer leaves rows bottom-up (world +y is the last row).
-            const float bx = (view->o.x - minimap_x0) * k, by = (view->o.y - minimap_y0) * k;
+            const float bx = (centre.x - minimap_x0) * k, by = (centre.y - minimap_y0) * k;
             const int stepx_y = int(-s / zoom * k * 65536), stepy_y = int(c / zoom * k * 65536);
             const int maxx = minimap_w << 16, maxy = minimap_h << 16;
             for(int x = 0; x < touch_width; ++x)
@@ -1019,7 +1113,7 @@ namespace
 
         auto toscreen = [&](const vec &o, int &sx, int &sy)
         {
-            const float rx = o.x - view->o.x, ry = o.y - view->o.y;
+            const float rx = o.x - centre.x, ry = o.y - centre.y;
             sx = cx + int(zoom * (rx * c + ry * s));
             sy = cy + int(zoom * (-rx * s + ry * c));
         };
@@ -1065,18 +1159,186 @@ namespace
                 }
             }
         }
-        if(!(p->isspectating() && spect3rd)) draw_self(screen, cx, cy);
+        if(!(p->isspectating() && spect3rd))
+        {
+            int sx = cx, sy = cy;
+            if(overview) toscreen(view->o, sx, sy);
+            draw_arrow(screen, sx, sy, overview ? yawdeg * RAD : 0.0f);
+        }
+    }
+
+    // The whole match screen: map, then the overlays.
+    void draw_match_screen(u16 *screen)
+    {
+        draw_radar(screen);
+        for(const HudButton &b : hud_buttons)
+            draw_hud_button(screen, b, hud_button_enabled(b.code),
+                            pressed_hud_code == b.code || (b.code == KEYCODE_RELOAD && reloading_now()));
+        if(vote_pending())
+        {
+            const bool armed = vote_armed();
+            for(const HudButton &b : vote_buttons) draw_hud_button(screen, b, armed, false);
+        }
+        draw_drawer(screen);
+    }
+
+    // Advances the drawer slide; true while it is still moving.
+    bool animate_drawer()
+    {
+        const int target = drawer_open ? 0 : -drawer_width;
+        if(drawer_offset == target) return false;
+        const int step = 31; // about 4 frames end to end
+        drawer_offset = drawer_offset < target ? min(target, drawer_offset + step) : max(target, drawer_offset - step);
+        return true;
+    }
+
+    // Handles a new touch on the match screen. Returns the key code to press
+    // (0 if none) and sets aim when the touch should steer the view.
+    int match_touch(const touchPosition &t, bool &aim)
+    {
+        aim = false;
+        if(drawer_open)
+        {
+            if(tab_hit(t)) { drawer_open = false; return 0; }
+            if(t.px < drawer_width)
+            {
+                for(const HudButton &b : drawer_items)
+                    if(hit(b, t) && hud_button_enabled(b.code)) return b.code;
+                return 0;
+            }
+            drawer_open = false; // a tap outside closes it
+            return 0;
+        }
+        if(tab_hit(t)) { drawer_open = true; return 0; }
+        if(vote_armed()) for(const HudButton &b : vote_buttons) if(hit(b, t)) return b.code;
+        for(const HudButton &b : hud_buttons)
+        {
+            if(!hit(b, t)) continue;
+            if(b.code == HUD_MAPTOGGLE) { map_overview = !map_overview; return 0; }
+            return hud_button_enabled(b.code) ? b.code : 0;
+        }
+        aim = true;
+        return 0;
     }
 }
 
+// ---------------------------------------------------------------------------
+// Server browser, lower screen: the selected server as a card, a big JOIN,
+// large scroll arrows (repeat while held) and the few actions players use.
 namespace
 {
-    void draw_vote_strip(u16 *screen)
+    struct BrowserButton { int x0, y0, x1, y1, code; const char *label; bool large; };
+    enum { BROWSER_UP_ARROW = 1, BROWSER_DOWN_ARROW = 2 };
+    const BrowserButton browser_buttons[] = {
+        {4, 106, 316, 148, SDLK_RETURN, "JOIN", true},
+        {4, 152, 106, 192, SDLK_UP, "", false},
+        {110, 152, 212, 192, SDLK_DOWN, "", false},
+        {216, 152, 316, 192, SDLK_F5, "REFRESH", false},
+        {4, 196, 106, 236, SDLK_F7, "FILTER", false},
+        {110, 196, 212, 236, SDLK_RIGHT, "SORT", false},
+        {216, 196, 316, 236, SDLK_ESCAPE, "BACK", false},
+    };
+    Uint32 browser_repeat_at = 0;
+
+    void draw_arrow_glyph(u16 *screen, int cx, int cy, bool up, u16 color)
     {
-        if(!vote_pending()) return;
-        const bool armed = vote_armed();
-        for(const HudButton &b : vote_buttons) draw_hud_button(screen, b, armed, false);
+        for(int row = 0; row < 12; ++row)
+        {
+            const int half = row;
+            const int y = up ? cy - 6 + row : cy + 5 - row;
+            fill_rect(screen, cx - half, y, cx + half + 1, y + 1, color);
+        }
     }
+
+    void draw_server_panel(u16 *screen)
+    {
+        static Ac3dsServerRow rows[256];
+        int selected = -1;
+        const int count = ac3ds_server_rows(const_cast<void *>(ac3ds_menu_identity()), rows, 256, selected);
+        fill_rect(screen, 0, 0, touch_width, 28, surface);
+        fill_rect(screen, 0, 27, touch_width, 28, border);
+        draw_label(screen, 10, 10, "Server browser", text);
+        char total[24];
+        snprintf(total, sizeof(total), "%d listed", count);
+        draw_label(screen, touch_width - 10 - 8 * int(strlen(total)), 10, total, muted);
+        // Card
+        fill_rect(screen, 4, 32, 316, 102, surface);
+        fill_rect(screen, 4, 32, 7, 102, accent);
+        if(selected >= 0)
+        {
+            const Ac3dsServerRow &r = rows[selected];
+            char line[128];
+            // Name over two lines of 37 characters.
+            const int len = int(strlen(r.desc));
+            snprintf(line, sizeof(line), "%.37s", r.desc);
+            draw_label(screen, 12, 38, line, text, 312);
+            if(len > 37)
+            {
+                snprintf(line, sizeof(line), "%.37s", r.desc + 37);
+                draw_label(screen, 12, 50, line, text, 312);
+            }
+            if(r.map[0]) snprintf(line, sizeof(line), "%s  %s", r.map, r.mode);
+            else snprintf(line, sizeof(line), "%s", r.responded ? "empty" : "waiting for an answer");
+            draw_label(screen, 12, 66, line, accent, 312);
+            if(r.responded)
+            {
+                snprintf(line, sizeof(line), "%d/%d players   ping %d%s%s", r.players, r.maxclients, r.ping,
+                         r.password ? "   password" : "", r.full ? "   FULL" : "");
+                draw_label(screen, 12, 82, line, muted, 312);
+            }
+        }
+        else draw_label(screen, 12, 60, count ? "Choose a server" : "Tap REFRESH to find servers", muted, 312);
+        for(const BrowserButton &b : browser_buttons)
+        {
+            const bool active = touch_key == b.code;
+            fill_rect(screen, b.x0, b.y0, b.x1, b.y1, active ? accent : border);
+            fill_rect(screen, b.x0 + 2, b.y0 + 2, b.x1 - 2, b.y1 - 2, active ? RGB565(8, 22, 10) : surface);
+            if(b.code == SDLK_UP || b.code == SDLK_DOWN)
+                draw_arrow_glyph(screen, (b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2, b.code == SDLK_UP, text);
+            else if(b.large)
+                draw_label_large(screen, (b.x0 + b.x1 - 16 * int(strlen(b.label))) / 2, (b.y0 + b.y1 - 16) / 2, b.label, selected >= 0 ? text : muted);
+            else
+                draw_label(screen, (b.x0 + b.x1 - 8 * int(strlen(b.label))) / 2, (b.y0 + b.y1 - 8) / 2, b.label, text, b.x1);
+        }
+    }
+
+    // Change key for redraws: the selection and what the card shows.
+    void server_panel_status(char *out, size_t size)
+    {
+        static Ac3dsServerRow rows[256];
+        int selected = -1;
+        const int count = ac3ds_server_rows(const_cast<void *>(ac3ds_menu_identity()), rows, 256, selected);
+        if(selected >= 0)
+        {
+            const Ac3dsServerRow &r = rows[selected];
+            snprintf(out, size, "S%d|%d|%s|%s|%d|%d|%d|%d", count, selected, r.desc, r.map, r.players, r.ping / 10, r.responded, touch_key);
+        }
+        else snprintf(out, size, "S%d|-|%d", count, touch_key);
+    }
+
+    int server_touch(const touchPosition &t)
+    {
+        for(const BrowserButton &b : browser_buttons)
+            if(t.px >= b.x0 && t.px < b.x1 && t.py >= b.y0 && t.py < b.y1) return b.code;
+        return 0;
+    }
+}
+
+// QA: a tap at (x, y) on the match screen, through the same handler as a real touch.
+void ac3ds_qa_tap(int x, int y)
+{
+    touchPosition t;
+    t.px = u16(max(0, min(x, touch_width - 1)));
+    t.py = u16(max(0, min(y, touch_height - 1)));
+    bool aim = false;
+    const int code = match_touch(t, aim);
+    if(code)
+    {
+        push_key(code, true, false, button_context);
+        push_key(code, false, false, button_context);
+        if(drawer_open && code != KEYCODE_SCORES) drawer_open = false;
+    }
+    controls_dirty = true;
 }
 
 bool ac3ds_minimap_info(unsigned &tex, float &x0, float &y0, float &span);
@@ -1185,31 +1447,29 @@ void ac3ds_poll_input()
             touch_aim = touchaim && touch.py >= 33 && touch.py < panel_top && can_aim && drawn_panel == panel;
             if(panel == GAME_PANEL && drawn_panel == panel)
             {
-                touch_aim = false;
-                if(vote_armed()) for(const HudButton &b : vote_buttons)
+                bool aim = false;
+                touch_key = match_touch(touch, aim);
+                touch_aim = aim && touchaim;
+                controls_dirty = true;
+                if(touch_key)
                 {
-                    if(touch.px < b.x0 || touch.px >= b.x1 || touch.py < b.y0 || touch.py >= b.y1) continue;
-                    touch_key = b.code;
                     touch_key_context = button_context;
-                    controls_dirty = true;
+                    pressed_hud_code = touch_key;
                     push_key(touch_key, true, false, touch_key_context);
-                    break;
                 }
-                if(!touch_key) for(int i = 0; i < hud_button_count; ++i)
-                {
-                    const HudButton &b = hud_buttons[i];
-                    if(touch.px < b.x0 || touch.px >= b.x1 || touch.py < b.y0 || touch.py >= b.y1) continue;
-                    if(!hud_button_enabled(b.code)) break;
-                    touch_key = b.code;
-                    touch_key_context = button_context;
-                    pressed_hud_button = i;
-                    controls_dirty = true;
-                    push_key(touch_key, true, false, touch_key_context);
-                    break;
-                }
-                if(!touch_key) touch_aim = touchaim && touch.py >= radar_top && touch.py < radar_bottom;
             }
             else if(drawn_panel == panel && panel == MENU_PANEL) queue_menu_touch(touch);
+            else if(drawn_panel == panel && panel == SERVER_PANEL)
+            {
+                touch_key = server_touch(touch);
+                if(touch_key)
+                {
+                    touch_key_context = button_context;
+                    push_key(touch_key, true, false, touch_key_context);
+                    browser_repeat_at = now + 340;
+                    controls_dirty = true;
+                }
+            }
             else if(drawn_panel == panel && touch.py >= panel_top)
             {
                 int row = (touch.py - panel_top) / cell_height;
@@ -1224,6 +1484,13 @@ void ac3ds_poll_input()
                 }
             }
         }
+        else if(panel == SERVER_PANEL && (touch_key == SDLK_UP || touch_key == SDLK_DOWN) &&
+                (Sint32)(now - browser_repeat_at) >= 0)
+        {
+            // Scroll arrows repeat while held.
+            push_key(touch_key, true, true, touch_key_context);
+            browser_repeat_at = now + 90;
+        }
         else if(touch_aim && touchaim && can_aim)
         {
             dx = (int(touch.px) - int(last_touch.px)) * touchsensitivity;
@@ -1235,16 +1502,19 @@ void ac3ds_poll_input()
     else if(touch_held)
     {
         if(touch_key && touch_key_context == button_context) push_key(touch_key, false, false, touch_key_context);
-        if(pressed_hud_button >= 0) { pressed_hud_button = -1; controls_dirty = true; }
+        // One-shot drawer actions close the drawer once used (SCORES is held).
+        if(drawer_open && touch_key && touch_key != KEYCODE_SCORES) drawer_open = false;
+        if(pressed_hud_code) { pressed_hud_code = 0; controls_dirty = true; }
         touch_key = 0;
         touch_held = touch_aim = false;
     }
-    else if(pressed_hud_button >= 0)
+    else if(pressed_hud_code)
     {
         // Released while the panel changed (or input was reset): clear the highlight.
-        pressed_hud_button = -1;
+        pressed_hud_code = 0;
         controls_dirty = true;
     }
+    if(panel != GAME_PANEL && drawer_open) drawer_open = false;
 
     if(can_aim)
     {
@@ -1303,13 +1573,18 @@ void ac3ds_draw_controls()
         else copystring(status, "Match");
     }
 
+    if(panel == SERVER_PANEL) server_panel_status(status, sizeof(status));
     // Button enable states are part of the match screen's look.
     if(panel == GAME_PANEL)
     {
         concatstring(status, "|");
-        for(int i = 0; i < hud_button_count; ++i)
-            concatstring(status, hud_button_enabled(hud_buttons[i].code) ? (pressed_hud_button == i ? "P" : "1") : "0");
+        for(const HudButton &b : hud_buttons)
+            concatstring(status, hud_button_enabled(b.code) ? (pressed_hud_code == b.code ? "P" : "1") : "0");
+        concatstring(status, reloading_now() ? "R" : "");
         concatstring(status, vote_pending() ? (vote_armed() ? "V" : "v") : "");
+        concatstring(status, map_overview ? "M" : "");
+        defformatstring(drawer)("D%d%d", drawer_open ? 1 : 0, pressed_hud_code);
+        concatstring(status, drawer);
     }
     const bool unchanged = !controls_dirty && drawn_panel == panel && drawn_bind_type == bind_type &&
        drawn_touch_aim == touchaim && !strcmp(status, drawn_status) &&
@@ -1317,20 +1592,14 @@ void ac3ds_draw_controls()
     const u64 now_tick = svcGetSystemTick();
     if(unchanged)
     {
-        // Only the radar moves: refresh it ten times a second.
-        if(panel != GAME_PANEL || now_tick - radar_drawn_tick < SYSCLOCK_ARM11 / 10) return;
+        // The map moves: refresh it ten times a second, every frame while the
+        // drawer slides.
+        if(panel != GAME_PANEL) return;
+        const bool sliding = animate_drawer();
+        if(!sliding && now_tick - radar_drawn_tick < SYSCLOCK_ARM11 / 10) return;
         u16 *screen = reinterpret_cast<u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
         if(!screen) return;
-        draw_radar(screen);
-        draw_vote_strip(screen);
-        if(*drawn_status && drawn_status[0] != '|' && !vote_pending())
-        {
-            fill_rect(screen, 4, radar_top + 3, 8 + 8 * int(strcspn(drawn_status, "|")), radar_top + 15, RGB565(1, 3, 2));
-            string label;
-            copystring(label, drawn_status);
-            label[strcspn(label, "|")] = '\0';
-            draw_label(screen, 6, radar_top + 5, label, text);
-        }
+        draw_match_screen(screen);
         radar_drawn_tick = now_tick;
         GSPGPU_FlushDataCache(screen, touch_width * touch_height * sizeof(*screen));
         return;
@@ -1342,22 +1611,11 @@ void ac3ds_draw_controls()
     if(panel == MENU_PANEL) draw_handheld_menu(screen, menu);
     else if(panel == GAME_PANEL)
     {
-        fill_rect(screen, 0, 0, touch_width, hud_top_bar, background);
-        fill_rect(screen, 0, radar_bottom, touch_width, touch_height, background);
-        for(int i = 0; i < hud_button_count; ++i)
-            draw_hud_button(screen, hud_buttons[i], hud_button_enabled(hud_buttons[i].code), pressed_hud_button == i);
-        draw_radar(screen);
-        draw_vote_strip(screen);
-        if(*status && status[0] != '|' && !vote_pending())
-        {
-            string label;
-            copystring(label, status);
-            label[strcspn(label, "|")] = '\0';
-            fill_rect(screen, 4, radar_top + 3, 8 + 8 * int(strlen(label)), radar_top + 15, RGB565(1, 3, 2));
-            draw_label(screen, 6, radar_top + 5, label, text);
-        }
+        animate_drawer();
+        draw_match_screen(screen);
         radar_drawn_tick = now_tick;
     }
+    else if(panel == SERVER_PANEL) draw_server_panel(screen);
     else
     {
         const char *title = panel == GAME_PANEL ? "Match controls" :

@@ -132,6 +132,26 @@ A review of that work (85 findings, 55 confirmed on an independent second pass) 
 
 **Frame times** on this build: six-bot `ac_desert` 59.84 FPS with a 17.4 ms p99. Venison with eight bots and both water passes is unchanged at about 52.7 FPS, with draw at 14.3 ms including a 5.3 ms reflection pass. The hardware GPU and clock figures will show whether Venison is limited by the CPU or the GPU there. None of this has been verified on the handheld.
 
+**Handheld verification, 2026-11-14 (previous checkpoint build on the New 2DS XL)**
+- The master list loaded and the package server ping succeeded, confirming the blocking-connect fix on real SOC.
+- The 2DS connected to a public PC 1.3.0.2 server ("Vortex | 1v1 Arena | USA [West Coast]"), authenticated, loaded `ac_urban` and played deathmatch at 16-19 ms per logged frame. Cross-play with PC works on hardware.
+- First load of `ac_arctic` offline took 9.2 s, against 68 s for `ac_wasteland` before the SD-probing fix.
+- The `ac_urban` load spent 11.7 s of CPU in image decode across 90 calls (about 130 ms each). That build read images through small stdio refills. `find file` took 6 ms.
+- The texture prefetch worker kept ahead of the main thread (53 of 53 ready, none waited), so core 2 runs in parallel on hardware.
+- The current build adds whole-file image reads, baseline JPEGs and the CPU clock ratio log, so the next handheld log shows how much of the decode time was I/O and whether the 804 MHz boost is active.
+
+**Lower screen and server browser rework, and the hardware smear report.**
+
+*Match screen.* The map now fills the whole lower screen and remains the stylus look area. It carries only translucent RELOAD (top centre) and GRENADE (bottom centre) buttons, plus a MAP/RADAR corner toggle that switches between the close rotating radar and a north-up view of the whole map. A corner tab slides out a drawer with MENU, SCORES, WEAPON and CHAT.
+
+*Server browser.* The top screen shows a handheld list at the readable text size: ping, players, name and map, with a footer for the selected server. The lower screen shows a card for the selected server, a large JOIN button, repeating scroll arrows, and REFRESH, FILTER, SORT and BACK. Six-bot `ac_desert` stays at 59.8-59.9 FPS in Azahar.
+
+*Smear report.* On the handheld, ammo crates appeared to "stretch out and repeat", with general blurring; Azahar shows neither. Checking 27 candidate causes, each twice, refuted the coherency and stencil theories. Citro3D queues mid-frame splits and starts the GPU only at `C3D_FrameEnd`, after the arena flush.
+
+The best-supported mechanism is that AssaultCube clears the top colour buffer only outside the map. Any pixel the world leaves uncovered on PICA keeps earlier frames, and the rotating, bobbing pickups smear into stacked copies. The 3DS build now clears colour every frame (`ac3dsclearcolor`, default 1). That is one GPU fill and gives identical output where the world draws. It also flushes the arena before every mid-frame split, as hardening.
+
+`ac3dsnear` (hundredths, default 15) is a diagnostic. If holes remain visible as fog-coloured flicker with clearing on, raising it tests whether near-plane clipping of large world polygons causes them. Handheld confirmation is pending.
+
 To capture the next failure, the main and audio mixer threads now install a CPU exception handler. A fault writes `profile/crash.txt` with the exception type, PC, LR, fault address, registers, nearby code and stack return candidates, and shows the summary on the touch screen. A watchdog on the extra core reports a main loop that makes no progress for 20 seconds. Both reports name the last main loop phase. The client log records the first six frames, every 1,800th frame and each map load. Resolve the addresses with `scripts/symbolize-crash.py crash.txt <build>/assaultcube.elf` using the ELF from the same build. Azahar passed the smoke fixture on this build in `build-azahar/crash-01` without a stall report. Handheld verification is pending.
 
 The 39.749 FPS build passed the original Lockdown Edition desktop server retest at 100% CPU clock. It entered `ac_douze` revision 40 on protocol 1300, exchanged chat and disconnected. See `build-azahar/network-native-ui-100`.

@@ -444,6 +444,14 @@ void flushData()
         iflushed = iused;
     }
 }
+// Mid-frame command-list split. Citro3D only queues the list (the GPU starts at
+// C3D_FrameEnd, after flushData), but cleaning the arena first keeps every
+// queued segment correct even if a split ever runs the queue early.
+void splitFrame()
+{
+    flushData();
+    C3D_FrameSplit(submitFlags);
+}
 void recycleFrame()
 {
     ++currentCounters.barriers;
@@ -1467,7 +1475,7 @@ bool readTarget(C3D_RenderTarget *source)
     // the GPU framebuffer. Keep this outside the normal gameplay hot path.
     const u32 dim = GX_BUFFER_DIM(source->frameBuf.width,source->frameBuf.height);
     const size_t bytes = source->frameBuf.width*source->frameBuf.height*4;
-    C3D_FrameSplit(submitFlags);
+    splitFrame();
     queuedGx += 2;
     const bool copied = R_SUCCEEDED(GSPGPU_FlushDataCache(pixels,bytes)) &&
         R_SUCCEEDED(GX_DisplayTransfer(static_cast<u32 *>(source->frameBuf.colorBuf),dim,pixels,dim,0));
@@ -2163,7 +2171,7 @@ bool ac3ds_gl_queue_readback_565(GLuint id, u16 **out, int *outw, int *outh)
     submitPending();
     if(!startFrame(false)) return false;
     reserveCommands();
-    C3D_FrameSplit(submitFlags);
+    splitFrame();
     queuedGx += 2;
     const bool queued = R_SUCCEEDED(GSPGPU_FlushDataCache(staging, bytes)) &&
         R_SUCCEEDED(GX_DisplayTransfer(static_cast<u32 *>(t->gpu.data), GX_BUFFER_DIM(sw, sh),
@@ -2215,7 +2223,7 @@ bool copyWaterWorld(WaterWorldSnapshot &snapshot, bool restore)
     reserveCommands();
     // Submit preceding draws before the two raw, contiguous VRAM copies.
     // The following draws are queued after both transfers.
-    C3D_FrameSplit(submitFlags);
+    splitFrame();
     u32 *snapshotColor = reinterpret_cast<u32 *>(snapshot.storage);
     u32 *snapshotDepth = reinterpret_cast<u32 *>(snapshot.storage + colorBytes);
     u32 *liveColor = static_cast<u32 *>(fb.colorBuf);
@@ -2254,7 +2262,7 @@ void ac3ds_gl_render_to_screen()
     {
         submitPending();
         reserveCommands();
-        C3D_FrameSplit(submitFlags);
+        splitFrame();
         ++queuedGx;
     }
     selectTarget(top);
@@ -2385,7 +2393,7 @@ void glClear(GLbitfield mask)
         (mask&(GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT) ? C3D_CLEAR_DEPTH : 0);
     if(!bits) return;
     reserveCommands();
-    C3D_FrameSplit(submitFlags);
+    splitFrame();
     // PICA clears complete attachments. Cube uses scissor only on freshly
     // rendered water targets; those passes must clear outside it as well.
     const u32 z = u32((1.f-clearDepth)*16777215.f);
@@ -3120,7 +3128,7 @@ bool ac3ds_gl_queue_aim_depth()
     submitPending();
     if(!startFrame(false)) return false;
     reserveCommands();
-    C3D_FrameSplit(submitFlags);
+    splitFrame();
     // A depth texel is D24S8 in native Morton order. GX copies one aligned
     // tile (256 bytes) after the map/model pass, without a CPU/GPU barrier.
     const unsigned x = screenH/2, y = screenW/2;

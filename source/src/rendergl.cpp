@@ -816,6 +816,13 @@ VAR(ac3dssharedrefraction, 0, 1, 1);
 VARF(ac3dslatevblank, 0, 0, 1, ac3ds_gl_set_late_vblank(ac3dslatevblank));
 VARF(ac3dsfastvertexoffsets, 0, 0, 1, ac3ds_gl_set_fast_vertex_offsets(ac3dsfastvertexoffsets));
 VARF(ac3dsjoinedwatercommands, 0, 0, 1, ac3ds_gl_set_joined_water_commands(ac3dsjoinedwatercommands));
+// Clear the top screen's colour every frame. AssaultCube only clears it outside
+// the map because the world covers every pixel; any pixel left uncovered on the
+// handheld would otherwise keep old frames and smear moving objects into
+// stretched, repeated copies. One GPU fill; identical output where the world draws.
+VARP(ac3dsclearcolor, 0, 1, 1);
+// Diagnostic: near plane in hundredths of a unit (AssaultCube uses 0.15).
+VAR(ac3dsnear, 5, 15, 100);
 namespace
 {
     struct WaterWorldKey
@@ -1311,7 +1318,11 @@ void sethudgunperspective(bool on)
         glScalef(1, 1, 0.5f); // fix hudugns colliding with map geometry
         setperspective(75.0f, aspect, 0.3f, farplane); // y fov fixed at 75 degrees
     }
+#ifdef __3DS__
+    else setperspective(fovy, aspect, ac3dsnear / 100.0f, farplane);
+#else
     else setperspective(fovy, aspect, 0.15f, farplane);
+#endif
     glMatrixMode(GL_MODELVIEW);
 }
 
@@ -1480,7 +1491,11 @@ void gl_drawframe(int w, int h, float changelod, float curfps, int elapsed)
     }
 
     farplane = fog*5/2;
+#ifdef __3DS__
+    setperspective(fovy, aspect, ac3dsnear / 100.0f, farplane);
+#else
     setperspective(fovy, aspect, 0.15f, farplane);
+#endif
     glMatrixMode(GL_MODELVIEW);
 
     transplayer();
@@ -1500,7 +1515,12 @@ void gl_drawframe(int w, int h, float changelod, float curfps, int elapsed)
 #endif
 
     if(effective_stencilshadow && hasstencil && stencilbits >= 8) glClearStencil((hasSTS || hasST2) && !hasSTW ? 128 : 0);
-    glClear((outsidemap(camera1) ? GL_COLOR_BUFFER_BIT : 0) | GL_DEPTH_BUFFER_BIT | (effective_stencilshadow && hasstencil && stencilbits >= 8 ? GL_STENCIL_BUFFER_BIT : 0));
+#ifdef __3DS__
+    const bool clearcolor = outsidemap(camera1) || ac3dsclearcolor;
+#else
+    const bool clearcolor = outsidemap(camera1);
+#endif
+    glClear((clearcolor ? GL_COLOR_BUFFER_BIT : 0) | GL_DEPTH_BUFFER_BIT | (effective_stencilshadow && hasstencil && stencilbits >= 8 ? GL_STENCIL_BUFFER_BIT : 0));
 
     glEnable(GL_TEXTURE_2D);
 
