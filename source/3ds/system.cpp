@@ -1377,14 +1377,15 @@ namespace
     }
 }
 
-// QA: a tap at (x, y) on the match screen, through the same handler as a real touch.
+// QA: a tap at (x, y) on the match screen or server browser, through the
+// same handlers as a real touch.
 void ac3ds_qa_tap(int x, int y)
 {
     touchPosition t;
     t.px = u16(max(0, min(x, touch_width - 1)));
     t.py = u16(max(0, min(y, touch_height - 1)));
     bool aim = false;
-    const int code = match_touch(t, aim);
+    const int code = current_panel() == SERVER_PANEL ? server_touch(t) : match_touch(t, aim);
     if(code)
     {
         push_key(code, true, false, button_context);

@@ -197,3 +197,5 @@ Desktop arbitrary window sizes and multisample settings have no direct equivalen
 
 *Also in build 11.* Double-tap the match screen's look area to jump (`3DS_TOUCH_JUMP`, `doubletapjump`, `doubletapms`). In Azahar a double or triple tap jumped once (rose 2.94 units), and a single tap, a slow pair or taps on RELOAD did not. The SD install keeps the file name `assaultcube.3dsx`, because the Homebrew Launcher only lists `<folder>/<folder>.3dsx` (or `boot.3dsx`) as an app. The launcher title is the release name in `RELEASE_NAME` (`AC-3DS0v1.0` for this build), or `AC3DSv<build>` without one.
 
+*Release package.* The public release is the engine-only build (`-DAC3DS_EMBED_ASSETS=OFF`) with the port's own launcher icon (`source/3ds/icon.png`). Players stage the game files from the official archive with `stage-assets.py`. In Azahar the engine-only build ran from freshly staged SD files and loaded `ac_douze` in 2.9 s. On the release build, Azahar measured `ac_arctic2` with six bots at 59.8 FPS (p99 20.5 ms, no missed VBlanks) and `ac_venison` with eight bots and both water passes at 54.2 FPS (p99 24.3 ms).
+

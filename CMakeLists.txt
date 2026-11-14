@@ -147,8 +147,9 @@ elseif(AC3DS_EMBED_ASSETS)
     add_custom_command(OUTPUT "${icon}"
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/resize-icon.py" "${stock_icon}" "${icon}"
         DEPENDS ${romfs_deps} scripts/resize-icon.py VERBATIM)
-elseif(EXISTS "${DEVKITPRO}/libctru/default_icon.png")
-    set(icon "${DEVKITPRO}/libctru/default_icon.png")
+else()
+    # Engine-only builds carry no game art; use the port's own launcher icon.
+    set(icon "${CMAKE_CURRENT_SOURCE_DIR}/source/3ds/icon.png")
 endif()
 set(package_config "${CMAKE_CURRENT_BINARY_DIR}/package-3dsx.options")
 file(GENERATE OUTPUT "${package_config}" CONTENT "romfs=${romfs_args}\nicon=${icon}\n")
@@ -156,7 +157,7 @@ if(icon)
     find_program(SMDHTOOL smdhtool HINTS ${sdk_tool_paths} REQUIRED)
     set(smdh "${CMAKE_CURRENT_BINARY_DIR}/assaultcube.smdh")
     add_custom_command(OUTPUT "${smdh}"
-        COMMAND "${SMDHTOOL}" --create "${AC3DS_LAUNCHER_TITLE}" "AssaultCube 3DS build ${AC3DS_BUILD_NUMBER}" "AssaultCube Team" "${icon}" "${smdh}"
+        COMMAND "${SMDHTOOL}" --create "${AC3DS_LAUNCHER_TITLE}" "AssaultCube for New 3DS, build ${AC3DS_BUILD_NUMBER}" "rzkowskii" "${icon}" "${smdh}"
         DEPENDS "${icon}" "${package_config}" VERBATIM)
     set(smdh_args "--smdh=${smdh}")
 endif()
