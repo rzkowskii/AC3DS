@@ -213,7 +213,7 @@ void gl_checkextensions()
         ac3ds_log_memory([](const char *line) { clientlogf("%s", line); });
         extern float ac3ds_cpu_clock_ratio;
         clientlogf("cpu: boost clock ratio %.2f (about 3.0 means 804 MHz is active)", ac3ds_cpu_clock_ratio);
-        clientlogf("AC3DS build %d", AC3DS_BUILD_NUMBER);
+        clientlogf("AC3DS build %d (%s)", AC3DS_BUILD_NUMBER, AC3DS_RELEASE_NAME);
     }
 #endif
 
@@ -824,6 +824,10 @@ VARF(ac3dsjoinedwatercommands, 0, 0, 1, ac3ds_gl_set_joined_water_commands(ac3ds
 VARP(ac3dsclearcolor, 0, 1, 1);
 // Diagnostic: near plane in hundredths of a unit (AssaultCube uses 0.15).
 VAR(ac3dsnear, 5, 15, 100);
+// Linear (W-buffer) depth for perspective draws, so fog matches desktop
+// AssaultCube. 0 restores the hyperbolic Z-buffer, whose fog table greys out
+// everything past about 19 units.
+VARF(ac3dslineardepth, 0, 1, 1, ac3ds_gl_set_linear_depth(ac3dslineardepth != 0));
 namespace
 {
     struct WaterWorldKey
@@ -1312,6 +1316,9 @@ void setperspective(float fovy, float aspect, float nearplane, float farplane)
 
 void sethudgunperspective(bool on)
 {
+#ifdef __3DS__
+    ac3ds_gl_set_hud_gun_depth(on);
+#endif
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     if(on)
@@ -1404,6 +1411,93 @@ static void resolveaim(float depth, vec &pos)
         }
     }
 }
+
+// QA: compare the GPU centre depth (as an eye distance, before the CPU clips
+// it to geometry) with a CPU ray cast along the same centre ray.
+COMMANDF(ac3dsqaaim, "", ()
+{
+    vec4 world;
+    aimInverse.transform(vec(0, 0, depthcorrect(cursordepth)*2 - 1), world);
+    const float raw = fabsf(world.w) < 1e-7f ? -1.f : vec(world.x, world.y, world.z).div(world.w).dist(aimOrigin);
+    const float saved = cursordepth;
+    vec cpu;
+    resolveaim(1.f, cpu);
+    cursordepth = saved;
+    clientlogf("qa: aim gpu %.2f, used %.2f, cpu ray %.2f", raw, worldpos.dist(aimOrigin), cpu.dist(aimOrigin));
+});
+// QA: move the player along the view direction to `dist` units from the wall ahead.
+COMMANDF(ac3dsqaapproach, "f", (float *dist)
+{
+    const vec dir(sinf(RAD*player1->yaw)*cosf(RAD*player1->pitch), -cosf(RAD*player1->yaw)*cosf(RAD*player1->pitch), sinf(RAD*player1->pitch));
+    const vec far = vec(dir).mul(500).add(player1->o);
+    vec hit = far;
+    intersectgeometry(player1->o, hit);
+    const float d = hit.dist(player1->o);
+    if(d < 1e-3f || hit == far) { clientlogf("qa: approach found no wall"); return; }
+    player1->o.add(vec(dir).mul(max(0.f, d - *dist)));
+    player1->vel = vec(0, 0, 0);
+    player1->resetinterp();
+    clientlogf("qa: approach wall was %.2f away, now %.2f", d, min(d, *dist));
+});
+
+// QA: stand on dry ground near the first water cell and look at it.
+static void qawater()
+{
+    for(int y = MINBORD; y < ssize-MINBORD; ++y) for(int x = MINBORD; x < ssize-MINBORD; ++x)
+    {
+        sqr *w = S(x, y);
+        if(SOLID(w) || w->floor >= waterlevel - 1) continue;
+        for(int r = 8; r <= 24; r += 4) loopi(16)
+        {
+            const float a = i*PI2/16;
+            const int sx = x + int(cosf(a)*r), sy = y + int(sinf(a)*r);
+            if(OUTBORD(sx, sy)) continue;
+            sqr *g = S(sx, sy);
+            if(SOLID(g) || g->floor < waterlevel || g->ceil - g->floor < 8) continue;
+            bool clear = true; // nothing taller than eye level between us and the water
+            for(int k = 1; k < r && clear; ++k)
+            {
+                sqr *c = S(sx + (x - sx)*k/r, sy + (y - sy)*k/r);
+                if(SOLID(c) || c->floor > g->floor + 2 || c->ceil < g->floor + 8) clear = false;
+            }
+            if(!clear) continue;
+            player1->o = vec(sx + .5f, sy + .5f, g->floor + player1->eyeheight);
+            player1->vel = vec(0, 0, 0);
+            player1->resetinterp();
+            player1->yaw = atan2f(float(x - sx), float(sy - y))/RAD;
+            player1->pitch = -20;
+            clientlogf("qa: water at %d %d, standing at %d %d facing yaw %.0f", x, y, sx, sy, player1->yaw);
+            return;
+        }
+    }
+    clientlogf("qa: no water found");
+}
+COMMANDN(ac3dsqawater, qawater, "");
+
+// QA: stand `dist` units from the nearest live player or bot, facing it.
+static void qafacebot(float *dist)
+{
+    playerent *best = NULL;
+    float bestd = 1e9f;
+    loopv(players) if(players[i] && players[i]->state == CS_ALIVE)
+    {
+        const float d = players[i]->o.dist(player1->o);
+        if(d < bestd) { bestd = d; best = players[i]; }
+    }
+    if(!best) { clientlogf("qa: no bot to face"); return; }
+    vec back(player1->o);
+    back.sub(best->o);
+    back.z = 0;
+    if(back.magnitude() < 1e-3f) back = vec(1, 0, 0);
+    back.normalize().mul(*dist);
+    player1->o = vec(best->o).add(back);
+    player1->vel = vec(0, 0, 0);
+    player1->resetinterp();
+    player1->yaw = atan2f(-back.x, back.y)/RAD;
+    player1->pitch = -8;
+    clientlogf("qa: facing %s from %.1f units", best->name, *dist);
+}
+COMMANDN(ac3dsqafacebot, qafacebot, "f");
 
 void ac3ds_resolve_aim()
 {

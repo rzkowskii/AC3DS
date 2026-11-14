@@ -421,7 +421,12 @@ void drawstencilshadows()
 
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
+#ifdef __3DS__
+        extern int ac3dsnear;
+        setperspective(fovy, aspect, ac3dsnear / 100.0f, farplane);
+#else
         setperspective(fovy, aspect, 0.15f, farplane);
+#endif
 
         glMatrixMode(GL_MODELVIEW);
         glPopMatrix();

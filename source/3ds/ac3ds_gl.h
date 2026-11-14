@@ -296,5 +296,9 @@ void glVertex3fv(const GLfloat *);
 void glVertexPointer(GLint, GLenum, GLsizei, const GLvoid *);
 void glViewport(GLint, GLint, GLsizei, GLsizei);
 
+// Perspective draws store linear (W-buffer) depth so fog matches desktop GL.
+void ac3ds_gl_set_linear_depth(bool enabled);
+// The hud gun draws in a depth band in front of the world.
+void ac3ds_gl_set_hud_gun_depth(bool on);
 bool ac3ds_gl_queue_aim_depth();
 bool ac3ds_gl_take_aim_depth(float &depth);

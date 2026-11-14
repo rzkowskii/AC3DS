@@ -27,6 +27,10 @@ extern bool inmainloop;
 extern void writeinitcfg();
 extern void writecfg();
 VARP(touchaim, 0, 1, 1);
+// Double-tap the look area of the match screen to jump (taps under 250 ms,
+// second tap within doubletapms of the first and near it).
+VARP(doubletapjump, 0, 1, 1);
+VARP(doubletapms, 150, 300, 600);
 
 // Network keepalive while the main thread is blocked in a system applet (the
 // software keyboard) or suspended in the HOME menu. Runs upstream's own
@@ -161,7 +165,8 @@ namespace
         KEYCODE_FLAG, KEYCODE_SCREENSHOT, KEYCODE_WEAPONS, KEYCODE_NEXT,
         KEYCODE_PREV, KEYCODE_UNDO, KEYCODE_REDO, KEYCODE_DELETE, KEYCODE_EDITMENU,
         KEYCODE_RELOAD, KEYCODE_GRENADE, KEYCODE_SCOPE, KEYCODE_NEXTWEAPON,
-        KEYCODE_MATCHMENU, KEYCODE_SCORES
+        KEYCODE_MATCHMENU, KEYCODE_SCORES, KEYCODE_JUMP,
+        KEYCODE_LAST = KEYCODE_JUMP
     };
 
     struct Control
@@ -211,9 +216,10 @@ namespace
         {KEYCODE_SCOPE, "3DS_TOUCH_SCOPE", "altaction", "", ""},
         {KEYCODE_NEXTWEAPON, "3DS_TOUCH_WEAPON", "shiftweapon 1", "", ""},
         {KEYCODE_MATCHMENU, "3DS_TOUCH_MENU", "ac3ds_pause_menu", "", ""},
-        {KEYCODE_SCORES, "3DS_TOUCH_SCORES", "key_showscores", "", ""}
+        {KEYCODE_SCORES, "3DS_TOUCH_SCORES", "key_showscores", "", ""},
+        {KEYCODE_JUMP, "3DS_TOUCH_JUMP", "jump", "", ""} // double-tap on the match screen
     };
-    static_assert(sizeof(controls) / sizeof(controls[0]) == KEYCODE_SCORES - KEYCODE_A + 1,
+    static_assert(sizeof(controls) / sizeof(controls[0]) == KEYCODE_LAST - KEYCODE_A + 1,
                   "The default control table follows the native key code order.");
 
     const struct { u32 mask; Key code; } buttons[] = {
@@ -304,7 +310,7 @@ namespace
 
     bool uses_default_binding(int code, int type)
     {
-        if(code < KEYCODE_A || code > KEYCODE_SCORES) return true;
+        if(code < KEYCODE_A || code > KEYCODE_LAST) return true;
         const Control &control = controls[code - KEYCODE_A];
         keym *binding = findbindc(code);
         if(!binding) return true;
@@ -326,6 +332,55 @@ namespace
         event.key.windowID = context;
         pushevent(event);
     }
+
+    // Double tap on the look area of the match screen. A tap is a touch that
+    // lifts within 250 ms and stays within 12 px of where it started; the
+    // second touch must land within doubletapms of the first and near it. The
+    // jump fires on the second touch-down, and that touch can still drag to aim.
+    struct DoubleTap
+    {
+        Uint32 down_at = 0, tap_at = 0;
+        int start_x = 0, start_y = 0, tap_x = 0, tap_y = 0;
+        bool tracking = false, moved = false, have_tap = false;
+
+        bool down(Uint32 now, int x, int y, Uint32 window)
+        {
+            const bool second = have_tap && now - tap_at <= window &&
+                                abs(x - tap_x) <= 40 && abs(y - tap_y) <= 40;
+            have_tap = false;
+            tracking = !second; // a third tap starts a new pair
+            moved = false;
+            down_at = now;
+            start_x = x;
+            start_y = y;
+            return second;
+        }
+        void move(int x, int y)
+        {
+            if(abs(x - start_x) > 12 || abs(y - start_y) > 12) moved = true;
+        }
+        void up(Uint32 now)
+        {
+            have_tap = tracking && !moved && now - down_at <= 250;
+            if(have_tap)
+            {
+                tap_at = now;
+                tap_x = start_x;
+                tap_y = start_y;
+            }
+            tracking = false;
+        }
+        void reset() { tracking = have_tap = false; }
+    } double_tap;
+
+    // QA: a scripted stylus sequence fed through the real input path.
+    struct QaTouch
+    {
+        int x = 0, y = 0, presses = 0, hold = 0, gap = 0, jumps = 0;
+        Uint32 start = 0;
+        float base_z = 0, peak_z = 0;
+        bool active = false;
+    } qa_touch;
 
     void reset_physical_input()
     {
@@ -1339,6 +1394,21 @@ void ac3ds_qa_tap(int x, int y)
     controls_dirty = true;
 }
 
+// QA: `presses` stylus taps at (x, y), each held hold_ms with gap_ms between,
+// through the real touch path. Logs the double-tap jumps and how far the player rose.
+void ac3ds_qa_touch(int x, int y, int presses, int hold_ms, int gap_ms)
+{
+    qa_touch = {};
+    qa_touch.x = max(0, min(x, touch_width - 1));
+    qa_touch.y = max(0, min(y, touch_height - 1));
+    qa_touch.presses = max(1, presses);
+    qa_touch.hold = max(1, hold_ms);
+    qa_touch.gap = max(1, gap_ms);
+    qa_touch.start = SDL_GetTicks();
+    qa_touch.base_z = qa_touch.peak_z = player1 ? player1->o.z : 0;
+    qa_touch.active = true;
+}
+
 bool ac3ds_minimap_info(unsigned &tex, float &x0, float &y0, float &span);
 
 void ac3ds_minimap_updated()
@@ -1391,7 +1461,7 @@ namespace
 
 bool ac3ds_accept_button_event(const SDL_KeyboardEvent &event)
 {
-    if(event.keysym.sym < KEYCODE_A || event.keysym.sym > KEYCODE_SCORES || !event.windowID) return true;
+    if(event.keysym.sym < KEYCODE_A || event.keysym.sym > KEYCODE_LAST || !event.windowID) return true;
     ac3ds_sync_input_context();
     return event.windowID == button_context;
 }
@@ -1404,6 +1474,22 @@ void ac3ds_poll_input()
     u32 held = hidKeysHeld();
     inhibited_buttons &= held;
     held &= ~inhibited_buttons;
+    bool qa_pressed = false;
+    if(qa_touch.active)
+    {
+        const int elapsed = int(SDL_GetTicks() - qa_touch.start);
+        const int period = qa_touch.hold + qa_touch.gap;
+        qa_pressed = elapsed / period < qa_touch.presses && elapsed % period < qa_touch.hold;
+        if(player1) qa_touch.peak_z = max(qa_touch.peak_z, player1->o.z);
+        if(elapsed >= qa_touch.presses * period + 800)
+        {
+            clientlogf("qa: touch sequence done: %d taps, %d double-tap jumps, rose %.2f (state %d, on floor %d)",
+                       qa_touch.presses, qa_touch.jumps, qa_touch.peak_z - qa_touch.base_z,
+                       player1 ? player1->state : -1, player1 ? int(player1->onfloor) : -1);
+            qa_touch.active = false;
+        }
+    }
+    if(qa_pressed) held |= KEY_TOUCH;
     if(dedicated_display)
     {
         if((held & KEY_B) && !(held_buttons & KEY_B)) push_key(KEYCODE_B, true);
@@ -1440,6 +1526,11 @@ void ac3ds_poll_input()
     {
         touchPosition touch;
         hidTouchRead(&touch);
+        if(qa_pressed)
+        {
+            touch.px = u16(qa_touch.x);
+            touch.py = u16(qa_touch.y);
+        }
         if(!touch_held)
         {
             touch_aim = touchaim && touch.py >= 33 && touch.py < panel_top && can_aim && drawn_panel == panel;
@@ -1455,6 +1546,15 @@ void ac3ds_poll_input()
                     pressed_hud_code = touch_key;
                     push_key(touch_key, true, false, touch_key_context);
                 }
+                else if(aim && doubletapjump && double_tap.down(now, touch.px, touch.py, Uint32(doubletapms)))
+                {
+                    // Held until the stylus lifts, like the A button.
+                    touch_key = KEYCODE_JUMP;
+                    touch_key_context = button_context;
+                    push_key(touch_key, true, false, touch_key_context);
+                    if(qa_touch.active) ++qa_touch.jumps;
+                }
+                if(!aim || !doubletapjump) double_tap.reset();
             }
             else if(drawn_panel == panel && panel == MENU_PANEL) queue_menu_touch(touch);
             else if(drawn_panel == panel && panel == SERVER_PANEL)
@@ -1494,11 +1594,13 @@ void ac3ds_poll_input()
             dx = (int(touch.px) - int(last_touch.px)) * touchsensitivity;
             dy = (int(touch.py) - int(last_touch.py)) * touchsensitivity;
         }
+        if(touch_held) double_tap.move(touch.px, touch.py);
         last_touch = touch;
         touch_held = true;
     }
     else if(touch_held)
     {
+        double_tap.up(now);
         if(touch_key && touch_key_context == button_context) push_key(touch_key, false, false, touch_key_context);
         // One-shot drawer actions close the drawer once used (SCORES is held).
         if(drawer_open && touch_key && touch_key != KEYCODE_SCORES) drawer_open = false;
@@ -1512,7 +1614,11 @@ void ac3ds_poll_input()
         pressed_hud_code = 0;
         controls_dirty = true;
     }
-    if(panel != GAME_PANEL && drawer_open) drawer_open = false;
+    if(panel != GAME_PANEL)
+    {
+        drawer_open = false;
+        double_tap.reset();
+    }
 
     if(can_aim)
     {

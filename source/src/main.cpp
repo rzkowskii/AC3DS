@@ -2049,6 +2049,16 @@ int main(int argc, char **argv)
 #ifdef __3DS__
 // QA: tap the match screen at x y.
 COMMANDF(ac3dstap, "ii", (int *x, int *y) { extern void ac3ds_qa_tap(int, int); ac3ds_qa_tap(*x, *y); });
+// QA: put the player at x y z (a negative x keeps the position) facing yaw pitch.
+COMMANDF(ac3dspose, "fffff", (float *x, float *y, float *z, float *yaw, float *pitch)
+{
+    if(*x >= 0) { player1->o = vec(*x, *y, *z); player1->vel = vec(0, 0, 0); player1->resetinterp(); }
+    player1->yaw = *yaw;
+    player1->pitch = *pitch;
+    clientlogf("qa: pose %.1f %.1f %.1f yaw %.0f pitch %.0f", player1->o.x, player1->o.y, player1->o.z, player1->yaw, player1->pitch);
+});
+// QA: scripted stylus taps through the real input path: x y presses hold_ms gap_ms.
+COMMANDF(ac3dsqatouch, "iiiii", (int *x, int *y, int *n, int *hold, int *gap) { extern void ac3ds_qa_touch(int, int, int, int, int); ac3ds_qa_touch(*x, *y, *n, *hold, *gap); });
 // QA: save the lower screen as profile/screenshots/<name>.bmp
 COMMANDF(bottomshot, "s", (const char *name)
 {

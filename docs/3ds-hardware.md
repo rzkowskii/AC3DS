@@ -77,6 +77,7 @@ An application gets the larger New-model regions only when its exheader asks for
 
 - **Vertex stage:** three programmable vertex processors plus a geometry-shader unit (which can act as a fourth). The shaders use one ISA, assembled by Picasso. Limits: 96 float vec4 uniforms, 4 int and 16 bool uniforms, up to 16 input attributes (12 vertex arrays), and 7 output registers mapped to fixed semantics (position, color, texcoord0–2, texcoord0.w, normquat, view).
 - **Fixed-function fragment stage:** 6 texture-combiner (TEV) stages plus a combiner buffer, per-fragment lighting with lookup tables, fog, alpha/stencil/depth tests and blending. There are no fragment shaders.
+- **Fog:** a 128-entry table (value plus delta) indexed by the stored depth, after the depth map and any W-buffering. With a hyperbolic Z-buffer and a small near plane, almost every distance falls into the first entry, so the port uses the W-buffer (linear depth) for perspective draws.
 - **Texture units:** units 0–2 are normal. Unit 0 alone can do cube maps, shadow maps and projective lookups. Unit 3 is procedural only.
 - **Textures:** each dimension is a power of two from 8 to 1024. Texels are stored in 8×8 Morton-tiled blocks. Formats: RGBA8, RGB8, RGBA5551, RGB565, RGBA4, IA8, HILO8, I8, A8, IA4, I4, A4, ETC1, and ETC1A4.
 - **Render targets:** color in RGBA8, RGB8, RGB565, RGB5A1 or RGBA4. Depth in D16, D24 or D24S8. Framebuffers are stored rotated 90° (240×400 for the top screen) and tiled. The transfer engine detiles them into the LCD framebuffers.

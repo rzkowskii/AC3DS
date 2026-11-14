@@ -298,8 +298,32 @@ struct FogTable
 {
     C3D_FogLut lut{};
     float near = 0, far = 0, start = 0, end = 0;
-    bool perspective = false, valid = false;
+    int kind = 0; // 0 ortho, 1 hyperbolic Z-buffer, 2 linear W-buffer
+    bool valid = false;
 };
+// Perspective draws use the PICA W-buffer, so stored depth falls linearly
+// with eye distance e: depth = top - slope*e. The world spans 0.96 at the eye
+// to 0 at the far plane, and the hud gun gets the 0.96-1 band in front of it
+// (desktop Cube squeezes the gun's depth range for the same reason). The fog
+// LUT is indexed by this depth, so its 128 entries cover distance evenly and
+// reproduce desktop GL's linear fog. With the hyperbolic Z-buffer one entry
+// spanned everything from about 19 units to the far plane, which fogged
+// mid-distance walls and sky nearly flat grey. Ortho, oblique (water clip)
+// and other projections keep the Z-buffer, as before.
+constexpr float worldDepthTop = .96f, gunDepthSpan = 32.f;
+bool linearDepth = true, hudGunDepth = false;
+struct DepthMap
+{
+    bool w = false, gun = false;
+    float scale = -1, offset = 0, far = 0;
+    bool operator==(const DepthMap &o) const
+    {
+        return w == o.w && gun == o.gun && scale == o.scale && offset == o.offset && far == o.far;
+    }
+};
+DepthMap appliedDepthMap, aimDepthMap;
+bool depthMapValid = false;
+float worldFogFar = 0, aimProjA = 0, aimProjB = 0;
 std::array<FogTable, 4> fogTables{};
 unsigned nextFogTable = 0;
 FogTable *boundFogTable = nullptr;
@@ -676,15 +700,59 @@ void applySamplers()
     }
     samplerDirty = 0;
 }
+DepthMap depthMapFor(const Mat &p)
+{
+    DepthMap d;
+    const float *a = p.a;
+    // Only a plain glFrustum (optionally with a scaled z row, as the hud gun
+    // uses): w = e, and PICA clip z' = alpha*e + beta.
+    if(!linearDepth || a[11] != -1.f || a[3] != 0 || a[7] != 0 || a[15] != 0 ||
+       a[2] != 0 || a[6] != 0 || a[14] == 0) return d;
+    const float alpha = -(a[10]+1.f)*.5f, beta = a[14]*.5f;
+    float slope, top;
+    if(hudGunDepth)
+    {
+        d.gun = true;
+        slope = -(1.f-worldDepthTop)/gunDepthSpan;
+        top = 1.f;
+    }
+    else
+    {
+        d.far = a[14]/(a[10]+1.f);
+        if(!std::isfinite(d.far) || d.far <= 0) return DepthMap{};
+        slope = -worldDepthTop/d.far;
+        top = worldDepthTop;
+    }
+    // W-buffer depth = scale*z' + offset*w = (scale*alpha + offset)*e + scale*beta.
+    d.w = true;
+    d.scale = top/beta;
+    d.offset = slope-d.scale*alpha;
+    return d;
+}
+void syncDepthMap()
+{
+    const DepthMap d = depthMapFor(projection.current);
+    if(depthMapValid && d == appliedDepthMap) return;
+    C3D_DepthMap(!d.w,d.scale,d.offset);
+    if(d.w && !d.gun) worldFogFar = d.far;
+    if(!depthMapValid || d.w != appliedDepthMap.w || d.gun != appliedDepthMap.gun || d.far != appliedDepthMap.far)
+        fogDirty = true;
+    appliedDepthMap = d;
+    depthMapValid = true;
+}
 Mat clipTransform()
 {
     Mat m = multiply(projection.current,model.current);
     Mat out = m;
+    const DepthMap d = depthMapFor(projection.current);
     for(int i = 0; i < 4; ++i)
     {
         if(target == top) { out.at(0,i) = m.at(1,i); out.at(1,i) = -m.at(0,i); }
-        out.at(2,i) = (m.at(2,i)-m.at(3,i))*.5f + (offsetOn ? polyOffset*m.at(3,i) : 0.f);
+        out.at(2,i) = (m.at(2,i)-m.at(3,i))*.5f + (offsetOn && !d.w ? polyOffset*m.at(3,i) : 0.f);
     }
+    // The same constant depth bias in either mode (Z-buffer: depth -= offset).
+    // Under the W-buffer, stored depth gains scale*z', so bias z' by a constant.
+    if(offsetOn && d.w) out.at(2,3) -= polyOffset/d.scale;
     return out;
 }
 void uniformRow(int loc, const Mat &m, int r)
@@ -780,14 +848,29 @@ void applyFog()
 {
     if(!fogOn) return;
     const Mat &p = projection.current;
-    const bool perspective = p.a[11] != 0;
-    float near = perspective ? p.a[14]/(p.a[10]-1.f) : (p.a[14]+1.f)/p.a[10];
-    float far = perspective ? p.a[14]/(p.a[10]+1.f) : (p.a[14]-1.f)/p.a[10];
-    if(!std::isfinite(near) || !std::isfinite(far) || far <= near) { near = .15f; far = 450; }
+    int kind;
+    float near, far;
+    if(depthMapValid && appliedDepthMap.w)
+    {
+        // Linear depth: entry i is at eye distance (top - i/128)/top * far.
+        // The hud gun band (depth above top) reads as distance 0, unfogged.
+        kind = 2;
+        near = 0;
+        far = appliedDepthMap.gun ? worldFogFar : appliedDepthMap.far;
+        if(!std::isfinite(far) || far <= 0) far = 450;
+    }
+    else
+    {
+        const bool perspective = p.a[11] != 0;
+        kind = perspective ? 1 : 0;
+        near = perspective ? p.a[14]/(p.a[10]-1.f) : (p.a[14]+1.f)/p.a[10];
+        far = perspective ? p.a[14]/(p.a[10]+1.f) : (p.a[14]-1.f)/p.a[10];
+        if(!std::isfinite(near) || !std::isfinite(far) || far <= near) { near = .15f; far = 450; }
+    }
     for(FogTable &table : fogTables)
     {
         if(!table.valid || table.near != near || table.far != far || table.start != fogNear ||
-           table.end != fogFar || table.perspective != perspective) continue;
+           table.end != fogFar || table.kind != kind) continue;
         if(boundFogTable != &table) C3D_FogLutBind(&table.lut);
         boundFogTable = &table;
         return;
@@ -796,7 +879,8 @@ void applyFog()
     for(int i = 0; i <= 128; ++i)
     {
         float depth = i/128.f;
-        float z = perspective ? FogLut_CalcZ(depth,near,far) : far-depth*(far-near);
+        float z = kind == 2 ? std::max(0.f,worldDepthTop-depth)/worldDepthTop*far :
+                  kind == 1 ? FogLut_CalcZ(depth,near,far) : far-depth*(far-near);
         float v = sat((fogFar-z)/std::max(fogFar-fogNear,.0001f));
         if(i < 128) data[i] = v;
         if(i) data[i+127] = v-prev;
@@ -808,7 +892,7 @@ void applyFog()
     table.far = far;
     table.start = fogNear;
     table.end = fogFar;
-    table.perspective = perspective;
+    table.kind = kind;
     table.valid = true;
     C3D_FogLutBind(&table.lut);
     boundFogTable = &table;
@@ -827,6 +911,7 @@ void apply(bool clip)
     if(rasterDirty) { applyRaster(clip); rasterDirty = false; }
     if(tevDirty) { applyTex(); tevDirty = false; }
     else if(samplerDirty) applySamplers();
+    if(transformDirty || clip || !depthMapValid) syncDepthMap();
     if(clip != clipWasOn || (!clip && transformDirty))
     {
         const Mat m = clip ? Mat::identity() : clipTransform();
@@ -1608,6 +1693,7 @@ bool ac3ds_gl_init()
         GX_TRANSFER_FLIP_VERT(0)|GX_TRANSFER_OUT_TILED(0)|GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8)|
         GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB8)|GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO));
     C3D_DepthMap(true,-1.f,0.f);
+    depthMapValid = false;
     C3D_EarlyDepthTest(false,GPU_EARLYDEPTH_GREATER,0);
     C3D_FrameRate(60.f);
     pending.reserve(8192);
@@ -1659,6 +1745,7 @@ void ac3ds_gl_shutdown()
     depthOn = blendOn = stencilOn = cullOn = alphaOn = fogOn = scissorOn = false;
     writeDepth = true; colorMask = 15; wireframe = offsetOn = false;
     boundFogTable = nullptr;
+    depthMapValid = hudGunDepth = false;
     tevInitialized = false;
     viewportValid = false;
     rasterStateValid = false;
@@ -3121,6 +3208,18 @@ void glGetTexImage(GLenum,GLint level,GLenum format,GLenum type,GLvoid *dest)
     for(int j = 0; j < h; ++j) for(int i = 0; i < w; ++i)
         outputPixel(dst+j*pitch+i*bpp,format,readTexel(src+tiled(i*tw/w,j*th/h,tw)*dbpp,t->gpu.fmt));
 }
+void ac3ds_gl_set_linear_depth(bool enabled)
+{
+    if(linearDepth == enabled) return;
+    if(ready) dirtyTransform();
+    linearDepth = enabled;
+}
+void ac3ds_gl_set_hud_gun_depth(bool on)
+{
+    if(hudGunDepth == on) return;
+    if(ready) dirtyTransform();
+    hudGunDepth = on;
+}
 bool ac3ds_gl_queue_aim_depth()
 {
     aimQueued = false;
@@ -3134,6 +3233,9 @@ bool ac3ds_gl_queue_aim_depth()
     const unsigned x = screenH/2, y = screenW/2;
     const size_t offset = tiled(x&~7u,y&~7u,screenH);
     const auto *depth = static_cast<const u32 *>(top->frameBuf.depthBuf);
+    aimDepthMap = depthMapFor(projection.current);
+    aimProjA = projection.current.a[10];
+    aimProjB = projection.current.a[14];
     queuedGx += 2;
     aimQueued = R_SUCCEEDED(GSPGPU_FlushDataCache(aimTile,256)) &&
         R_SUCCEEDED(GX_TextureCopy(const_cast<u32 *>(depth+offset),0,aimTile,0,256,8));
@@ -3145,7 +3247,15 @@ bool ac3ds_gl_take_aim_depth(float &depth)
     aimQueued = false;
     if(R_FAILED(GSPGPU_InvalidateDataCache(aimTile,256))) return false;
     const u32 value = aimTile[morton(screenH/2,screenW/2)]&0xffffff;
-    depth = 1.f-value*(1.f/16777215.f);
+    if(aimDepthMap.w && value)
+    {
+        // Linear depth back to eye distance, then to the GL window depth of
+        // the same projection, which resolveaim() unprojects.
+        const float stored = value*(1.f/16777215.f);
+        const float e = std::max(std::max(0.f,worldDepthTop-stored)/worldDepthTop*aimDepthMap.far,1e-3f);
+        depth = sat(.5f*((aimProjB-aimProjA*e)/e+1.f));
+    }
+    else depth = 1.f-value*(1.f/16777215.f);
     return true;
 }
 
