@@ -7,6 +7,10 @@ mapmodelattributes loadingattributes;
 
 #include "tristrip.h"
 #include "modelcache.h"
+#include "loadprofile_3ds.h"
+#ifdef __3DS__
+#include "system.h"
+#endif
 #include "vertmodel.h"
 
 #ifdef __3DS__
@@ -407,6 +411,7 @@ model *loadmodel(const char *name, int i, bool trydl)     // load model by name 
     if(mm) m = *mm;                             // a model of that name is already loaded
     else
     {
+        AC3DS_LOAD_TIME(AC3DS_LOAD_MODEL_TOTAL);
         pushscontext(IEXC_MDLCFG);
         m = new md2(name);                      // try md2
         loadingmodel = m;
@@ -1202,6 +1207,7 @@ int findanim(const char *name)
 
 void loadskin(const char *dir, const char *altdir, Texture *&skin) // model skin sharing
 {
+    AC3DS_LOAD_TIME(AC3DS_LOAD_MODEL_SKIN);
     bool old_silent_texture_load = silent_texture_load;
     silent_texture_load = true;
     #define ifnoload if((skin = textureload(path))==notexture)
@@ -1261,8 +1267,15 @@ bool preload_mapmodels(bool trydl)
         mapmodels[ents[i].attr2].flags |= MMF_TEMP_USED;
         if(e.attr4 && lookuptexture(e.attr4, notexture, trydl) == notexture && (!_ignoreillegalpaths || gettextureslot(e.attr4))) missing++;
     }
+#ifdef __3DS__
+    int modeltotal = 0, modeldone = 0;
+    loopv(mapmodels) if(mapmodels[i].flags & (MMF_REQUIRED | MMF_TEMP_USED)) ++modeltotal;
+#endif
     loopv(mapmodels) if(mapmodels[i].flags & (MMF_REQUIRED | MMF_TEMP_USED))
     {
+#ifdef __3DS__
+        ac3ds_loading_screen(NULL, NULL, 0.60f + 0.30f * float(modeldone++) / max(modeltotal, 1));
+#endif
         model *m = loadmodel(NULL, i, trydl);
         if(!m) missing++;
 #ifdef __3DS__

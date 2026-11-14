@@ -6,11 +6,15 @@
 #include "system.h"
 #include "audio_3ds.h"
 #include "performance.h"
+#include "crash_3ds.h"
 static bool native_graphics = false, native_network = false, native_dedicated = false;
 #endif
 
 void cleanup(char *msg)         // single program exit point;
 {
+#ifdef __3DS__
+    ac3ds_crash_stop_watchdog();
+#endif
     if(clientlogfile) clientlogfile->fflush();
     if(!msg)
     {
@@ -1388,6 +1392,7 @@ void sanitychecks()
 int main(int argc, char **argv)
 {
 #ifdef __3DS__
+    ac3ds_crash_install("main");
     if(const char *error = ac3ds_system_init()) fatal("%s", error);
     ac3ds_read_launch_arguments(argc, argv);
 #endif
@@ -1427,7 +1432,21 @@ int main(int argc, char **argv)
     persistidents = false;
 
 #ifdef __3DS__
-    #define initlog(s) do { clientlogf("init: " s); if(clientlogfile) clientlogfile->fflush(); } while(0)
+    // Startup progress on the lower screen, by stage.
+    auto startupprogress = [](const char *stage)
+    {
+        static const struct { const char *stage, *label; float progress; } steps[] = {
+            { "video: sdl", "Starting video", 0.03f }, { "video: mode", "Starting video", 0.05f },
+            { "video: misc", "Starting video", 0.07f }, { "gl", "Starting the renderer", 0.10f },
+            { "console", "Loading fonts", 0.14f }, { "console icons loaded", "Loading fonts", 0.18f },
+            { "startup screen", "Checking the graphics chip", 0.22f }, { "particles", "Loading effects", 0.32f },
+            { "sound", "Starting audio", 0.40f }, { "cfg", "Reading configuration", 0.50f },
+            { "models", "Loading player and weapon models", 0.65f }, { "docs", "Loading help", 0.85f },
+            { "localconnect", "Starting the game", 0.92f }, { "mainloop", "Starting the game", 1.0f } };
+        for(const auto &step : steps)
+            if(!strcmp(step.stage, stage)) { ac3ds_loading_screen("Starting up", step.label, step.progress); return; }
+    };
+    #define initlog(s) do { AC3DS_PHASE("init: " s); startupprogress(s); clientlogf("init: " s); if(clientlogfile) clientlogfile->fflush(); } while(0)
 #else
     #define initlog(s) clientlogf("init: " s)
 #endif
@@ -1636,30 +1655,67 @@ int main(int argc, char **argv)
 
 #ifdef __3DS__
     initlog("startup screen");
-    auto awaitStartupGpu = [](const char *stage)
+    // Each stage adds one part of the renderer and waits for the GPU queue.
+    // A stage that never completes is named in the log and on the touch screen.
+    auto awaitStartupGpu = [](const char *stage, const char *meaning)
     {
-        uint32_t status = 0;
+        uint32_t status = 0, state[6] = {};
         int32_t result = 0;
-        if(ac3ds_gl_drain_startup_frame(status,result)) return true;
-        clientlogf("init: startup %s GPU timeout (busy=%08x read=%08x)",stage,unsigned(status),unsigned(result));
+        if(ac3ds_gl_drain_startup_frame(status,result))
+        {
+            clientlogf("init: startup %s completed",stage);
+            return true;
+        }
+        ac3ds_gl_startup_state(state);
+        clientlogf("init: startup %s GPU timeout (busy=%08x read=%08x gx=%08x err=%08x list=%08x+%x free=%08x)",
+                   stage,unsigned(status),unsigned(result),unsigned(state[0]),unsigned(state[1]),
+                   unsigned(state[2]),unsigned(state[3]),unsigned(state[5]));
         if(clientlogfile) clientlogfile->fflush();
+        defformatstring(l0)("Stopped at: %s",stage);
+        defformatstring(l2)("busy %08x  gx %08x",unsigned(state[4]),unsigned(state[0]));
+        defformatstring(l3)("err  %08x  len %x",unsigned(state[1]),unsigned(state[3]));
+        const char *lines[] = { l0, meaning, l2, l3, "", "Log and command lists are in", "/3ds/assaultcube/profile/", "", "Hold POWER to switch off." };
+        ac3ds_show_startup_report(lines,int(sizeof(lines)/sizeof(*lines)));
         while(aptMainLoop()) svcSleepThread(100000000);
         return false;
     };
+    ac3ds_gl_set_command_dumps(6);
     ac3ds_gl_startup_clear();
-    initlog("startup clear submitted");
-    if(!awaitStartupGpu("clear")) return EXIT_FAILURE;
-    initlog("startup clear presented");
+    if(!awaitStartupGpu("clear","Screen clear did not finish.")) return EXIT_FAILURE;
     ac3ds_draw_controls();
+    ac3ds_gl_probe_empty();
+    if(!awaitStartupGpu("empty list","GPU command lists do not complete.")) return EXIT_FAILURE;
+    ac3ds_gl_probe_minimal();
+    if(!awaitStartupGpu("minimal draw","A plain triangle does not complete.")) return EXIT_FAILURE;
     ac3ds_gl_startup_draw();
-    initlog("startup untextured draw submitted");
-    if(!awaitStartupGpu("untextured draw")) return EXIT_FAILURE;
-    initlog("startup untextured draw presented");
+    if(!awaitStartupGpu("game shader draw","The game vertex path stalls.")) return EXIT_FAILURE;
+    {
+        // The projection program is only needed for water. If a launch stops
+        // inside its check, the next launch runs without it.
+        const char *marker = "sdmc:/3ds/assaultcube/profile/gpu-projective.txt";
+        char previous[16] = "";
+        if(FILE *f = fopen(marker,"r")) { if(!fgets(previous,sizeof(previous),f)) previous[0] = 0; fclose(f); }
+        auto mark = [marker](const char *state) { if(FILE *f = fopen(marker,"w")) { fputs(state,f); fclose(f); } };
+        if(!strncmp(previous,"pending",7) || !strncmp(previous,"off",3))
+        {
+            if(previous[0] == 'p') mark("off");
+            ac3ds_gl_set_projective(false);
+            clientlogf("init: projection textures disabled after an earlier stalled check");
+        }
+        else
+        {
+            if(strncmp(previous,"ok",2)) mark("pending");
+            ac3ds_gl_probe_projective();
+            if(!awaitStartupGpu("projection draw","Restart: water will use the fallback.")) return EXIT_FAILURE;
+            if(strncmp(previous,"ok",2)) mark("ok");
+        }
+    }
 #endif
     loadingscreen();
 
 #ifdef __3DS__
-    if(!awaitStartupGpu("splash")) return EXIT_FAILURE;
+    if(!awaitStartupGpu("splash","The first textured draw stalls.")) return EXIT_FAILURE;
+    ac3ds_gl_set_command_dumps(0);
     initlog("particles");
 #endif
     particleinit();
@@ -1774,6 +1830,9 @@ int main(int argc, char **argv)
     if(initscript) execute(initscript);
 
     initlog("mainloop");
+#ifdef __3DS__
+    ac3ds_crash_start_watchdog();
+#endif
 
     inputgrab(grabinput = true);
 
@@ -1793,6 +1852,8 @@ int main(int argc, char **argv)
     for(;;)
     {
 #ifdef __3DS__
+        AC3DS_PHASE("system events");
+        ac3ds_crash_tick();
         if(!ac3ds_main_loop()) break;
         if(ac3ds_take_clock_reset())
         {
@@ -1836,13 +1897,20 @@ int main(int argc, char **argv)
         extern void ac3ds_resolve_aim();
         ac3ds_resolve_aim();
         Ac3dsPhaseTimer updatePhase(Ac3dsPhase::Update);
+        AC3DS_PHASE("input");
 #endif
         checkinput();
 
+#ifdef __3DS__
+        AC3DS_PHASE("update world");
+#endif
         if(lastmillis) updateworld(curtime, lastmillis);
 
         if(needsautoscreenshot) showscores(true);
 
+#ifdef __3DS__
+        AC3DS_PHASE("server slice");
+#endif
         serverslice(0);
 #ifdef __3DS__
         updatePhase.stop();
@@ -1853,11 +1921,13 @@ int main(int argc, char **argv)
 
 #ifdef __3DS__
         Ac3dsPhaseTimer audioPhase(Ac3dsPhase::Audio);
+        AC3DS_PHASE("audio");
 #endif
         audiomgr.updateaudio();
 #ifdef __3DS__
         audioPhase.stop();
         Ac3dsPhaseTimer rayPhase(Ac3dsPhase::Rays);
+        AC3DS_PHASE("ray table");
 #endif
         computeraytable(camera1->o.x, camera1->o.y, dynfov());
 #ifdef __3DS__
@@ -1866,10 +1936,13 @@ int main(int argc, char **argv)
         if(frames>3 && !minimized)
         {
 #ifdef __3DS__
+            AC3DS_PHASE("begin frame");
             ac3ds_gl_begin_frame();
+            AC3DS_PHASE("draw frame");
 #endif
             gl_drawframe(screenw, screenh, fps<lowfps ? fps/lowfps : (fps>highfps ? fps/highfps : 1.0f), fps, elapsed);
 #ifdef __3DS__
+            AC3DS_PHASE("present");
             swapbuffers();
             extern void ac3ds_report_profile();
             ac3ds_report_profile();
@@ -1902,6 +1975,15 @@ int main(int argc, char **argv)
 #ifdef _DEBUG
         if(millis>lastflush+60000) { fflush(stdout); lastflush = millis; }
 #endif
+#ifdef __3DS__
+        AC3DS_PHASE("frame end");
+        if(frames <= 6 || frames % 1800 == 0)
+        {
+            // Progress marks for handheld runs, flushed so a hang leaves a trace.
+            clientlogf("frame %d done (%d ms)", frames, elapsed);
+            if(clientlogfile) clientlogfile->fflush();
+        }
+#endif
         pollautodownloadresponse();
         if(onceauthed && sk)
         {
@@ -1917,6 +1999,16 @@ int main(int argc, char **argv)
     } __except(stackdumper(0, GetExceptionInformation()), EXCEPTION_CONTINUE_SEARCH) { return 0; }
 #endif
 }
+
+#ifdef __3DS__
+// QA: save the lower screen as profile/screenshots/<name>.bmp
+COMMANDF(bottomshot, "s", (const char *name)
+{
+    defformatstring(file)("screenshots/%s.bmp", *name ? name : "bottom");
+    const char *target = findfile(path(file), "wb");
+    conoutf(ac3ds_save_bottom_screen(target) ? "saved lower screen to %s" : "could not save %s", target);
+});
+#endif
 
 VAR(version, 1, AC_VERSION, 0);
 VAR(protocol, 1, PROTOCOL_VERSION, 0);

@@ -369,7 +369,7 @@ struct vertmodel : model
                 else if(d->prev.fr1 < 0) return d;
             }
 
-            d = (owner->numframes > 1 || as.anim&ANIM_DYNALLOC ? dynalloc : statalloc).allocate<shadowcacheentry>(9*numtris*sizeof(ushort));
+            d = (owner->numframes > 1 || as.anim&ANIM_DYNALLOC ? dynalloc : statalloc).allocate<shadowcacheentry>((9*numtris + 3)*sizeof(ushort)); // +3: alignment pad below
             if(!d) return NULL;
 #ifdef __3DS__
             d->upload = uploadserial();
@@ -412,6 +412,11 @@ struct vertmodel : model
 
             if(dbgstenc >= (owner->numframes > 1 || as.anim&ANIM_DYNALLOC ? 2 : 1)) conoutf("%s: %d tris", owner->filename, int((idx - d->idxs()) / 3));
 
+            // Each silhouette edge adds 6 bytes. An odd edge count would leave
+            // the next cache entry 2 bytes off a word boundary, and the ARM11
+            // faults on multi-word stores to it (Azahar does not). Pad with one
+            // degenerate triangle so the trimmed entry stays 4-byte aligned.
+            if((idx - d->idxs()) % 2) { *idx++ = numverts; *idx++ = numverts; *idx++ = numverts; }
             d->size = (uchar *)idx - (uchar *)d;
             return d;
         }
@@ -1309,6 +1314,7 @@ struct vertmodel : model
 
         void calcneighbors()
         {
+            AC3DS_LOAD_TIME(AC3DS_LOAD_MODEL_NEIGHBORS);
             loopv(meshes) meshes[i]->calcneighbors();
         }
 

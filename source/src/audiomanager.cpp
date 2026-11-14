@@ -255,6 +255,15 @@ bool audiomanager::preloadmapsound(entity &e, bool trydl)
 #endif
     if(e.type!=SOUND || !mapsounds.inrange(e.attr1)) return false;
     sbuffer *buf = mapsounds[e.attr1].buf;
+#ifdef __3DS__
+    // Ambient Ogg loops decode on core 2 after the map is playable.
+    if(!trydl)
+    {
+        if(!buf->loadasync()) { conoutf("\f3failed to load sample %s", buf->name); return false; }
+        return true;
+    }
+    if(buf->loadasync()) return true;
+#endif
     if(!buf->load(trydl) && !trydl) { conoutf("\f3failed to load sample %s", buf->name); return false; }
     return true;
 }
@@ -612,6 +621,9 @@ VARP(heartbeat, 0, 0, 99);
 
 void audiomanager::updateaudio()
 {
+#ifdef __3DS__
+    ac3ds_async_sounds_poll();
+#endif
     if(nosound) return;
 
     alcSuspendContext(context); // don't process sounds while we mess around

@@ -39,8 +39,19 @@ struct console : consolebuffer<cline>
 
     void render()
     {
+#ifdef __3DS__
+        // Desktop-scaled console text is about 4 pixels tall at 400x240.
+        extern int hudtextscale;
+        const float s = hudtextscale / 100.0f;
+        glPushMatrix();
+        glScalef(s, s, 1);
+        int conwidth = int(((fullconsole ? VIRTW : int(floor(getradarpos().x)))*2) / s) - 2*CONSPAD - 2*FONTH/3;
+        int h = int(VIRTH*2 / s) - 2*CONSPAD - 2*FONTH/3;
+        struct PopScale { ~PopScale() { glPopMatrix(); } } popscale;
+#else
         int conwidth = (fullconsole ? VIRTW : int(floor(getradarpos().x)))*2 - 2*CONSPAD - 2*FONTH/3;
         int h = VIRTH*2 - 2*CONSPAD - 2*FONTH/3;
+#endif
         int conheight = min(fullconsole ? (h*(fullconsole==1 ? altconsize : fullconsize))/100 : FONTH*consize, h);
 
         if(fullconsole) blendbox(CONSPAD, CONSPAD, conwidth+CONSPAD+2*FONTH/3, conheight+CONSPAD+2*FONTH/3, true);

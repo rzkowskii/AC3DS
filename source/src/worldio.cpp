@@ -1,6 +1,17 @@
 // worldio.cpp: loading & saving of maps and savegames
 
 #include "cube.h"
+#ifdef __3DS__
+#include "crash_3ds.h"
+// Map loads take tens of seconds on the handheld. Name each stage and flush
+// the log so a slow stage can be told apart from a stalled one.
+#include "loadprofile_3ds.h"
+#include "texprefetch_3ds.h"
+#include "system.h"
+#define AC3DS_LOAD_STAGE(name, label, progress) do { AC3DS_PHASE("load map: " name); ac3ds_loading_screen(NULL, label, progress); clientlogf("load map: " name); if(clientlogfile) clientlogfile->fflush(); } while(0)
+#else
+#define AC3DS_LOAD_STAGE(name, label, progress) do {} while(0)
+#endif
 
 #define DEBUGCOND (worldiodebug==1)
 VARP(worldiodebug, 0, 0, 1);
@@ -926,6 +937,18 @@ bool incompatiblemap = false;
 
 int load_world(char *mname)        // still supports all map formats that have existed since the earliest cube betas!
 {
+#ifdef __3DS__
+    const char *const previousPhase = ac3ds_crash_phase;
+    AC3DS_PHASE("load map");
+    ac3ds_load_profile_reset();
+    clientlogf("loading map %s", mname);
+    if(clientlogfile) clientlogfile->fflush();
+    struct RestorePhase { const char *p; ~RestorePhase() { ac3ds_crash_phase = p; ac3ds_loading_done(); } } restorePhase{previousPhase};
+    {
+        defformatstring(loadingtitle)("%s", mname);
+        ac3ds_loading_screen(loadingtitle, "Reading the map", 0.02f);
+    }
+#endif
     incompatiblemap = false;
     const int sizeof_header = sizeof(header), sizeof_baseheader = sizeof_header - sizeof(int) * 16;
     stopwatch watch;
@@ -1098,6 +1121,7 @@ int load_world(char *mname)        // still supports all map formats that have e
     calclight();
     conoutf("read map %s rev %d (%d milliseconds)", cgzname, hdr.maprevision, watch.elapsed());
     conoutf("%s", hdr.maptitle);
+    AC3DS_LOAD_STAGE("map config", "Reading the map settings", 0.06f);
     mapconfigerror = 0;
     pushscontext(IEXC_MAPCFG); // untrusted altogether
     if(hdr.flags & MHF_AUTOMAPCONFIG)
@@ -1115,12 +1139,32 @@ int load_world(char *mname)        // still supports all map formats that have e
 
     c2skeepalive();
 
+    AC3DS_LOAD_STAGE("textures", "Loading textures", 0.10f);
     watch.start();
+#ifdef __3DS__
+    extern void ac3ds_prefetch_world_textures(const char *texuse);
+    ac3ds_texprefetch_begin();
+    ac3ds_prefetch_world_textures(texuse);
+#endif
+#ifdef __3DS__
+    int textotal = 0, texdone = 0;
+    loopi(256) if(texuse[i]) ++textotal;
+    loopi(256) if(texuse[i])
+    {
+        lookupworldtexture(i, autodownload ? true : false);
+        ac3ds_loading_screen(NULL, NULL, 0.10f + 0.50f * float(++texdone) / max(textotal, 1));
+    }
+#else
     loopi(256) if(texuse[i]) lookupworldtexture(i, autodownload ? true : false);
+#endif
+#ifdef __3DS__
+    ac3ds_texprefetch_end([](const char *line) { clientlogf("%s", line); });
+#endif
     int texloadtime = watch.elapsed();
 
     c2skeepalive();
 
+    AC3DS_LOAD_STAGE("map models", "Loading map models", 0.60f);
     watch.start();
     if(autodownload) resetmdlnotfound();
     preload_mapmodels(autodownload ? true : false);
@@ -1128,18 +1172,21 @@ int load_world(char *mname)        // still supports all map formats that have e
 
     c2skeepalive();
 
+    AC3DS_LOAD_STAGE("map sounds", "Queuing ambient sounds", 0.90f);
     watch.start();
     audiomgr.preloadmapsounds(autodownload ? true : false);
     int audioloadtime = watch.elapsed();
 
     c2skeepalive();
 
+    AC3DS_LOAD_STAGE("package downloads", "Checking for missing content", 0.93f);
     watch.start();
     int downloaded = downloadpackages();
     if(downloaded > 0) clientlogf("downloaded content (%d KB in %d seconds)", downloaded/1024, watch.elapsed()/1000);
 
     c2skeepalive();
 
+    AC3DS_LOAD_STAGE("sky and checks", "Loading the sky", 0.96f);
     res |= loadskymap(true) ? 0 : LWW_MISSINGMEDIA * 1;
 
     watch.start();
@@ -1153,6 +1200,9 @@ int load_world(char *mname)        // still supports all map formats that have e
     watch.start();
     res |= audiomgr.preloadmapsounds(false) ? 0 : LWW_MISSINGMEDIA * 8; // also set, if soundvol == 0, because no sounds are loaded (or checked) in that case
     clientlogf("loaded mapsounds (%d milliseconds)", audioloadtime+watch.elapsed());
+#ifdef __3DS__
+    ac3ds_load_profile_report([](const char *line) { clientlogf("%s", line); });
+#endif
     c2skeepalive();
 #ifdef __3DS__
     textureload("packages/misc/damage.png", 3);

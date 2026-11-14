@@ -318,21 +318,23 @@ int connectwithtimeout(ENetSocket sock, const char *hostname, ENetAddress &addre
     show_out_of_renderloop_progress(0, text);
 
 #ifdef __3DS__
-    if(enet_socket_set_option(sock, ENET_SOCKOPT_NONBLOCK, 1) == 0 && enet_socket_connect(sock, &address) == 0)
+    if(void *pending = enet_3ds_connect_begin(sock, &address))
     {
         Uint32 start = SDL_GetTicks();
-        while(SDL_GetTicks() - start < CONNLIMIT)
+        for(;;)
         {
-            int status = enet_3ds_connect_status(sock, 100);
-            if(status <= 0)
+            int status = enet_3ds_connect_poll(pending, 100);
+            if(status == 0) return 0;
+            if(status < 0) break;
+            if(SDL_GetTicks() - start >= CONNLIMIT || (show_out_of_renderloop_progress(min(float(SDL_GetTicks() - start)/CONNLIMIT, 1.0f), text), interceptkey(SDLK_ESCAPE)))
             {
-                if(status == 0) return 0;
-                break;
+                enet_3ds_connect_abandon(pending); // closes the socket when the connect returns
+                clientlogf("connect to %s:%d failed: %s", hostname, address.port, enet_3ds_connect_diag());
+                return -1;
             }
-            show_out_of_renderloop_progress(min(float(SDL_GetTicks() - start)/CONNLIMIT, 1.0f), text);
-            if(interceptkey(SDLK_ESCAPE)) break;
         }
     }
+    clientlogf("connect to %s:%d failed: %s", hostname, address.port, enet_3ds_connect_diag());
     enet_socket_destroy(sock);
     return -1;
 #else

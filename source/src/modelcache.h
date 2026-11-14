@@ -97,7 +97,9 @@ struct modelcache
     template<class T>
     T *allocate(size_t reqsize)
     {
-        reqsize += sizeof(T);
+        // Keep every entry 8-byte aligned. ARM11 faults on multi-word and VFP
+        // stores to an unaligned entry, which odd-sized shadow data produced.
+        reqsize = (reqsize + sizeof(T) + 7) & ~size_t(7);
         if(reqsize > size) return NULL;
 
         if(!curalloc)
@@ -111,7 +113,9 @@ struct modelcache
 
         if(curalloc) for(bool failed = false;;)
         {
-            uchar *nextfree = curalloc ? (uchar *)curalloc + curalloc->size : (uchar *)buf;
+            // Entries may be trimmed after filling (shadow volumes are), so
+            // round the next start up rather than trusting the trimmed size.
+            uchar *nextfree = curalloc ? (uchar *)curalloc + ((curalloc->size + 7) & ~size_t(7)) : (uchar *)buf;
             entry *nextused = curalloc ? curalloc->nextalloc : (entry *)buf;
             for(;;)
             {

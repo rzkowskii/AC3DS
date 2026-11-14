@@ -2132,6 +2132,51 @@ void *ac3ds_gl_proc(const char *s)
     if(!std::strcmp(s,"glDrawRangeElementsEXT")) return reinterpret_cast<void *>(rangeElements);
     return nullptr;
 }
+// Queues a hardware copy of a rendered RGBA8 texture into an RGB565 linear
+// buffer (the transfer engine detiles and converts). The copy is in
+// GPU order after everything drawn so far, so the caller reads it two frames
+// later, after invalidating the data cache. Used for the lower-screen radar.
+bool ac3ds_gl_queue_readback_565(GLuint id, u16 **out, int *outw, int *outh)
+{
+    Tex *t = findTex(id);
+    if(!ready || !t || !t->target || !t->gpu.data || t->gpu.fmt != GPU_RGBA8) return false;
+    const int sw = t->gpu.width, sh = t->gpu.height, dw = sw, dh = sh;
+    if(dw < 64 || dh < 16) return false;
+    static u16 *staging = nullptr;
+    static size_t stagingBytes = 0;
+    const size_t bytes = size_t(dw) * dh * sizeof(u16);
+    if(stagingBytes < bytes)
+    {
+        if(staging) linearFree(staging);
+        staging = static_cast<u16 *>(linearAlloc(bytes));
+        stagingBytes = staging ? bytes : 0;
+        if(!staging) return false;
+    }
+    const bool wasOpen = frame;
+    submitPending();
+    if(!startFrame(false)) return false;
+    reserveCommands();
+    C3D_FrameSplit(submitFlags);
+    queuedGx += 2;
+    const bool queued = R_SUCCEEDED(GSPGPU_FlushDataCache(staging, bytes)) &&
+        R_SUCCEEDED(GX_DisplayTransfer(static_cast<u32 *>(t->gpu.data), GX_BUFFER_DIM(sw, sh),
+                                       reinterpret_cast<u32 *>(staging), GX_BUFFER_DIM(dw, dh),
+                                       GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) |
+                                       GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB565) |
+                                       GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO)));
+    recycleFrame();
+    if(!wasOpen)
+    {
+        C3D_FrameEnd(fullFlush ? 0 : submitFlags);
+        frame = false;
+        frameHasVblank = false;
+    }
+    *out = staging;
+    *outw = dw;
+    *outh = dh;
+    return queued;
+}
+
 bool ac3ds_gl_render_to_texture(GLuint id)
 {
     Tex *t = findTex(id);
@@ -2911,6 +2956,73 @@ void glPixelStorei(GLenum key,GLint i)
     if(key == GL_PACK_ALIGNMENT) packAlignment = i;
     else if(key == GL_UNPACK_ALIGNMENT) unpackAlignment = i;
 }
+// Writes a source image into PICA 8x8 Morton-tiled texels, one tile at a time.
+// Produces the same texels as decode() + writeTexel() + tiled() per pixel, with
+// lookup tables for the tile order, source columns and RGB565 quantization,
+// and direct paths for the formats map loads use.
+void uploadTiled(u8 *dst,GPU_TEXCOLOR fmt,int dbpp,int tw,int th,const u8 *src,GLenum format,int bpp,int pitch,int w,int h)
+{
+    static u8 order[64];
+    static u8 r5[256], g6[256];
+    static bool tables = false;
+    if(!tables)
+    {
+        for(unsigned i = 0; i < 64; ++i) order[i] = u8(morton(i&7,i>>3));
+        for(unsigned v = 0; v < 256; ++v) { r5[v] = u8((v*31+127)/255); g6[v] = u8((v*63+127)/255); }
+        tables = true;
+    }
+    if((tw&7) || (th&7))
+    {
+        for(int y = 0; y < th; ++y) for(int x = 0; x < tw; ++x)
+            writeTexel(dst+tiled(x,y,tw)*dbpp,fmt,decode(src+(y*h/th)*pitch+(x*w/tw)*bpp,format));
+        return;
+    }
+    static std::vector<int> columns;
+    columns.resize(tw);
+    for(int x = 0; x < tw; ++x) columns[x] = (x*w/tw)*bpp;
+    const int *col = columns.data();
+    for(int ty = 0; ty < th; ty += 8) for(int tx = 0; tx < tw; tx += 8)
+    {
+        u8 *tile = dst + size_t((ty/8)*(tw/8)+tx/8)*64*dbpp;
+        for(int py = 0; py < 8; ++py)
+        {
+            const u8 *row = src + ((ty+py)*h/th)*pitch;
+            const u8 *ord = order + py*8;
+            const int *c = col + tx;
+            if(format == GL_RGB && fmt == GPU_RGB565)
+            {
+                for(int px = 0; px < 8; ++px)
+                {
+                    const u8 *p = row + c[px];
+                    const u16 v = u16(r5[p[0]] << 11 | g6[p[1]] << 5 | r5[p[2]]);
+                    std::memcpy(tile + ord[px]*2,&v,2);
+                }
+            }
+            else if(format == GL_RGB && fmt == GPU_RGB8)
+            {
+                for(int px = 0; px < 8; ++px)
+                {
+                    const u8 *p = row + c[px];
+                    u8 *o = tile + ord[px]*3;
+                    o[0] = p[2]; o[1] = p[1]; o[2] = p[0];
+                }
+            }
+            else if(format == GL_RGBA && fmt == GPU_RGBA8)
+            {
+                for(int px = 0; px < 8; ++px)
+                {
+                    const u8 *p = row + c[px];
+                    u8 *o = tile + ord[px]*4;
+                    o[0] = p[3]; o[1] = p[2]; o[2] = p[1]; o[3] = p[0];
+                }
+            }
+            else
+            {
+                for(int px = 0; px < 8; ++px) writeTexel(tile + ord[px]*dbpp,fmt,decode(row + c[px],format));
+            }
+        }
+    }
+}
 void glTexImage2D(GLenum,GLint level,GLint internal,GLsizei w,GLsizei h,GLint,GLenum format,GLenum type,const void *source)
 {
     Tex *t = bound();
@@ -2949,14 +3061,9 @@ void glTexImage2D(GLenum,GLint level,GLint internal,GLsizei w,GLsizei h,GLint,GL
     const int tw = t->gpu.width>>level, th = t->gpu.height>>level;
     const int bpp = pixelSize(format), dbpp = gpuPixelSize(t->gpu.fmt), pitch = aligned(w*bpp,unpackAlignment);
     const auto *src = static_cast<const u8 *>(source);
-    for(int y = 0; y < th; ++y) for(int x = 0; x < tw; ++x)
-    {
-        // Upsample dimensions below the hardware's 8-pixel tile minimum so
-        // wrap periods and normalized texture coordinates stay unchanged.
-        int sx = x*w/tw, sy = y*h/th;
-        u32 color = decode(src+sy*pitch+sx*bpp,format);
-        writeTexel(dst+tiled(x,y,tw)*dbpp,t->gpu.fmt,color);
-    }
+    // Upsample dimensions below the hardware's 8-pixel tile minimum so wrap
+    // periods and normalized texture coordinates stay unchanged.
+    uploadTiled(dst,t->gpu.fmt,dbpp,tw,th,src,format,bpp,pitch,w,h);
     t->dirty = true;
 }
 void glReadPixels(GLint x,GLint y,GLsizei w,GLsizei h,GLenum format,GLenum type,GLvoid *dest)

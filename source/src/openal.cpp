@@ -1,8 +1,15 @@
 // simple OpenAL call wrappers
 
 #include "cube.h"
+#include "loadprofile_3ds.h"
 #ifdef __3DS__
 #include "audio_3ds.h"
+extern "C" {
+#include <3ds/types.h>
+#include <3ds/svc.h>
+#include <3ds/synchronization.h>
+#include <3ds/thread.h>
+}
 
 COMMANDF(ac3dsaudiostats, "", ()
 {
@@ -347,10 +354,244 @@ static bool load_native_ogg_sample(ALuint id, OggVorbis_File &file, const vorbis
 }
 #endif
 
+#ifdef __3DS__
+// Background decode of map ambience on the New 3DS's second application core.
+// Ambient loops are full Ogg Vorbis decodes (12.7 s for ac_keller's 12 sounds
+// in Azahar), and none of it is needed before the player can move. Loading
+// queues them; a low-priority worker on core 2 decodes into the same PCM or
+// packed blocks the synchronous path produces; the main thread adopts each
+// finished sample in ac3ds_async_sounds_poll(). A map sound location with no
+// buffer yet is stale and is retried on the next map sound refresh, so each
+// loop starts as soon as it is ready.
+namespace
+{
+struct asyncsound
+{
+    sbuffer *buf = nullptr;
+    string path;
+    bool cancelled = false, ok = false;
+    int state = 0; // 0 queued, 1 decoding, 2 done
+    int channels = 0, rate = 0, frames = 0;
+    int16_t *pcm = nullptr;
+    Ac3dsPcmBlocks *blocks = nullptr;
+};
+LightLock asynclock;
+LightEvent asyncwake;
+Thread asyncworker = nullptr;
+bool asyncready = false, asyncstop = false, asyncunavailable = false;
+vector<asyncsound *> asyncjobs;
+
+void decodeasync(asyncsound &job)
+{
+    stream *f = openfile(job.path, "rb");
+    if(!f) return;
+    OggVorbis_File file;
+    if(ov_open_callbacks(f, &file, NULL, 0, oggcallbacks)) { delete f; return; }
+    const vorbis_info *info = ov_info(&file, -1);
+    if(!compatiblevorbis(&file, info)) { ov_clear(&file); return; }
+    const int framebytes = info->channels * sizeof(int16_t);
+    const ogg_int64_t total = ov_pcm_total(&file, -1);
+    job.channels = info->channels;
+    job.rate = info->rate;
+    int bitstream, holes = 0;
+    if(total > 0 && total < INT_MAX / framebytes && total * framebytes < 512 * 1024)
+    {
+        // Same as load_native_ogg_sample: one exact-sized PCM allocation.
+        int capacity = int(total) * framebytes, used = 0;
+        char *pcm = static_cast<char *>(malloc(capacity));
+        long bytes = -1;
+        char block[16 * 1024];
+        while(pcm)
+        {
+            bytes = readvorbispcm(&file, block, sizeof(block), &bitstream);
+            if(bytes == OV_HOLE && ++holes <= 4) continue;
+            if(bytes <= 0 || bytes > INT_MAX - used) break;
+            holes = 0;
+            if(used + bytes > capacity)
+            {
+                const int expanded = max(used + int(bytes), capacity + capacity / 2);
+                char *more = static_cast<char *>(realloc(pcm, expanded));
+                if(!more) { bytes = -1; break; }
+                pcm = more;
+                capacity = expanded;
+            }
+            memcpy(pcm + used, block, size_t(bytes));
+            used += int(bytes);
+        }
+        if(pcm && bytes == 0 && used > 0 && used % framebytes == 0)
+        {
+            job.pcm = reinterpret_cast<int16_t *>(pcm);
+            job.frames = used / framebytes;
+            job.ok = true;
+        }
+        else free(pcm);
+    }
+    else
+    {
+        // Same as load_packed_ogg_sample: lossless packed blocks.
+        Ac3dsPcmBlocks *sample = ac3ds_audio_new_pcm_blocks(info->channels);
+        static thread_local int16_t pcm[ac3ds_pcm_block_frames * 2];
+        const int blockbytes = ac3ds_pcm_block_frames * framebytes;
+        int used = 0;
+        while(sample)
+        {
+            const long bytes = readvorbispcm(&file, reinterpret_cast<char *>(pcm) + used, blockbytes - used, &bitstream);
+            if(bytes == OV_HOLE && ++holes <= 4) continue;
+            if(bytes < 0) break;
+            holes = 0;
+            used += int(bytes);
+            if(used == blockbytes || (!bytes && used))
+            {
+                if(used % framebytes || !ac3ds_audio_append_pcm_block(sample, pcm, used / framebytes)) break;
+                used = 0;
+            }
+            if(!bytes)
+            {
+                job.blocks = sample;
+                job.ok = true;
+                sample = nullptr;
+                break;
+            }
+        }
+        ac3ds_audio_discard_pcm_blocks(sample);
+    }
+    ov_clear(&file);
+}
+
+void asyncworkermain(void *)
+{
+    for(;;)
+    {
+        LightLock_Lock(&asynclock);
+        if(asyncstop) { LightLock_Unlock(&asynclock); return; }
+        asyncsound *job = NULL;
+        loopv(asyncjobs) if(asyncjobs[i]->state == 0 && !asyncjobs[i]->cancelled) { job = asyncjobs[i]; break; }
+        if(job) job->state = 1;
+        LightLock_Unlock(&asynclock);
+        if(!job) { LightEvent_WaitTimeout(&asyncwake, 100000000LL); continue; }
+        decodeasync(*job);
+        LightLock_Lock(&asynclock);
+        job->state = 2;
+        LightLock_Unlock(&asynclock);
+    }
+}
+
+bool startasyncworker()
+{
+    if(asyncworker) return true;
+    if(asyncunavailable) return false;
+    if(!asyncready)
+    {
+        LightLock_Init(&asynclock);
+        LightEvent_Init(&asyncwake, RESET_ONESHOT);
+        asyncready = true;
+    }
+    if(!ac3ds_audio_prepare_pcm_blocks()) { asyncunavailable = true; return false; }
+    s32 priority = 0x30;
+    svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
+    // Below the game and the audio mixer, on core 2.
+    asyncstop = false;
+    asyncworker = threadCreate(asyncworkermain, NULL, 64 * 1024, min(int(priority) + 2, 0x3F), 2, false);
+    if(!asyncworker) asyncunavailable = true;
+    clientlogf("map sounds: background decode on core 2 %s", asyncworker ? "started" : "unavailable");
+    return asyncworker != NULL;
+}
+
+void freejob(asyncsound *job)
+{
+    free(job->pcm);
+    ac3ds_audio_discard_pcm_blocks(job->blocks);
+    delete job;
+}
+}
+
+bool sbuffer::loadasync()
+{
+    if(!name) return false;
+    if(id || pending) return true;
+    string filepath;
+    const char *exts[] = { "", ".wav", ".ogg" };
+    loopi(sizeof(exts)/sizeof(exts[0]))
+    {
+        formatstring(filepath)("packages/audio/%s%s", name, exts[i]);
+        path(filepath);
+        stream *f = openfile(filepath, "rb");
+        if(!f) continue;
+        delete f;
+        size_t len = strlen(filepath);
+        const bool ogg = len >= 4 && !strcasecmp(filepath + len - 4, ".ogg");
+        if(!ogg || !startasyncworker()) return load(); // WAV and fallbacks stay synchronous
+        asyncsound *job = new asyncsound;
+        job->buf = this;
+        copystring(job->path, filepath);
+        LightLock_Lock(&asynclock);
+        asyncjobs.add(job);
+        LightLock_Unlock(&asynclock);
+        LightEvent_Signal(&asyncwake);
+        pending = true;
+        return true;
+    }
+    return false;
+}
+
+void ac3ds_async_sounds_poll()
+{
+    if(!asyncready) return;
+    LightLock_Lock(&asynclock);
+    loopv(asyncjobs)
+    {
+        asyncsound *job = asyncjobs[i];
+        if(job->state != 2) continue;
+        asyncjobs.remove(i--);
+        LightLock_Unlock(&asynclock);
+        bool adopted = false;
+        if(!job->cancelled && job->ok && job->buf->pending && !job->buf->id)
+        {
+            ALuint id = 0;
+            alclearerr();
+            alGenBuffers(1, &id);
+            if(!alerr(false) && id)
+            {
+                adopted = job->pcm ? ac3ds_audio_take_pcm16(id, job->pcm, job->frames, job->channels, job->rate)
+                                   : ac3ds_audio_take_pcm_blocks(id, job->blocks, job->rate);
+                if(adopted) { job->pcm = NULL; job->blocks = NULL; job->buf->id = id; }
+                else alDeleteBuffers(1, &id);
+            }
+            if(!adopted) conoutf("\f3failed to load sample %s", job->buf->name);
+        }
+        if(!job->cancelled) job->buf->pending = false;
+        freejob(job);
+        static int adoptedcount = 0;
+        if(adopted) ++adoptedcount;
+        LightLock_Lock(&asynclock);
+        if(asyncjobs.empty() && adoptedcount)
+        {
+            LightLock_Unlock(&asynclock);
+            clientlogf("map sounds: %d decoded in the background", adoptedcount);
+            adoptedcount = 0;
+            LightLock_Lock(&asynclock);
+        }
+    }
+    LightLock_Unlock(&asynclock);
+}
+
+void ac3ds_async_sounds_cancel_all()
+{
+    if(!asyncready) return;
+    LightLock_Lock(&asynclock);
+    loopv(asyncjobs) { asyncjobs[i]->cancelled = true; asyncjobs[i]->buf->pending = false; }
+    LightLock_Unlock(&asynclock);
+}
+#endif
+
 bool sbuffer::load(bool trydl)
 {
     if(!name) return false;
     if(id) return true;
+#ifdef __3DS__
+    if(pending) return false;
+#endif
+    AC3DS_LOAD_TIME(AC3DS_LOAD_SOUND_TOTAL);
     alclearerr();
     alGenBuffers(1, &id);
     if(!ALERR)
@@ -377,7 +618,11 @@ bool sbuffer::load(bool trydl)
                     }
 
 #ifdef __3DS__
-                    const bool loaded = load_native_ogg_sample(id, oggfile, *info);
+                    bool loaded;
+                    {
+                        AC3DS_LOAD_TIME(AC3DS_LOAD_SOUND_DECODE);
+                        loaded = load_native_ogg_sample(id, oggfile, *info);
+                    }
                     ov_clear(&oggfile);
                     if(!loaded) continue;
 #else
@@ -469,6 +714,15 @@ bool sbuffer::load(bool trydl)
 
 void sbuffer::unload()
 {
+#ifdef __3DS__
+    if(pending)
+    {
+        LightLock_Lock(&asynclock);
+        loopv(asyncjobs) if(asyncjobs[i]->buf == this) asyncjobs[i]->cancelled = true;
+        LightLock_Unlock(&asynclock);
+        pending = false;
+    }
+#endif
     if(!id) return;
     alclearerr();
     if(alIsBuffer(id)) alDeleteBuffers(1, &id);

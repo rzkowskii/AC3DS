@@ -101,7 +101,9 @@ namespace
         KEYCODE_CHAT, KEYCODE_TEAM, KEYCODE_CONSOLE, KEYCODE_EDIT,
         KEYCODE_VOICE, KEYCODE_MAP, KEYCODE_VOTEYES, KEYCODE_VOTENO,
         KEYCODE_FLAG, KEYCODE_SCREENSHOT, KEYCODE_WEAPONS, KEYCODE_NEXT,
-        KEYCODE_PREV, KEYCODE_UNDO, KEYCODE_REDO, KEYCODE_DELETE, KEYCODE_EDITMENU
+        KEYCODE_PREV, KEYCODE_UNDO, KEYCODE_REDO, KEYCODE_DELETE, KEYCODE_EDITMENU,
+        KEYCODE_RELOAD, KEYCODE_GRENADE, KEYCODE_SCOPE, KEYCODE_NEXTWEAPON,
+        KEYCODE_MATCHMENU, KEYCODE_SCORES
     };
 
     struct Control
@@ -145,9 +147,15 @@ namespace
         {KEYCODE_UNDO, "3DS_TOUCH_UNDO", "", "undo", ""},
         {KEYCODE_REDO, "3DS_TOUCH_REDO", "", "redo", ""},
         {KEYCODE_DELETE, "3DS_TOUCH_DELETE", "", "editkey_delete_entity", ""},
-        {KEYCODE_EDITMENU, "3DS_TOUCH_EDITMENU", "", "editkey_show_menu", ""}
+        {KEYCODE_EDITMENU, "3DS_TOUCH_EDITMENU", "", "editkey_show_menu", ""},
+        {KEYCODE_RELOAD, "3DS_TOUCH_RELOAD", "reload", "", ""},
+        {KEYCODE_GRENADE, "3DS_TOUCH_GRENADE", "quicknadethrow", "", ""},
+        {KEYCODE_SCOPE, "3DS_TOUCH_SCOPE", "altaction", "", ""},
+        {KEYCODE_NEXTWEAPON, "3DS_TOUCH_WEAPON", "shiftweapon 1", "", ""},
+        {KEYCODE_MATCHMENU, "3DS_TOUCH_MENU", "ac3ds_pause_menu", "", ""},
+        {KEYCODE_SCORES, "3DS_TOUCH_SCORES", "key_showscores", "", ""}
     };
-    static_assert(sizeof(controls) / sizeof(controls[0]) == KEYCODE_EDITMENU - KEYCODE_A + 1,
+    static_assert(sizeof(controls) / sizeof(controls[0]) == KEYCODE_SCORES - KEYCODE_A + 1,
                   "The default control table follows the native key code order.");
 
     const struct { u32 mask; Key code; } buttons[] = {
@@ -238,7 +246,7 @@ namespace
 
     bool uses_default_binding(int code, int type)
     {
-        if(code < KEYCODE_A || code > KEYCODE_EDITMENU) return true;
+        if(code < KEYCODE_A || code > KEYCODE_SCORES) return true;
         const Control &control = controls[code - KEYCODE_A];
         keym *binding = findbindc(code);
         if(!binding) return true;
@@ -351,6 +359,23 @@ namespace
                 for(int col = 0; col < 8; ++col)
                     if(glyph[row] & (0x80 >> col))
                         screen[(x + col) * touch_height + touch_height - 1 - y - row] = color;
+        }
+    }
+
+    // Pixel-doubled glyphs for headings: the 8x8 console font is too small
+    // to read at arm's length on the New 2DS XL's 4.18" lower panel.
+    void draw_label_large(u16 *screen, int x, int y, const char *label, u16 color, int scale = 2)
+    {
+        const ConsoleFont &font = consoleGetDefault()->font;
+        for(int i = 0; label[i] && x + 8 * scale <= touch_width; ++i, x += 8 * scale)
+        {
+            int index = (unsigned char)label[i] - font.asciiOffset;
+            if(index < 0 || index >= font.numChars) continue;
+            const u8 *glyph = font.gfx + 8 * index;
+            for(int row = 0; row < 8; ++row)
+                for(int col = 0; col < 8; ++col)
+                    if(glyph[row] & (0x80 >> col))
+                        fill_rect(screen, x + col * scale, y + row * scale, x + (col + 1) * scale, y + (row + 1) * scale, color);
         }
     }
 
@@ -698,9 +723,244 @@ void ac3ds_sync_input_context()
     reset_physical_input();
 }
 
+// ---------------------------------------------------------------------------
+// Match screen: the lower screen during play. A rotating radar built from the
+// map's own GPU-rendered minimap fills the middle and doubles as the stylus
+// look area; large buttons sit along the top and bottom edges where thumbs and
+// the stylus reach them without covering the radar.
+namespace
+{
+    constexpr int hud_top_bar = 40, radar_top = 42, radar_bottom = 192, hud_bottom_bar = 196;
+    struct HudButton { int x0, y0, x1, y1, code; const char *label; bool large; };
+    const HudButton hud_buttons[] = {
+        {2, 2, 76, 38, KEYCODE_MATCHMENU, "MENU", false},
+        {80, 2, 240, 38, KEYCODE_RELOAD, "RELOAD", true},
+        {244, 2, 318, 38, KEYCODE_SCORES, "SCORES", false},
+        {2, hud_bottom_bar, 106, 238, KEYCODE_GRENADE, "GRENADE", false},
+        {108, hud_bottom_bar, 212, 238, KEYCODE_NEXTWEAPON, "WEAPON", false},
+        {214, hud_bottom_bar, 318, 238, KEYCODE_SCOPE, "SCOPE", false},
+    };
+    constexpr int hud_button_count = sizeof(hud_buttons) / sizeof(hud_buttons[0]);
+
+    // Minimap copy from the GPU (RGB565, half the minimap texture size).
+    u16 *minimap_pixels = NULL;
+    int minimap_w = 0, minimap_h = 0, minimap_wait = 0;
+    bool minimap_request = false, minimap_valid = false;
+    u16 *minimap_staging = NULL;
+    int staging_w = 0, staging_h = 0;
+    float minimap_x0 = 0, minimap_y0 = 0, minimap_span = 1;
+    u64 radar_drawn_tick = 0;
+    int pressed_hud_button = -1;
+
+    const u16 radar_void = RGB565(1, 3, 2), hud_rvsf = RGB565(6, 26, 31), hud_cla = RGB565(31, 12, 8);
+    const u16 hud_self = RGB565(31, 61, 10), hud_outline = RGB565(0, 0, 0);
+
+    inline void plot(u16 *screen, int x, int y, u16 color)
+    {
+        if(x >= 0 && x < touch_width && y >= radar_top && y < radar_bottom)
+            screen[x * touch_height + touch_height - 1 - y] = color;
+    }
+
+    void draw_dot(u16 *screen, int x, int y, int r, u16 color)
+    {
+        for(int j = -r - 1; j <= r + 1; ++j) for(int i = -r - 1; i <= r + 1; ++i)
+        {
+            const int d = i * i + j * j;
+            if(d <= r * r) plot(screen, x + i, y + j, color);
+            else if(d <= (r + 1) * (r + 1)) plot(screen, x + i, y + j, hud_outline);
+        }
+    }
+
+    // Filled triangle for the local player, pointing up (forward).
+    void draw_self(u16 *screen, int cx, int cy)
+    {
+        for(int row = 0; row < 12; ++row)
+        {
+            const int half = row / 2;
+            for(int i = -half - 1; i <= half + 1; ++i)
+                plot(screen, cx + i, cy - 6 + row, (i < -half || i > half) ? hud_outline : hud_self);
+        }
+    }
+
+    bool hud_button_enabled(int code)
+    {
+        if(!player1 || player1->state != CS_ALIVE) return code == KEYCODE_MATCHMENU || code == KEYCODE_SCORES;
+        const weapon *gun = player1->weaponsel;
+        switch(code)
+        {
+            case KEYCODE_RELOAD: return gun && reloadable_gun(gun->type) && gun->ammo > 0 && gun->mag < gun->info.magsize;
+            case KEYCODE_GRENADE: return player1->weapons[GUN_GRENADE] && player1->weapons[GUN_GRENADE]->mag > 0;
+            case KEYCODE_SCOPE: return gun && gun->type == GUN_SNIPER;
+            default: return true;
+        }
+    }
+
+    void draw_hud_button(u16 *screen, const HudButton &b, bool enabled, bool active)
+    {
+        const u16 frame = active ? accent : enabled ? border : surface;
+        fill_rect(screen, b.x0, b.y0, b.x1, b.y1, frame);
+        fill_rect(screen, b.x0 + 2, b.y0 + 2, b.x1 - 2, b.y1 - 2, active ? RGB565(8, 22, 10) : surface);
+        const u16 color = enabled ? text : muted;
+        const int len = int(strlen(b.label));
+        if(b.large)
+            draw_label_large(screen, (b.x0 + b.x1 - 16 * len) / 2, (b.y0 + b.y1 - 16) / 2, b.label, color);
+        else
+            draw_label(screen, (b.x0 + b.x1 - 8 * len) / 2, (b.y0 + b.y1 - 8) / 2, b.label, color, b.x1);
+    }
+
+    void radar_probe()
+    {
+        static bool done = false;
+        static int qa = -1;
+        if(qa < 0) { struct stat st; qa = stat("sdmc:/3ds/assaultcube/qa-loadshot", &st) == 0; }
+        if(done || !qa || !minimap_valid) return;
+        int alive = 0;
+        loopv(players) if(players[i] && players[i]->state == CS_ALIVE) ++alive;
+        if(alive < 4) return;
+        done = true;
+                        // Orientation probe: count players on lit pixels per transform.
+                        int hits[8] = {}, total = 0;
+                        auto lit = [&](int x, int y) {
+                            if(x < 0 || y < 0 || x >= minimap_w || y >= minimap_h) return false;
+                            const u16 c = minimap_pixels[y * minimap_w + x];
+                            return ((c >> 11) & 31) + ((c >> 5) & 63) / 2 + (c & 31) > 6; };
+                        auto probe = [&](const vec &o) {
+                            const float k = minimap_w / minimap_span;
+                            const int u = int((o.x - minimap_x0) * k), v = int((o.y - minimap_y0) * k), m = minimap_w - 1;
+                            const int cand[8][2] = {{u, v}, {m - u, v}, {u, m - v}, {m - u, m - v}, {v, u}, {m - v, u}, {v, m - u}, {m - v, m - u}};
+                            for(int t = 0; t < 8; ++t) if(lit(cand[t][0], cand[t][1])) ++hits[t];
+                            ++total; };
+                        loopv(players) if(players[i] && players[i]->state == CS_ALIVE) probe(players[i]->o);
+                        clientlogf("radar probe: %d players, hits %d %d %d %d %d %d %d %d", total, hits[0], hits[1], hits[2], hits[3], hits[4], hits[5], hits[6], hits[7]);
+    }
+
+    void draw_radar(u16 *screen)
+    {
+        radar_probe();
+        const int cx = touch_width / 2, cy = (radar_top + radar_bottom) / 2;
+        playerent *p = player1;
+        const bool spectating = p && p->isspectating();
+        playerent *view = p;
+        if(spectating && p->spectatemode > SM_FOLLOW1ST && p->spectatemode <= SM_FOLLOW3RD_TRANSPARENT &&
+           players.inrange(p->followplayercn) && players[p->followplayercn]) view = players[p->followplayercn];
+        const float yaw = view ? view->yaw * RAD : 0.0f, c = cosf(yaw), s = sinf(yaw);
+        const float zoom = 2.2f; // screen pixels per world unit
+        if(minimap_valid && view)
+        {
+            const float k = minimap_w / minimap_span;
+            // Minimap pixel coordinates in 16.16 fixed point, stepped per pixel.
+            // The transfer leaves rows bottom-up (world +y is the last row).
+            const float bx = (view->o.x - minimap_x0) * k, by = (view->o.y - minimap_y0) * k;
+            const int stepx_y = int(-s / zoom * k * 65536), stepy_y = int(c / zoom * k * 65536);
+            const int maxx = minimap_w << 16, maxy = minimap_h << 16;
+            for(int x = 0; x < touch_width; ++x)
+            {
+                const float dx = x - cx, dy = radar_top - cy;
+                int mx = int((bx + (dx * c - dy * s) / zoom * k) * 65536);
+                int my = int((by + (dx * s + dy * c) / zoom * k) * 65536);
+                u16 *column = screen + x * touch_height + touch_height - 1 - radar_top;
+                for(int y = radar_top; y < radar_bottom; ++y, --column, mx += stepx_y, my += stepy_y)
+                    *column = (mx >= 0 && my >= 0 && mx < maxx && my < maxy) ?
+                              minimap_pixels[(minimap_h - 1 - (my >> 16)) * minimap_w + (mx >> 16)] : radar_void;
+            }
+        }
+        else fill_rect(screen, 0, radar_top, touch_width, radar_bottom, radar_void);
+        if(!view) return;
+
+        auto toscreen = [&](const vec &o, int &sx, int &sy)
+        {
+            const float rx = o.x - view->o.x, ry = o.y - view->o.y;
+            sx = cx + int(zoom * (rx * c + ry * s));
+            sy = cy + int(zoom * (-rx * s + ry * c));
+        };
+        // Same visibility as the PC radar: teammates in team modes, the
+        // followed player when spectating, never opponents.
+        const int baseteam = team_base(view->team);
+        loopv(players)
+        {
+            playerent *pl = players[i];
+            if(!pl || pl == p || pl == view || !team_isactive(pl->team) || pl->state != CS_ALIVE) continue;
+            if(p->team < TEAM_SPECT && !(m_teammode && isteam(baseteam, team_base(pl->team)))) continue;
+            if(p->team == TEAM_SPECT && !isteam(baseteam, team_base(pl->team))) continue;
+            int sx, sy;
+            toscreen(pl->o, sx, sy);
+            draw_dot(screen, sx, sy, 3, team_base(pl->team) ? hud_rvsf : hud_cla);
+        }
+        if(m_flags_) loopi(2)
+        {
+            const flaginfo &f = flaginfos[i];
+            const u16 color = m_ktf ? RGB565(31, 55, 0) : f.team ? hud_rvsf : hud_cla;
+            if(f.flagent && f.flagent->x != -1 && f.flagent->y != -1)
+            {
+                int sx, sy;
+                toscreen(vec(f.flagent->x, f.flagent->y, 0), sx, sy);
+                for(int j = -4; j <= 4; ++j) for(int k2 = -4; k2 <= 4; ++k2)
+                    if(abs(j) == 4 || abs(k2) == 4) plot(screen, sx + k2, sy + j, color);
+            }
+            if(f.state == CTFF_INBASE || f.state == CTFF_DROPPED)
+            {
+                int sx, sy;
+                toscreen(f.pos, sx, sy);
+                draw_dot(screen, sx, sy, 2, color);
+            }
+        }
+        draw_self(screen, cx, cy);
+    }
+}
+
+bool ac3ds_minimap_info(unsigned &tex, float &x0, float &y0, float &span);
+
+void ac3ds_minimap_updated()
+{
+    minimap_request = true;
+    minimap_valid = false;
+}
+
+namespace
+{
+    void service_minimap()
+    {
+        if(minimap_request)
+        {
+            minimap_request = false;
+            unsigned tex;
+            if(ac3ds_minimap_info(tex, minimap_x0, minimap_y0, minimap_span) &&
+               ac3ds_gl_queue_readback_565(tex, &minimap_staging, &staging_w, &staging_h))
+                minimap_wait = 3; // read after the queued copy has run
+        }
+        else if(minimap_wait && !--minimap_wait)
+        {
+            const size_t bytes = size_t(staging_w) * staging_h * sizeof(u16);
+            if(R_SUCCEEDED(GSPGPU_InvalidateDataCache(minimap_staging, bytes)))
+            {
+                u16 *copy = static_cast<u16 *>(realloc(minimap_pixels, bytes));
+                if(copy)
+                {
+                    minimap_pixels = copy;
+                    memcpy(minimap_pixels, minimap_staging, bytes);
+                    minimap_w = staging_w;
+                    minimap_h = staging_h;
+                    minimap_valid = true;
+                    struct stat st;
+                    if(stat("sdmc:/3ds/assaultcube/qa-loadshot", &st) == 0)
+                    {
+                        // QA: raw RGB565 minimap dump
+                        if(FILE *f = fopen("sdmc:/3ds/assaultcube/profile/minimap.raw", "wb"))
+                        {
+                            fwrite(minimap_pixels, 1, bytes, f);
+                            fclose(f);
+                        }
+                        clientlogf("radar: minimap %dx%d covers %.1f,%.1f span %.1f", minimap_w, minimap_h, minimap_x0, minimap_y0, minimap_span);
+                    }
+                }
+            }
+        }
+    }
+}
+
 bool ac3ds_accept_button_event(const SDL_KeyboardEvent &event)
 {
-    if(event.keysym.sym < KEYCODE_A || event.keysym.sym > KEYCODE_EDITMENU || !event.windowID) return true;
+    if(event.keysym.sym < KEYCODE_A || event.keysym.sym > KEYCODE_SCORES || !event.windowID) return true;
     ac3ds_sync_input_context();
     return event.windowID == button_context;
 }
@@ -752,7 +1012,24 @@ void ac3ds_poll_input()
         if(!touch_held)
         {
             touch_aim = touchaim && touch.py >= 33 && touch.py < panel_top && can_aim && drawn_panel == panel;
-            if(drawn_panel == panel && panel == MENU_PANEL) queue_menu_touch(touch);
+            if(panel == GAME_PANEL && drawn_panel == panel)
+            {
+                touch_aim = false;
+                for(int i = 0; i < hud_button_count; ++i)
+                {
+                    const HudButton &b = hud_buttons[i];
+                    if(touch.px < b.x0 || touch.px >= b.x1 || touch.py < b.y0 || touch.py >= b.y1) continue;
+                    if(!hud_button_enabled(b.code)) break;
+                    touch_key = b.code;
+                    touch_key_context = button_context;
+                    pressed_hud_button = i;
+                    controls_dirty = true;
+                    push_key(touch_key, true, false, touch_key_context);
+                    break;
+                }
+                if(!touch_key) touch_aim = touchaim && touch.py >= radar_top && touch.py < radar_bottom;
+            }
+            else if(drawn_panel == panel && panel == MENU_PANEL) queue_menu_touch(touch);
             else if(drawn_panel == panel && touch.py >= panel_top)
             {
                 int row = (touch.py - panel_top) / cell_height;
@@ -778,6 +1055,7 @@ void ac3ds_poll_input()
     else if(touch_held)
     {
         if(touch_key && touch_key_context == button_context) push_key(touch_key, false, false, touch_key_context);
+        if(pressed_hud_button >= 0) { pressed_hud_button = -1; controls_dirty = true; }
         touch_key = 0;
         touch_held = touch_aim = false;
     }
@@ -809,6 +1087,7 @@ void ac3ds_poll_input()
 
 void ac3ds_draw_controls()
 {
+    service_minimap();
     const int panel = current_panel();
     const int bind_type = editmode ? keym::ACTION_EDITING :
                           player1 && player1->isspectating() ? keym::ACTION_SPECTATOR : keym::ACTION_DEFAULT;
@@ -833,14 +1112,58 @@ void ac3ds_draw_controls()
         else copystring(status, "Match");
     }
 
-    if(!controls_dirty && drawn_panel == panel && drawn_bind_type == bind_type &&
+    // Button enable states are part of the match screen's look.
+    if(panel == GAME_PANEL)
+    {
+        concatstring(status, "|");
+        for(int i = 0; i < hud_button_count; ++i)
+            concatstring(status, hud_button_enabled(hud_buttons[i].code) ? (pressed_hud_button == i ? "P" : "1") : "0");
+    }
+    const bool unchanged = !controls_dirty && drawn_panel == panel && drawn_bind_type == bind_type &&
        drawn_touch_aim == touchaim && !strcmp(status, drawn_status) &&
-       (panel != MENU_PANEL || same_menu_view(menu, drawn_menu))) return;
+       (panel != MENU_PANEL || same_menu_view(menu, drawn_menu));
+    const u64 now_tick = svcGetSystemTick();
+    if(unchanged)
+    {
+        // Only the radar moves: refresh it ten times a second.
+        if(panel != GAME_PANEL || now_tick - radar_drawn_tick < SYSCLOCK_ARM11 / 10) return;
+        u16 *screen = reinterpret_cast<u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
+        if(!screen) return;
+        draw_radar(screen);
+        if(*drawn_status && drawn_status[0] != '|')
+        {
+            fill_rect(screen, 4, radar_top + 3, 8 + 8 * int(strcspn(drawn_status, "|")), radar_top + 15, RGB565(1, 3, 2));
+            string label;
+            copystring(label, drawn_status);
+            label[strcspn(label, "|")] = '\0';
+            draw_label(screen, 6, radar_top + 5, label, text);
+        }
+        radar_drawn_tick = now_tick;
+        GSPGPU_FlushDataCache(screen, touch_width * touch_height * sizeof(*screen));
+        return;
+    }
     u16 *screen = reinterpret_cast<u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
     if(!screen) return;
     fill_rect(screen, 0, 0, touch_width, touch_height, background);
 
     if(panel == MENU_PANEL) draw_handheld_menu(screen, menu);
+    else if(panel == GAME_PANEL)
+    {
+        fill_rect(screen, 0, 0, touch_width, hud_top_bar, background);
+        fill_rect(screen, 0, radar_bottom, touch_width, touch_height, background);
+        for(int i = 0; i < hud_button_count; ++i)
+            draw_hud_button(screen, hud_buttons[i], hud_button_enabled(hud_buttons[i].code), pressed_hud_button == i);
+        draw_radar(screen);
+        if(*status && status[0] != '|')
+        {
+            string label;
+            copystring(label, status);
+            label[strcspn(label, "|")] = '\0';
+            fill_rect(screen, 4, radar_top + 3, 8 + 8 * int(strlen(label)), radar_top + 15, RGB565(1, 3, 2));
+            draw_label(screen, 6, radar_top + 5, label, text);
+        }
+        radar_drawn_tick = now_tick;
+    }
     else
     {
         const char *title = panel == GAME_PANEL ? "Match controls" :
@@ -921,6 +1244,110 @@ void ac3ds_draw_server_controls()
     draw_label(screen, 12, 51, "Dedicated server", RGB565(29, 58, 29));
     draw_label(screen, 12, 79, "Press B or START to stop.", RGB565(20, 42, 21));
     GSPGPU_FlushDataCache(screen, touch_width * touch_height * sizeof(*screen));
+}
+
+namespace
+{
+    char loading_title[64] = "", loading_stage[64] = "";
+    int loading_percent = -1;
+    u64 loading_drawn_tick = 0;
+}
+
+void ac3ds_loading_screen(const char *title, const char *stage, float progress)
+{
+    // Software-drawn on the lower screen, so it keeps moving while the GPU
+    // and the main thread are busy loading.
+    if(dedicated_display) return;
+    const bool newtitle = title && strcmp(title, loading_title);
+    int percent = max(0, min(100, int(progress * 100 + 0.5f)));
+    if(!newtitle && percent < loading_percent) percent = loading_percent; // never moves backwards
+    const bool changed = newtitle || (stage && strcmp(stage, loading_stage));
+    const u64 now = svcGetSystemTick();
+    if(!changed && percent == loading_percent) return;
+    if(!changed && now - loading_drawn_tick < SYSCLOCK_ARM11 / 30) return; // at most 30 redraws a second
+    if(title) copystring(loading_title, title, sizeof(loading_title));
+    if(stage) copystring(loading_stage, stage, sizeof(loading_stage));
+    loading_percent = percent;
+    loading_drawn_tick = now;
+    u16 *screen = reinterpret_cast<u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
+    if(!screen) return;
+    fill_rect(screen, 0, 0, touch_width, touch_height, background);
+    fill_rect(screen, 0, 0, touch_width, 34, surface);
+    fill_rect(screen, 0, 34, touch_width, 36, accent);
+    draw_label_large(screen, 12, 9, "ASSAULTCUBE", text);
+    draw_label(screen, 12 + 11 * 16 + 6, 17, "3DS", accent);
+    draw_label_large(screen, 16, 70, loading_title, text);
+    draw_label(screen, 16, 104, loading_stage, muted, touch_width - 16);
+    // Progress bar
+    const int x0 = 16, x1 = touch_width - 16, y0 = 124, y1 = 140;
+    fill_rect(screen, x0, y0, x1, y1, border);
+    fill_rect(screen, x0 + 2, y0 + 2, x1 - 2, y1 - 2, background);
+    fill_rect(screen, x0 + 2, y0 + 2, x0 + 2 + (x1 - x0 - 4) * percent / 100, y1 - 2, accent);
+    char pct[8];
+    snprintf(pct, sizeof(pct), "%d%%", percent);
+    draw_label(screen, x1 - 8 * int(strlen(pct)), 148, pct, muted);
+    draw_label(screen, 16, 212, "The first load of a map takes longest.", muted);
+    GSPGPU_FlushDataCache(screen, touch_width * touch_height * sizeof(*screen));
+    controls_dirty = true;
+    // QA: capture one loading frame when sdmc:/3ds/assaultcube/qa-loadshot exists.
+    static int qaload = -1;
+    if(qaload < 0) { struct stat st; qaload = stat("sdmc:/3ds/assaultcube/qa-loadshot", &st) == 0; }
+    static bool captured = false;
+    if(qaload && !captured && percent >= 40 && strcmp(loading_title, "Starting up"))
+    {
+        captured = true;
+        ac3ds_save_bottom_screen("sdmc:/3ds/assaultcube/profile/loading.bmp");
+    }
+}
+
+bool ac3ds_save_bottom_screen(const char *path)
+{
+    // The lower framebuffer is RGB565, stored as 320 columns of 240 pixels
+    // bottom-to-top. Writes a 24-bit BMP for QA captures.
+    const u16 *screen = reinterpret_cast<const u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
+    FILE *f = screen ? fopen(path, "wb") : NULL;
+    if(!f) return false;
+    const int w = touch_width, h = touch_height, row = w * 3, size = 54 + row * h;
+    u8 header[54] = { 'B', 'M' };
+    auto put32 = [&](int at, u32 v) { for(int i = 0; i < 4; ++i) header[at + i] = u8(v >> (8 * i)); };
+    put32(2, size); put32(10, 54); put32(14, 40); put32(18, w); put32(22, h);
+    header[26] = 1; header[28] = 24; put32(34, row * h);
+    fwrite(header, 1, sizeof(header), f);
+    static u8 line[touch_width * 3];
+    for(int y = h - 1; y >= 0; --y) // BMP rows run bottom-up
+    {
+        for(int x = 0; x < w; ++x)
+        {
+            const u16 c = screen[x * touch_height + touch_height - 1 - y];
+            const u8 r = u8(((c >> 11) & 31) * 255 / 31), g = u8(((c >> 5) & 63) * 255 / 63), b = u8((c & 31) * 255 / 31);
+            line[x * 3] = b; line[x * 3 + 1] = g; line[x * 3 + 2] = r;
+        }
+        fwrite(line, 1, row, f);
+    }
+    fclose(f);
+    return true;
+}
+
+void ac3ds_loading_done()
+{
+    loading_title[0] = loading_stage[0] = '\0';
+    loading_percent = -1;
+    controls_dirty = true;
+}
+
+void ac3ds_show_startup_report(const char *const *lines, int count)
+{
+    // Software-drawn, so it stays readable when the GPU path has stopped.
+    u16 *screen = reinterpret_cast<u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
+    if(!screen) return;
+    fill_rect(screen, 0, 0, touch_width, touch_height, background);
+    fill_rect(screen, 0, 0, touch_width, 29, surface);
+    fill_rect(screen, 0, 28, touch_width, 29, border);
+    draw_label(screen, 10, 10, "AssaultCube startup check", text);
+    for(int i = 0; i < count && i < 16; ++i)
+        draw_label(screen, 6, 38 + i * 12, lines[i], i ? muted : accent);
+    GSPGPU_FlushDataCache(screen, touch_width * touch_height * sizeof(*screen));
+    controls_dirty = true;
 }
 
 int ac3ds_set_brightness(int percent)

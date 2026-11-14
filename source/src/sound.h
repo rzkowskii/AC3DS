@@ -175,6 +175,10 @@ class sbuffer
 public:
     ALuint id;
     const char *name;
+#ifdef __3DS__
+    bool pending = false;   // decoding in the background
+    bool loadasync();       // queue an Ogg map sound for background decode
+#endif
 
     sbuffer();
     ~sbuffer();
@@ -182,6 +186,10 @@ public:
     bool load(bool trydl = false);
     void unload();
 };
+#ifdef __3DS__
+void ac3ds_async_sounds_poll();
+void ac3ds_async_sounds_cancel_all();
+#endif
 
 // buffer storage
 

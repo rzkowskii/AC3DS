@@ -1,14 +1,13 @@
-; Each texture coordinate is stored as (u, v, z, 1). Unit zero can emit
-; a homogeneous q for PICA projection textures. The other units use 2D UVs.
+; Default program. Each texture coordinate is stored as (u, v, z, 1).
+; Every output register is written in full, exactly once, by the last four
+; instructions. Projection textures use cube_projective.v.pica.
 .fvec transform[4], tex0[3], tex1[3], flatColor, colorScale
 .constf constants(0.0, 1.0, 0.0, 0.0)
 .out outpos position
 .out outclr color
-.out uv0 texcoord0.xy
-.out - texcoord0w uv0.z
-.out uv1 texcoord1.xy
+.out uv0 texcoord0
+.out uv1 texcoord1
 .proc main
-    ; Keep the same straight-line layout for world, models and overlays.
     dp4 r2.x, transform[0], v0
     dp4 r2.y, transform[1], v0
     dp4 r2.z, transform[2], v0
@@ -17,18 +16,19 @@
     add r3, flatColor, r3
     mov r0.xyz, v2
     mov r0.w, constants.yyyy
+    mov r4, constants.xxxy
     dp4 r4.x, tex0[0], r0
     dp4 r4.y, tex0[1], r0
-    dp4 r4.z, tex0[2], r0
     mov r0.xyz, v3
     dp4 r1.x, tex1[0], r0
     dp4 r1.y, tex1[1], r0
     dp4 r1.z, tex1[2], r0
     rcp r1.w, r1.z
+    mov r5, constants.xxxy
     mul r5.xy, r1, r1.wwww
     mov outpos, r2
     mov outclr, r3
-    mov uv0.xyz, r4
-    mov uv1.xy, r5
+    mov uv0, r4
+    mov uv1, r5
     end
 .end

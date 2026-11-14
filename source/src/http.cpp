@@ -101,22 +101,30 @@ bool httpget::connect(bool force)
             err = "could not open socket";
             return false;
         }
-        if(enet_socket_set_option(sock, ENET_SOCKOPT_NONBLOCK, 1) == 0 && enet_socket_connect(sock, &ip) == 0)
+        if(void *pending = enet_3ds_connect_begin(sock, &ip))
         {
-            while(tcp_age.elapsed() < connecttimeout)
+            for(;;)
             {
-                int status = enet_3ds_connect_status(sock, 100);
-                if(status < 0) break;
+                int status = enet_3ds_connect_poll(pending, 100);
                 if(status == 0)
                 {
                     tcp = sock;
                     return true;
                 }
-                if(execcallback(-float(tcp_age.elapsed()) / (connecttimeout | 1))) break;
+                if(status < 0) break;
+                if(tcp_age.elapsed() >= connecttimeout || execcallback(-float(tcp_age.elapsed()) / (connecttimeout | 1)))
+                {
+                    enet_3ds_connect_abandon(pending); // closes the socket when the connect returns
+                    err = tcp_age.elapsed() >= connecttimeout ? "could not connect in time" : "could not connect";
+                    return false;
+                }
             }
         }
+        // HTTP runs on helper threads too, so report through err, not the log.
+        static thread_local string diagerr;
+        formatstring(diagerr)("could not connect (%s)", enet_3ds_connect_diag());
         enet_socket_destroy(sock);
-        if(!err) err = tcp_age.elapsed() >= connecttimeout ? "could not connect in time" : "could not connect";
+        if(!err) err = diagerr;
         return false;
 #else
         connectinfo ci = { enet_socket_create(ENET_SOCKET_TYPE_STREAM), ip, 0 };

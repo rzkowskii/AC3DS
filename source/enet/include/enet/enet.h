@@ -473,6 +473,17 @@ ENET_API int        enet_socket_connect (ENetSocket, const ENetAddress *);
 #ifdef __3DS__
 /* Polls a nonblocking TCP connect. Returns 0 on connection, 1 on timeout, or -1 on error. */
 ENET_API int        enet_3ds_connect_status (ENetSocket, int);
+/* Blocking TCP connect on a helper thread, so callers can show progress and
+   time out. The real SOC service rejected the nonblocking connect sequence
+   that Azahar accepts. begin returns NULL if the thread could not start.
+   poll returns 1 while pending, 0 once connected (socket left nonblocking),
+   or -1 on failure; after 0 or -1 the handle is released. abandon releases a
+   pending handle; the helper closes the socket when its connect returns. */
+ENET_API void *     enet_3ds_connect_begin (ENetSocket, const ENetAddress *);
+ENET_API int        enet_3ds_connect_poll (void *, int);
+ENET_API void       enet_3ds_connect_abandon (void *);
+/* Last connect failure: the SOC errno and stage, for the client log. */
+ENET_API const char * enet_3ds_connect_diag (void);
 #endif
 ENET_API int        enet_socket_send (ENetSocket, const ENetAddress *, const ENetBuffer *, size_t);
 ENET_API int        enet_socket_receive (ENetSocket, ENetAddress *, ENetBuffer *, size_t);

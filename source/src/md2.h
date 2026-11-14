@@ -80,6 +80,7 @@ struct md2 : vertmodel
         bool load(char *path)
         {
             if(filename) return true;
+            AC3DS_LOAD_TIME(AC3DS_LOAD_MODEL_FILE);
 
             stream *file = openfile(path, "rb");
             if(!file) return false;

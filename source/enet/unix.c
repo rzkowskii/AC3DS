@@ -19,6 +19,11 @@
 #include <limits.h>
 #include <poll.h>
 #include <3ds/os.h>
+#include <3ds/svc.h>
+#include <3ds/synchronization.h>
+#include <3ds/thread.h>
+#include <stdlib.h>
+#include <stdio.h>
 #define HAS_FCNTL 1
 #define HAS_INET_NTOP 1
 #define HAS_SOCKLEN_T 1
@@ -390,6 +395,117 @@ enet_3ds_buffer_size (const ENetBuffer * buffers, size_t count)
         size += buffers [i].dataLength;
     }
     return size;
+}
+
+typedef struct
+{
+    ENetSocket socket;
+    struct sockaddr_in address;
+    LightLock lock;
+    int state; /* 0 pending, 1 connected, -1 failed */
+    int error;
+    int abandoned;
+} Enet3dsConnect;
+
+static char enet_3ds_diag [96] = "none";
+
+const char *
+enet_3ds_connect_diag (void)
+{
+    return enet_3ds_diag;
+}
+
+static void
+enet_3ds_connect_main (void * arg)
+{
+    Enet3dsConnect * c = (Enet3dsConnect *) arg;
+    int result = connect (c -> socket, (struct sockaddr *) & c -> address, sizeof (struct sockaddr_in));
+    int error = result == 0 ? 0 : errno;
+    int abandoned;
+    LightLock_Lock (& c -> lock);
+    c -> error = error;
+    c -> state = result == 0 ? 1 : -1;
+    abandoned = c -> abandoned;
+    LightLock_Unlock (& c -> lock);
+    if (abandoned)
+    {
+        close (c -> socket);
+        free (c);
+    }
+}
+
+void *
+enet_3ds_connect_begin (ENetSocket socket, const ENetAddress * address)
+{
+    Enet3dsConnect * c;
+    s32 priority = 0x30;
+    if (fcntl (socket, F_SETFL, 0) != 0)
+    {
+        snprintf (enet_3ds_diag, sizeof (enet_3ds_diag), "blocking mode failed, errno %d", errno);
+        return NULL;
+    }
+    c = (Enet3dsConnect *) calloc (1, sizeof (Enet3dsConnect));
+    if (c == NULL)
+      return NULL;
+    c -> socket = socket;
+    c -> address.sin_family = AF_INET;
+    c -> address.sin_port = ENET_HOST_TO_NET_16 (address -> port);
+    c -> address.sin_addr.s_addr = address -> host;
+    LightLock_Init (& c -> lock);
+    svcGetThreadPriority (& priority, CUR_THREAD_HANDLE);
+    /* Detached: libctru frees the thread object when it returns. */
+    if (threadCreate (enet_3ds_connect_main, c, 16 * 1024, priority, -2, true) == NULL)
+    {
+        snprintf (enet_3ds_diag, sizeof (enet_3ds_diag), "connect thread did not start");
+        free (c);
+        return NULL;
+    }
+    return c;
+}
+
+int
+enet_3ds_connect_poll (void * handle, int timeout)
+{
+    Enet3dsConnect * c = (Enet3dsConnect *) handle;
+    int waited = 0;
+    for (;;)
+    {
+        int state, error;
+        LightLock_Lock (& c -> lock);
+        state = c -> state;
+        error = c -> error;
+        LightLock_Unlock (& c -> lock);
+        if (state != 0)
+        {
+            if (state > 0)
+              fcntl (c -> socket, F_SETFL, O_NONBLOCK);
+            else
+              snprintf (enet_3ds_diag, sizeof (enet_3ds_diag), "blocking connect failed, errno %d", error);
+            free (c);
+            return state > 0 ? 0 : -1;
+        }
+        if (waited >= timeout)
+          return 1;
+        svcSleepThread (10000000LL);
+        waited += 10;
+    }
+}
+
+void
+enet_3ds_connect_abandon (void * handle)
+{
+    Enet3dsConnect * c = (Enet3dsConnect *) handle;
+    int finished;
+    LightLock_Lock (& c -> lock);
+    finished = c -> state != 0;
+    c -> abandoned = 1;
+    LightLock_Unlock (& c -> lock);
+    if (finished)
+    {
+        close (c -> socket);
+        free (c);
+    }
+    snprintf (enet_3ds_diag, sizeof (enet_3ds_diag), "connect abandoned (timeout or cancel)");
 }
 
 int

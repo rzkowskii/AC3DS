@@ -189,6 +189,14 @@ void gl_checkextensions()
     const char *version = (const char *)glGetString(GL_VERSION);
     conoutf("Renderer: %s (%s)", renderer, vendor);
     conoutf("Driver: %s", version);
+#ifdef __3DS__
+    {
+        // The memory mode the handheld actually granted. Homebrew launch
+        // method decides it (64 MB Old 3DS mode or 124/178 MB New 3DS mode).
+        extern void ac3ds_log_memory(void (*log)(const char *));
+        ac3ds_log_memory([](const char *line) { clientlogf("%s", line); });
+    }
+#endif
 
     if(hasext(exts, "GL_EXT_texture_env_combine") || hasext(exts, "GL_ARB_texture_env_combine")) hasTE = true;
     else conoutf("WARNING: cannot use overbright lighting, using old lighting model!");
@@ -1112,10 +1120,29 @@ void clearminimap()
 
 COMMAND(clearminimap, "");
 VARFP(minimapres, 7, 9, 10, clearminimap());
+#ifdef __3DS__
+// World-space square the minimap texture covers, for the lower-screen radar.
+bool ac3ds_minimap_info(unsigned &tex, float &x0, float &y0, float &span)
+{
+    if(!minimaptex || minimapdirty) return false;
+    float gdim = max(clmapdims.xspan, clmapdims.yspan);
+    if(gdim < 1) gdim = ssize/2.0f;
+    tex = minimaptex;
+    x0 = clmapdims.xm - gdim/2.0f;
+    y0 = clmapdims.ym - gdim/2.0f;
+    span = gdim;
+    return true;
+}
+#endif
 void drawminimap(int w, int h)
 {
     if(!minimapdirty) return;
+#ifdef __3DS__
+    // Rendered straight into its own texture, so the screen height is no limit.
+    int size = 1<<minimapres, sizelimit = min(hwtexsize, 256);
+#else
     int size = 1<<minimapres, sizelimit = min(hwtexsize, min(w, h));
+#endif
     while(size > sizelimit) size /= 2;
     if(size!=minimaplastsize && minimaptex)
     {
@@ -1205,6 +1232,10 @@ void drawminimap(int w, int h)
     glDisable(GL_TEXTURE_2D);
     glViewport(0, 0, w, h);
     glClearDepth(1.0);
+#ifdef __3DS__
+    extern void ac3ds_minimap_updated();
+    ac3ds_minimap_updated();
+#endif
 }
 
 void cleanupgl()

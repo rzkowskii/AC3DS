@@ -1,4 +1,5 @@
 #include "cube.h"
+#include "loadprofile_3ds.h"
 
 ///////////////////////// file system ///////////////////////
 
@@ -11,10 +12,101 @@
 #ifdef __3DS__
 #include <errno.h>
 #include <fcntl.h>
+extern "C" {
+#include <3ds/types.h>
+#include <3ds/synchronization.h>
+}
+#include <string>
+#include <unordered_set>
 #endif
 
 string homedir = "";
 vector<char *> packagedirs;
+
+#ifdef __3DS__
+// Every asset lookup first checks the SD profile folder for an override, and
+// on the handheld each SD stat is an FS IPC round trip (about 30 ms in Azahar
+// per lookup). The profile folder is listed once into a case-insensitive index
+// (FAT is case-insensitive). A path missing from the index skips the SD probe;
+// a path present is still confirmed with stat, so deletions stay correct.
+// Every write path asks findfile for a "w"/"a" location first, which adds it.
+namespace
+{
+LightLock homeindexlock;
+bool homeindexlockready = false;
+bool homeindexready = false;
+string homeindexdir = "";
+std::unordered_set<std::string> homeindex;
+
+std::string homekey(const char *rel)
+{
+    std::string key(rel);
+    for(char &c : key) c = (c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : (c == '\\' ? '/' : c);
+    while(!key.empty() && key.back() == '/') key.pop_back();
+    return key;
+}
+
+void scanhomedir(const std::string &abs, const std::string &rel, int depth)
+{
+    if(depth > 8) return;
+    DIR *d = opendir(abs.c_str());
+    if(!d) return;
+    while(struct dirent *e = readdir(d))
+    {
+        if(!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        const std::string childrel = rel.empty() ? std::string(e->d_name) : rel + "/" + e->d_name;
+        homeindex.insert(homekey(childrel.c_str()));
+        if(e->d_type == DT_DIR) scanhomedir(abs + e->d_name + "/", childrel, depth + 1);
+    }
+    closedir(d);
+}
+
+void lockhomeindex()
+{
+    if(!homeindexlockready) { LightLock_Init(&homeindexlock); homeindexlockready = true; }
+    LightLock_Lock(&homeindexlock);
+}
+
+// Returns false only when the file is known not to be in the profile folder.
+bool homemayexist(const char *rel)
+{
+    lockhomeindex();
+    if(!homeindexready || strcmp(homeindexdir, homedir))
+    {
+        homeindex.clear();
+        copystring(homeindexdir, homedir);
+        scanhomedir(homedir, "", 0);
+        homeindexready = true;
+    }
+    const bool found = homeindex.count(homekey(rel)) != 0;
+    LightLock_Unlock(&homeindexlock);
+    return found;
+}
+
+void notehomewrite(const char *rel)
+{
+    lockhomeindex();
+    if(homeindexready)
+    {
+        // Parent folders are created alongside, and an interrupted install
+        // leaves a ".ac-prev" sibling.
+        std::string key = homekey(rel);
+        homeindex.insert(key + ".ac-prev");
+        for(size_t slash = key.find('/'); slash != std::string::npos; slash = key.find('/', slash + 1))
+            homeindex.insert(key.substr(0, slash));
+        homeindex.insert(key);
+    }
+    LightLock_Unlock(&homeindexlock);
+}
+}
+
+void ac3ds_note_home_write(const char *path)
+{
+    // Absolute writes into the profile folder that bypass findfile.
+    const size_t len = strlen(homedir);
+    if(len && !strncmp(path, homedir, len)) notehomewrite(path + len);
+}
+#endif
 
 char *makerelpath(const char *dir, const char *file, const char *prefix, const char *cmd)
 {
@@ -308,15 +400,20 @@ const char *findfile(const char *filename, const char *mode)
     while(filename[0] == PATHDIV) filename++; // skip leading pathdiv
     while(!strncmp(".." PATHDIVS, filename, 3)) filename += 3; // skip leading "../" (don't allow access to files below "AC root dir")
 #ifdef __3DS__
+    AC3DS_LOAD_TIME(AC3DS_LOAD_FIND_FILE);
     static thread_local string s;
 #else
     static string s;
 #endif
     formatstring(s)("%s%s", homedir, filename);         // homedir may be ""
     findfilelocation = FFL_HOME;
-    if(homedir[0] && fileexists(s, mode)) return s;
 #ifdef __3DS__
-    if(homedir[0] && mode[0] == 'r' && errno == ENOENT)
+    const bool writing = mode[0] == 'w' || mode[0] == 'a';
+    if(homedir[0] && writing) notehomewrite(filename);
+    const bool probehome = homedir[0] && (writing || homemayexist(filename));
+    errno = ENOENT;
+    if(probehome && fileexists(s, mode)) return s;
+    if(homedir[0] && mode[0] == 'r' && errno == ENOENT && homemayexist((std::string(filename) + ".ac-prev").c_str()))
     {
         size_t len = strlen(s);
         if(len + sizeof(".ac-prev") <= sizeof(s))
@@ -326,6 +423,8 @@ const char *findfile(const char *filename, const char *mode)
             s[len] = '\0';
         }
     }
+#else
+    if(homedir[0] && fileexists(s, mode)) return s;
 #endif
     if(mode[0]=='w' || mode[0]=='a')
     { // create missing directories, if necessary

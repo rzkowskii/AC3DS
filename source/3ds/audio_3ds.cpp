@@ -1,4 +1,5 @@
 #include <3ds.h>
+#include "crash_3ds.h"
 #include <AL/al.h>
 #include <AL/alc.h>
 
@@ -468,6 +469,7 @@ void serviceAudio()
 
 void mixerMain(void *)
 {
+    ac3ds_crash_install("audio mixer");
     for(;;)
     {
         LightEvent_Wait(&mixerWake);
@@ -1009,6 +1011,30 @@ void ac3ds_audio_free_pcm_blocks(Ac3dsPcmBlocks *sample)
         entry.owner = nullptr;
         entry.used = 0;
     }
+    for(size_t i = 0; i < sample->count; ++i) std::free(sample->blocks[i].data);
+    std::free(sample->blocks);
+    delete sample;
+}
+
+bool ac3ds_audio_prepare_pcm_blocks()
+{
+    Ac3dsPcmBlocks *probe = ac3ds_audio_create_pcm_blocks(1);
+    if(!probe) return false;
+    ac3ds_audio_free_pcm_blocks(probe);
+    return true;
+}
+
+Ac3dsPcmBlocks *ac3ds_audio_new_pcm_blocks(int channels)
+{
+    if(!pcmInflaterReady || (channels != 1 && channels != 2)) return nullptr;
+    Ac3dsPcmBlocks *sample = new(std::nothrow) Ac3dsPcmBlocks;
+    if(sample) sample->channels = channels;
+    return sample;
+}
+
+void ac3ds_audio_discard_pcm_blocks(Ac3dsPcmBlocks *sample)
+{
+    if(!sample) return;
     for(size_t i = 0; i < sample->count; ++i) std::free(sample->blocks[i].data);
     std::free(sample->blocks);
     delete sample;

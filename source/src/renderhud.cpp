@@ -520,6 +520,9 @@ vec getradarpos()
 VARP(showmapbackdrop, 0, 0, 2);
 VARP(showmapbackdroptransparency, 0, 75, 100);
 VARP(radarheight, 5, 150, 500);
+#ifdef __3DS__
+VARP(hudtextscale, 100, 180, 300); // console and scoreboard text scale on the 400x240 screen
+#endif
 
 void drawradar_showmap(playerent *p, int w, int h)
 {

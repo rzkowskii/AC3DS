@@ -64,9 +64,14 @@ endforeach()
 
 set(shader "${CMAKE_CURRENT_BINARY_DIR}/cube_vertex.shbin")
 set(shader_asm "${CMAKE_CURRENT_BINARY_DIR}/cube_vertex.S")
+# One DVLB with three programs: default, projection texture, startup probe.
+set(shader_sources
+    "${CMAKE_CURRENT_SOURCE_DIR}/source/3ds/cube_vertex.v.pica"
+    "${CMAKE_CURRENT_SOURCE_DIR}/source/3ds/cube_projective.v.pica"
+    "${CMAKE_CURRENT_SOURCE_DIR}/source/3ds/probe_vertex.v.pica")
 add_custom_command(OUTPUT "${shader}"
-    COMMAND "${PICASSO}" -o "${shader}" "${CMAKE_CURRENT_SOURCE_DIR}/source/3ds/cube_vertex.v.pica"
-    DEPENDS source/3ds/cube_vertex.v.pica VERBATIM)
+    COMMAND "${PICASSO}" -o "${shader}" ${shader_sources}
+    DEPENDS ${shader_sources} VERBATIM)
 file(GENERATE OUTPUT "${shader_asm}" CONTENT ".section .rodata\n.balign 4\n.global cube_vertex_shbin\n.global cube_vertex_shbin_size\ncube_vertex_shbin:\n.incbin \"${shader}\"\n.Lcube_vertex_shbin_end:\n.balign 4\ncube_vertex_shbin_size:\n.word .Lcube_vertex_shbin_end - cube_vertex_shbin\n")
 set_source_files_properties("${shader_asm}" PROPERTIES OBJECT_DEPENDS "${shader}")
 
@@ -82,7 +87,7 @@ list(TRANSFORM cube_units APPEND ".cpp")
 set(enet_units callbacks compress host list packet peer protocol unix)
 list(TRANSFORM enet_units PREPEND "source/enet/")
 list(TRANSFORM enet_units APPEND ".c")
-set(platform_units ac3ds_gl audio_3ds dedicated system)
+set(platform_units ac3ds_gl audio_3ds crash_3ds dedicated system texprefetch_3ds)
 list(TRANSFORM platform_units PREPEND "source/3ds/")
 list(TRANSFORM platform_units APPEND ".cpp")
 add_executable(assaultcube ${cube_units} ${enet_units} ${platform_units} "${shader_asm}")
@@ -91,7 +96,7 @@ target_include_directories(assaultcube PRIVATE source/src source/src/bot source/
     "${DEVKITPRO}/portlibs/3ds/include" "${DEVKITPRO}/libctru/include")
 target_compile_definitions(assaultcube PRIVATE $<$<BOOL:${AC3DS_PRODUCTION}>:PRODUCTION>)
 target_compile_options(assaultcube PRIVATE -O3 -fsigned-char -ffunction-sections -fdata-sections -fno-strict-aliasing)
-target_link_options(assaultcube PRIVATE -Wl,--gc-sections -Wl,--wrap=GX_ProcessCommandList "-Wl,-Map,${CMAKE_CURRENT_BINARY_DIR}/assaultcube.map")
+target_link_options(assaultcube PRIVATE -Wl,--gc-sections -Wl,--wrap=GX_ProcessCommandList -Wl,--wrap=gspSubmitGxCommand "-Wl,-Map,${CMAKE_CURRENT_BINARY_DIR}/assaultcube.map")
 if(AC3DS_LTO)
     target_compile_options(assaultcube PRIVATE -flto)
     target_link_options(assaultcube PRIVATE -flto=4)

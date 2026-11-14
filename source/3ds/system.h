@@ -45,6 +45,11 @@ void ac3ds_poll_input();
 void ac3ds_draw_controls();
 void ac3ds_draw_server_controls();
 void ac3ds_controls_changed();
+void ac3ds_show_startup_report(const char *const *lines, int count);
+// Lower-screen loading progress (title and stage may be null to keep them).
+void ac3ds_loading_screen(const char *title, const char *stage, float progress);
+void ac3ds_loading_done();
+bool ac3ds_save_bottom_screen(const char *path);
 Ac3dsMenu ac3ds_menu_panel();
 const void *ac3ds_menu_identity();
 void ac3ds_menu_view(Ac3dsMenuView &view);

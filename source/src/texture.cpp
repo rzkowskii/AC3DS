@@ -1,6 +1,10 @@
 // texture.cpp: texture management
 
 #include "cube.h"
+#include "loadprofile_3ds.h"
+#ifdef __3DS__
+#include "texprefetch_3ds.h"
+#endif
 #ifdef __3DS__
 #include <3ds.h>
 #endif
@@ -139,13 +143,17 @@ void uploadtexture(GLenum target, GLenum internal, int tw, int th, GLenum format
     if(pixels && (pw!=tw || ph!=th))
     {
         buf = new uchar[tw*th*bpp];
+        AC3DS_LOAD_TIME(AC3DS_LOAD_SCALE);
         scaletexture((uchar *)pixels, pw, ph, bpp, buf, tw, th);
     }
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     for(int level = 0;; level++)
     {
         uchar *src = buf ? buf : (uchar *)pixels;
-        glTexImage2D(target, level, internal, tw, th, 0, format, type, src);
+        {
+            AC3DS_LOAD_TIME(AC3DS_LOAD_TEX_UPLOAD);
+            glTexImage2D(target, level, internal, tw, th, 0, format, type, src);
+        }
 #ifdef __3DS__
         if(!pixels || !mipmap || min(tw, th) <= 8) break;
 #else
@@ -155,6 +163,7 @@ void uploadtexture(GLenum target, GLenum internal, int tw, int th, GLenum format
         if(tw > 1) tw /= 2;
         if(th > 1) th /= 2;
         if(!buf) buf = new uchar[tw*th*bpp];
+        AC3DS_LOAD_TIME(AC3DS_LOAD_SCALE);
         scaletexture(src, srcw, srch, bpp, buf, tw, th);
     }
     if(buf) delete[] buf;
@@ -341,6 +350,7 @@ GLuint loadsurface(const char *texname, int &xs, int &ys, int &bpp, int clamp = 
         file++;
     }
 
+    AC3DS_LOAD_TIME(AC3DS_LOAD_TEXTURE_TOTAL);
     SDL_Surface *s = NULL;
     const char *ffile = findfile(file, "rb");
     if(findfilelocation == FFL_ZIP)
@@ -351,13 +361,23 @@ GLuint loadsurface(const char *texname, int &xs, int &ys, int &bpp, int clamp = 
             SDL_RWops *rw = z->rwops();
             if(rw)
             {
+                AC3DS_LOAD_TIME(AC3DS_LOAD_IMAGE_DECODE);
                 s = IMG_Load_RW(rw, 0);
                 SDL_FreeRW(rw);
             }
             delete z;
         }
     }
-    else if(!s) s = IMG_Load(ffile);
+    else if(!s)
+    {
+        AC3DS_LOAD_TIME(AC3DS_LOAD_IMAGE_DECODE);
+#ifdef __3DS__
+        bool prefetched = false;
+        s = ac3ds_texprefetch_take(ffile, prefetched);
+        if(!prefetched)
+#endif
+        s = IMG_Load(ffile);
+    }
     if(!s)
     {
         if(trydl) requirepackage(PCK_TEXTURE, file);
@@ -366,7 +386,10 @@ GLuint loadsurface(const char *texname, int &xs, int &ys, int &bpp, int clamp = 
     }
     const bool weaponskin = strstr(texname, "skin") && strstr(texname, "weapon");
     const int skinthreshold = strstr(texname, "playermodel") ? 45 : (weaponskin ? 44 : 0);
-    s = fixsurfaceformat(s, skinthreshold != 0);
+    {
+        AC3DS_LOAD_TIME(AC3DS_LOAD_SURFACE_FIX);
+        s = fixsurfaceformat(s, skinthreshold != 0);
+    }
     if(!s)
     {
         clientlogf("Could not convert texture %s to an uploadable pixel format", texname);
@@ -456,9 +479,12 @@ GLuint loadsurface(const char *texname, int &xs, int &ys, int &bpp, int clamp = 
 #else
     createtexture(tnum, xs, ys, pixels, clamp, mipmap, canreduce, format);
 #endif
-    SDL_free(scaled);
-    SDL_free(packed);
-    SDL_FreeSurface(s);
+    {
+        AC3DS_LOAD_TIME(AC3DS_LOAD_TEX_FREE);
+        SDL_free(scaled);
+        SDL_free(packed);
+        SDL_FreeSurface(s);
+    }
 #ifdef __3DS__
     if(!ac3ds_gl_texture_ready(tnum))
     {
@@ -624,6 +650,34 @@ Texture *lookuptexture(int tex, Texture *failtex, bool trydl)
 }
 
 #ifdef __3DS__
+// Queues the decode of every world texture this load will read from disk, in
+// the order load_world looks them up.
+void ac3ds_prefetch_world_textures(const char *texuse)
+{
+    loopi(256)
+    {
+        if(!texuse[i] || !slots.inrange(i)) continue;
+        Slot &s = slots[i];
+        if(s.loaded) continue;
+        defformatstring(name)("packages/textures/%s", path(s.name, true));
+        defformatstring(key)("%.7g        ", s.scale);
+        copystring(key + TEXSCALEPREFIXSIZE, name, MAXSTRLEN - TEXSCALEPREFIXSIZE);
+        path(key + TEXSCALEPREFIXSIZE);
+        Texture *existing = textures.access(key);
+        if(existing && existing->id) continue;
+        const char *file = key + TEXSCALEPREFIXSIZE;
+        if(file[0] == '<')
+        {
+            file = strchr(file, '>');
+            if(!file) continue;
+            ++file;
+        }
+        const char *resolved = findfile(file, "rb");
+        if(findfilelocation == FFL_ZIP) continue;
+        ac3ds_texprefetch_add(resolved);
+    }
+}
+
 void ac3ds_release_world_textures()
 {
     ++worldTextureGeneration;

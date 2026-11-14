@@ -1,0 +1,16 @@
+; Startup probe: position and color only, the layout of the Citro3D samples.
+.fvec transform[4]
+.constf scale(0.00392156862, 0.0, 0.0, 0.0)
+.out outpos position
+.out outclr color
+.entry probe_main
+.proc probe_main
+    dp4 r0.x, transform[0], v0
+    dp4 r0.y, transform[1], v0
+    dp4 r0.z, transform[2], v0
+    dp4 r0.w, transform[3], v0
+    mul r1, scale.xxxx, v1
+    mov outpos, r0
+    mov outclr, r1
+    end
+.end

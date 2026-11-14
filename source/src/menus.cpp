@@ -1268,7 +1268,7 @@ void ac3ds_menu_view(Ac3dsMenuView &view)
     view.selection = menu.menusel;
     view.back = !menustack.empty();
     handheldtext(view.title, sizeof(view.title),
-                 !strcmp(menu.name, "main") ? "Main menu" : menu.title ? menu.title : menu.name);
+                 !strcmp(menu.name, "main") ? "AssaultCube 3DS" : menu.title ? menu.title : menu.name);
 
     constexpr int size = Ac3dsMenuView::row_count;
     int count = 0, selected = 0;
@@ -1384,9 +1384,19 @@ void ac3ds_install_handheld_menus()
 
         newmenu "Match menu"
         menuitem "Resume match" [ paused 0; closecurmenu ]
-        menuitem "Handheld controls" [ showmenu [Handheld controls] ]
+        menuitem "Chat" [ closecurmenu; saycommand ]
+        menuitem "Team chat" [ closecurmenu; key_teamchat ]
+        menuitem "Voice commands" [ key_showmenuvoicecom ]
+        menuitem "Vote yes" [ closecurmenu; key_voteyes ]
+        menuitem "Vote no" [ closecurmenu; key_voteno ]
+        menuitem "Toggle full map" [ closecurmenu; key_showmap ]
+        menuitem "Drop flag" [ closecurmenu; dropflag ]
         menuitem "Weapons" [ showmenu Weapons ]
+        menuitem "Handheld controls" [ showmenu [Handheld controls] ]
         menuitem "Settings" [ showmenu Settings ]
+        menuitem "Screenshot" [ closecurmenu; sleep 100 [ screenshot ] ]
+        menuitem "Command line" [ closecurmenu; key_commandline ]
+        menuitem "Edit map" [ closecurmenu; edittoggle ]
         menuitem "Main menu" [ showmenu main ]
 
         delmenu "\fsVideo"
@@ -1900,6 +1910,18 @@ static void renderhandheldmenu(gmenu &menu)
         {
             const int size = width - 2 * pad;
             handheldmenuimage(startscreen->id, pad, pad / 2, size, size * 48 / 100, 0.04f, 0.52f);
+            // "3DS" badge in the empty top-right corner beside the logo.
+            const float badgescale = 2.0f;
+            int bw, bh;
+            text_bounds("3DS", bw, bh);
+            const int badgew = int(bw * badgescale) + FONTH, badgeh = int(FONTH * badgescale) + FONTH / 2;
+            const int bx = width - pad - badgew, by = pad / 2;
+            handheldmenurect(bx, by, badgew, badgeh, 169, 207, 118, 255);
+            glPushMatrix();
+            glTranslatef(bx + (badgew - bw * badgescale) / 2, by + (badgeh - FONTH * badgescale) / 2, 0);
+            glScalef(badgescale, badgescale, 1);
+            draw_text("3DS", 0, 0, 12, 21, 18, 255);
+            glPopMatrix();
         }
     }
     else if(preview && preview != notexture && preview->xs && preview->ys)
@@ -1961,6 +1983,19 @@ static void renderhandheldmenu(gmenu &menu)
 
 void gmenu::render()
 {
+#ifdef __3DS__
+    // Information menus (the scoreboard) drawn over play on the top screen
+    // get the handheld text scale; layout runs in the scaled space.
+    extern int hudtextscale;
+    extern void *scoremenu;
+    const float uiscale = this == scoremenu ? hudtextscale / 100.0f : 1.0f;
+    const int VW2 = int(2 * VIRTW / uiscale), VH2 = int(2 * VIRTH / uiscale);
+    glPushMatrix();
+    glScalef(uiscale, uiscale, 1);
+    struct PopScale { ~PopScale() { glPopMatrix(); } } popscale;
+#else
+    const int VW2 = 2 * VIRTW, VH2 = 2 * VIRTH;
+#endif
     if(usefont) pushfont(usefont);
     if(!allowblink) ignoreblinkingbit = true;
     bool synctabs = title != NULL || synctabstops;
@@ -1972,7 +2007,7 @@ void gmenu::render()
         else formatstring(buf)("[ %s menu ]", name);
         t = buf;
     }
-    int w = 0, footermaxw = 2 * VIRTW - 6 * FONTH, hitems = headeritems(), footwidth, footheight, maxfootheight = 0;
+    int w = 0, footermaxw = VW2 - 6 * FONTH, hitems = headeritems(), footwidth, footheight, maxfootheight = 0;
     if(hasdesc) loopv(items) if(items[i]->getdesc())
     {
         text_bounds(items[i]->getdesc(), footwidth, footheight, footermaxw);
@@ -1994,10 +2029,10 @@ void gmenu::render()
 
     int step = (FONTH*5)/4;
     int h = (mdisp+hitems+2)*step;
-    int y = (2*VIRTH-h)/2;
-    int x = hotkeys ? (2*VIRTW-w)/6 : (2*VIRTW-w)/2;
-    x = clamp(x + (VIRTW * xoffs) / 100, 3 * FONTH, 2 * VIRTW - w - 3 * FONTH);
-    y = clamp(y + (VIRTH * yoffs) / 100, 3 * FONTH, 2 * VIRTH - h - 3 * FONTH);
+    int y = (VH2-h)/2;
+    int x = hotkeys ? (VW2-w)/6 : (VW2-w)/2;
+    x = clamp(x + (VW2 / 2 * xoffs) / 100, 3 * FONTH, VW2 - w - 3 * FONTH);
+    y = clamp(y + (VH2 / 2 * yoffs) / 100, 3 * FONTH, VH2 - h - 3 * FONTH);
 
     if(!hotkeys) renderbg(x - FONTH*3/2, y - FONTH, x + w + FONTH*3/2, y + h + FONTH, true);
     if(pages)
