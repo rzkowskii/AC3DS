@@ -1,6 +1,6 @@
 # New Nintendo 3DS and New Nintendo 2DS XL controls
 
-The top screen shows the match, menu details and map previews. The touch screen shows the active menu or match controls. The server browser lists servers on the top screen, one row each with ping, players, name and map, and shows the selected server's mode, map, time left and address underneath. The touch screen shows that server as a card, with a large JOIN button, scroll arrows that repeat while held, and REFRESH, FILTER (responding servers only), SORT (next sort column) and BACK.
+The top screen shows the match, menu details and map previews. The touch screen shows the active menu or match controls. The server browser lists servers on the top screen, one row each with ping, players, name and map, and shows the selected server's mode, map, time left and address underneath. The touch screen shows that server as a card, with a large JOIN button, scroll arrows that repeat while held, and SCAN (refresh the list), FILTER (responding servers only), SORT (next sort column) and BACK.
 
 | Control | In a match | In the map editor |
 |---|---|---|

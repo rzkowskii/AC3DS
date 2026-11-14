@@ -90,13 +90,18 @@ list(TRANSFORM enet_units APPEND ".c")
 set(platform_units ac3ds_gl audio_3ds crash_3ds dedicated system texprefetch_3ds)
 list(TRANSFORM platform_units PREPEND "source/3ds/")
 list(TRANSFORM platform_units APPEND ".cpp")
+# Build number for the SD install: bumped in BUILD_NUMBER for every build put
+# on the handheld. The launcher title and the installed file are AC3DSv<n>.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/BUILD_NUMBER" AC3DS_BUILD_NUMBER LIMIT_COUNT 1)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/BUILD_NUMBER")
+message(STATUS "AC3DS build number: ${AC3DS_BUILD_NUMBER}")
 add_executable(assaultcube ${cube_units} ${enet_units} ${platform_units} "${shader_asm}")
 set_target_properties(assaultcube PROPERTIES SUFFIX ".elf" CXX_STANDARD 17 CXX_STANDARD_REQUIRED TRUE CXX_EXTENSIONS TRUE)
 target_include_directories(assaultcube PRIVATE source/src source/src/bot source/enet/include source/3ds source/3ds/include
     "${DEVKITPRO}/portlibs/3ds/include" "${DEVKITPRO}/libctru/include")
-target_compile_definitions(assaultcube PRIVATE $<$<BOOL:${AC3DS_PRODUCTION}>:PRODUCTION>)
+target_compile_definitions(assaultcube PRIVATE $<$<BOOL:${AC3DS_PRODUCTION}>:PRODUCTION> AC3DS_BUILD_NUMBER=${AC3DS_BUILD_NUMBER})
 target_compile_options(assaultcube PRIVATE -O3 -fsigned-char -ffunction-sections -fdata-sections -fno-strict-aliasing)
-target_link_options(assaultcube PRIVATE -Wl,--gc-sections -Wl,--wrap=GX_ProcessCommandList -Wl,--wrap=gspSubmitGxCommand "-Wl,-Map,${CMAKE_CURRENT_BINARY_DIR}/assaultcube.map")
+target_link_options(assaultcube PRIVATE -Wl,--gc-sections -Wl,--wrap=GX_ProcessCommandList -Wl,--wrap=gspSubmitGxCommand -Wl,--wrap=abort -Wl,--wrap=svcBreak "-Wl,-Map,${CMAKE_CURRENT_BINARY_DIR}/assaultcube.map")
 if(AC3DS_LTO)
     target_compile_options(assaultcube PRIVATE -flto)
     target_link_options(assaultcube PRIVATE -flto=4)
@@ -141,7 +146,7 @@ if(icon)
     find_program(SMDHTOOL smdhtool HINTS ${sdk_tool_paths} REQUIRED)
     set(smdh "${CMAKE_CURRENT_BINARY_DIR}/assaultcube.smdh")
     add_custom_command(OUTPUT "${smdh}"
-        COMMAND "${SMDHTOOL}" --create "AssaultCube" "Lockdown Edition for New Nintendo 3DS" "AssaultCube Team" "${icon}" "${smdh}"
+        COMMAND "${SMDHTOOL}" --create "AC3DSv${AC3DS_BUILD_NUMBER}" "AssaultCube 3DS build ${AC3DS_BUILD_NUMBER}" "AssaultCube Team" "${icon}" "${smdh}"
         DEPENDS "${icon}" "${package_config}" VERBATIM)
     set(smdh_args "--smdh=${smdh}")
 endif()

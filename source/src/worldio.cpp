@@ -978,6 +978,11 @@ int load_world(char *mname)        // still supports all map formats that have e
             ac3ds_loading_done();
             const u64 now = svcGetSystemTick();
             clientlogf("load map: done (last stage +%u ms, %u ms total)", ac3ds_ms(now - ac3ds_stage_start), ac3ds_ms(now - ac3ds_load_start));
+            char memory[128];
+            ac3ds_memory_line(memory, sizeof(memory));
+            clientlogf("memory after load: %s", memory);
+            extern int ac3ds_load_generation;
+            ++ac3ds_load_generation; // the main loop logs the first frames after it
             if(clientlogfile) clientlogfile->fflush();
         }
     } restorePhase{previousPhase};

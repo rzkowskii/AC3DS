@@ -86,6 +86,7 @@ namespace
     bool gfx_ready, romfs_ready, network_ready, apt_hooked, lcd_ready;
     bool clock_reset, controls_dirty = true, active = true;
     bool resumed_from_suspend = false; // HOME menu or sleep, not the keyboard applet
+    bool in_keyboard_applet = false;   // the software keyboard also fires the suspend/restore hooks
     aptHookCookie apt_cookie;
     u32 *socket_buffer;
     u32 original_brightness;
@@ -249,13 +250,13 @@ namespace
         },
         {
             {SDLK_F1, "HELP"}, {SDLK_F2, "NAMES"}, {SDLK_F3, "SEARCH"},
-            {SDLK_F4, "FAVORITES"}, {SDLK_F5, "REFRESH"}, {SDLK_F6, "SORT DIR"},
+            {SDLK_F4, "FAVORITES"}, {SDLK_F5, "SCAN"}, {SDLK_F6, "SORT DIR"},
             {SDLK_F7, "GOOD ONLY"}, {SDLK_F8, "TIME LEFT"}, {SDLK_F9, "DETAILS"},
             {SDLK_LEFTBRACKET, "PREV VIEW"}, {SDLK_RIGHTBRACKET, "NEXT VIEW"},
             {SDLK_ESCAPE, "BACK"}
         },
         {
-            {SDLK_F1, "HELP"}, {SDLK_F2, "UPLINK"}, {SDLK_F5, "REFRESH"},
+            {SDLK_F1, "HELP"}, {SDLK_F2, "UPLINK"}, {SDLK_F5, "SCAN"},
             {SDLK_m, "ROTATION"}, {SDLK_c, "CONNECTED"}, {SDLK_PAGEUP, "PAGE UP"},
             {SDLK_PAGEDOWN, "PAGE DOWN"}, {SDLK_ESCAPE, "BACK"},
             {0, ""}, {0, ""}, {0, ""}, {0, ""}
@@ -365,7 +366,7 @@ namespace
                 // aptMainLoop runs this hook from the top of a frame on the main
                 // thread; save settings now in case the console is powered off
                 // from the HOME menu or while asleep.
-                if(inmainloop && hook != APTHOOK_ONEXIT) { writeinitcfg(); writecfg(); }
+                if(inmainloop && !in_keyboard_applet) { writeinitcfg(); writecfg(); }
                 ac3ds_crash_pause(true); // the main loop legitimately stops
                 ac3ds_audio_lifecycle_event(true);
                 break;
@@ -376,7 +377,7 @@ namespace
                 break;
             case APTHOOK_ONRESTORE:
             case APTHOOK_ONWAKEUP:
-                resumed_from_suspend = true;
+                if(!in_keyboard_applet) resumed_from_suspend = true;
                 netkeep_end();
                 ac3ds_crash_pause(false);
                 ac3ds_audio_lifecycle_event(false);
@@ -800,7 +801,9 @@ bool ac3ds_edit_text(const char *title, const char *initial, char *out, size_t c
     if(password) swkbdSetPasswordMode(&keyboard, SWKBD_PASSWORD_HIDE);
     ac3ds_crash_pause(true); // the keyboard applet blocks the main loop
     netkeep_begin();         // ...so keep the server connection serviced meanwhile
+    in_keyboard_applet = true;
     SwkbdButton button = swkbdInputText(&keyboard, out, capacity);
+    in_keyboard_applet = false;
     netkeep_end();
     ac3ds_crash_pause(false);
 
@@ -1233,10 +1236,10 @@ namespace
         {4, 106, 316, 148, SDLK_RETURN, "JOIN", true},
         {4, 152, 106, 192, SDLK_UP, "", false},
         {110, 152, 212, 192, SDLK_DOWN, "", false},
-        {216, 152, 316, 192, SDLK_F5, "REFRESH", false},
-        {4, 196, 106, 236, SDLK_F7, "FILTER", false},
-        {110, 196, 212, 236, SDLK_RIGHT, "SORT", false},
-        {216, 196, 316, 236, SDLK_ESCAPE, "BACK", false},
+        {216, 152, 316, 192, SDLK_F5, "SCAN", true},
+        {4, 196, 106, 236, SDLK_F7, "FILTER", true},
+        {110, 196, 212, 236, SDLK_RIGHT, "SORT", true},
+        {216, 196, 316, 236, SDLK_ESCAPE, "BACK", true},
     };
     Uint32 browser_repeat_at = 0;
 
@@ -1259,35 +1262,29 @@ namespace
         fill_rect(screen, 0, 27, touch_width, 28, border);
         draw_label(screen, 10, 10, "Server browser", text);
         char total[24];
-        snprintf(total, sizeof(total), "%d listed", count);
+        snprintf(total, sizeof(total), "%d servers", count);
         draw_label(screen, touch_width - 10 - 8 * int(strlen(total)), 10, total, muted);
-        // Card
+        // Card: the selected server in the large font.
         fill_rect(screen, 4, 32, 316, 102, surface);
         fill_rect(screen, 4, 32, 7, 102, accent);
         if(selected >= 0)
         {
             const Ac3dsServerRow &r = rows[selected];
             char line[128];
-            // Name over two lines of 37 characters.
             const int len = int(strlen(r.desc));
-            snprintf(line, sizeof(line), "%.37s", r.desc);
-            draw_label(screen, 12, 38, line, text, 312);
-            if(len > 37)
-            {
-                snprintf(line, sizeof(line), "%.37s", r.desc + 37);
-                draw_label(screen, 12, 50, line, text, 312);
-            }
-            if(r.map[0]) snprintf(line, sizeof(line), "%s  %s", r.map, r.mode);
-            else snprintf(line, sizeof(line), "%s", r.responded ? "empty" : "waiting for an answer");
-            draw_label(screen, 12, 66, line, accent, 312);
+            if(len > 18) snprintf(line, sizeof(line), "%.16s..", r.desc);
+            else snprintf(line, sizeof(line), "%s", r.desc);
+            draw_label_large(screen, 12, 36, line, text);
+            if(r.map[0]) snprintf(line, sizeof(line), "%.12s %s", r.map, r.mode);
+            else snprintf(line, sizeof(line), "%s", r.responded ? "Empty" : "Waiting...");
+            draw_label_large(screen, 12, 58, line, accent);
             if(r.responded)
             {
-                snprintf(line, sizeof(line), "%d/%d players   ping %d%s%s", r.players, r.maxclients, r.ping,
-                         r.password ? "   password" : "", r.full ? "   FULL" : "");
-                draw_label(screen, 12, 82, line, muted, 312);
+                snprintf(line, sizeof(line), "%d/%d  %dms%s", r.players, r.maxclients, r.ping, r.password ? " *" : "");
+                draw_label_large(screen, 12, 80, line, r.full ? RGB565(31, 30, 12) : muted);
             }
         }
-        else draw_label(screen, 12, 60, count ? "Choose a server" : "Tap REFRESH to find servers", muted, 312);
+        else draw_label_large(screen, 12, 58, count ? "Pick a server" : "Tap SCAN", muted);
         for(const BrowserButton &b : browser_buttons)
         {
             const bool active = touch_key == b.code;
@@ -1296,7 +1293,8 @@ namespace
             if(b.code == SDLK_UP || b.code == SDLK_DOWN)
                 draw_arrow_glyph(screen, (b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2, b.code == SDLK_UP, text);
             else if(b.large)
-                draw_label_large(screen, (b.x0 + b.x1 - 16 * int(strlen(b.label))) / 2, (b.y0 + b.y1 - 16) / 2, b.label, selected >= 0 ? text : muted);
+                draw_label_large(screen, (b.x0 + b.x1 - 16 * int(strlen(b.label))) / 2, (b.y0 + b.y1 - 16) / 2, b.label,
+                                 b.code == SDLK_RETURN && selected < 0 ? muted : text); // only JOIN needs a server
             else
                 draw_label(screen, (b.x0 + b.x1 - 8 * int(strlen(b.label))) / 2, (b.y0 + b.y1 - 8) / 2, b.label, text, b.x1);
         }

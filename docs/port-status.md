@@ -152,7 +152,30 @@ The best-supported mechanism is that AssaultCube clears the top colour buffer on
 
 `ac3dsnear` (hundredths, default 15) is a diagnostic. If holes remain visible as fog-coloured flicker with clearing on, raising it tests whether near-plane clipping of large world polygons causes them. Handheld confirmation is pending.
 
-To capture the next failure, the main and audio mixer threads now install a CPU exception handler. A fault writes `profile/crash.txt` with the exception type, PC, LR, fault address, registers, nearby code and stack return candidates, and shows the summary on the touch screen. A watchdog on the extra core reports a main loop that makes no progress for 20 seconds. Both reports name the last main loop phase. The client log records the first six frames, every 1,800th frame and each map load. Resolve the addresses with `scripts/symbolize-crash.py crash.txt <build>/assaultcube.elf` using the ELF from the same build. Azahar passed the smoke fixture on this build in `build-azahar/crash-01` without a stall report. Handheld verification is pending.
+**Handheld results, build `bbf58cf` (New 2DS XL, 2026-11-14)**
+- **CPU boost:** `cpu: boost clock ratio 3.00`, so the 804 MHz boost is in effect for the `.3dsx` under Luma's Homebrew Launcher.
+- **First map load:** `ac_dusk` loaded in 2.33 s (load frame 2.44 s), against 68 s for a first load before this work. `ac_arctic2` loaded in 2.78 s.
+- **Prefetch:** the worker had every queued texture ready (54 of 54 and 58 of 58), with no main-thread waits.
+- **Startup sounds:** 104 decoded in the background, none claimed late.
+- **Frame times:** logged frames were at 16 ms.
+
+**Single-player crash on `bbf58cf` and build 10 (2026-11-14)**
+
+*The crash session.* The handheld session on `bbf58cf` ended right after Singleplayer > Bot Team Deathmatch > `ac_arctic2`. The last log lines are the map load and "Waypoints aren't for map ac_arctic2 but for map", then "Starting flood". It left no `crash.txt`, no `stall.txt` and no Luma dump. That build flushed nothing after a load, so the crash could not be placed. A CPU fault would have written `crash.txt`. That leaves:
+- an abort or library panic (`svcBreak`), which shows the system error screen and bypasses both handlers;
+- a hang, if the watchdog asked GSP for the GPU state before writing its report.
+
+The same match runs to completion in Azahar. A code review (12 findings, 10 confirmed on a second pass) found no defect that explains it. The GX command queue (32 entries) stays below about 29 per frame.
+
+*Build 10 diagnostics.* Build 10 records `abort`, out-of-memory and `svcBreak` in `crash.txt` with the phase, caller and heap figures. It writes `stall.txt` before querying GSP. It flushes the log for frames 1-6, 300 and 900 after every map load and every 1,800 frames, with heap and linear-memory figures. Bot thinking and waypoint flooding are named phases.
+
+*Waypoints.* Eleven stock waypoint files carry a blank map name, among them `ac_arctic2`, `ac_dusk`, `ac_africa` and `ac_coal`. On PC those files are rejected and waypoints are flooded at match start. The 3DS build uses them, because the file name matches the map. This affects offline bots only. On `ac_arctic2` in Azahar, the first bot-match frames dropped from 125-180 ms for about 9 s to 9-16 ms.
+
+*Other fixes.* A 260-byte write into a 64-byte server-row field is fixed. The keyboard applet no longer counts as a return from HOME (no auto-pause, no config rewrite after typing). The server browser text is about 17 px on the top screen and uses the 2x font on the lower screen.
+
+*Build number.* Builds are numbered in `BUILD_NUMBER`. The launcher title and the installed file are `AC3DSv<n>`.
+
+To capture the next failure, the main and audio mixer threads now install a CPU exception handler. A fault writes `profile/crash.txt` with the exception type, PC, LR, fault address, registers, nearby code and stack return candidates, and shows the summary on the touch screen. A watchdog on the extra core reports a main loop that makes no progress for 30 seconds (180 seconds during a map load). Both reports name the last main loop phase. The client log records the first six frames, every 1,800th frame and each map load. Resolve the addresses with `scripts/symbolize-crash.py crash.txt <build>/assaultcube.elf` using the ELF from the same build. Azahar passed the smoke fixture on this build in `build-azahar/crash-01` without a stall report. Handheld verification is pending.
 
 The 39.749 FPS build passed the original Lockdown Edition desktop server retest at 100% CPU clock. It entered `ac_douze` revision 40 on protocol 1300, exchanged chat and disconnected. See `build-azahar/network-native-ui-100`.
 

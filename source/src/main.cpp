@@ -64,6 +64,19 @@ void cleanup(char *msg)         // single program exit point;
 
 VAR(resetcfg, 0, 0, 1);
 
+#ifdef __3DS__
+int ac3ds_load_generation = 0;
+// True for frames 1-6, 300 and 900 after each map load.
+static bool ac3ds_frames_after_load(int frame)
+{
+    static int seen = 0, loadframe = 0;
+    if(seen != ac3ds_load_generation) { seen = ac3ds_load_generation; loadframe = frame; }
+    if(!seen) return false;
+    const int n = frame - loadframe;
+    return (n >= 1 && n <= 6) || n == 300 || n == 900;
+}
+#endif
+
 void quit()                     // normal exit
 {
     if(clientlogfile) clientlogfile->fflush();
@@ -1998,7 +2011,24 @@ int main(int argc, char **argv)
             clientlogf("frame %d done (%d ms)", frames, elapsed);
             if(clientlogfile) clientlogfile->fflush();
         }
-        else if(frames % 1800 == 0) clientlogf("frame %d done (%d ms)", frames, elapsed); // no SD flush mid-match
+        else if(ac3ds_frames_after_load(frames))
+        {
+            // The first seconds of a match (bot spawn, waypoint flood, first
+            // draws): flushed, so a crash there is pinned down.
+            char memory[128];
+            ac3ds_memory_line(memory, sizeof(memory));
+            clientlogf("frame %d done (%d ms) after load: %s", frames, elapsed, memory);
+            if(clientlogfile) clientlogfile->fflush();
+        }
+        else if(frames % 1800 == 0)
+        {
+            // Every 30 s: progress and memory, flushed so a crash mid-match
+            // leaves the last state on the SD card (one small write).
+            char memory[128];
+            ac3ds_memory_line(memory, sizeof(memory));
+            clientlogf("frame %d done (%d ms) %s %s", frames, elapsed, getclientmap(), memory);
+            if(clientlogfile) clientlogfile->fflush();
+        }
 #endif
         pollautodownloadresponse();
         if(onceauthed && sk)

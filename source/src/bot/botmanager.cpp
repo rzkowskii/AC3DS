@@ -11,6 +11,9 @@
 //
 
 #include "cube.h"
+#ifdef __3DS__
+#include "crash_3ds.h"
+#endif
 #include "bot.h"
 
 extern void respawnself();
@@ -101,6 +104,9 @@ void CBotManager::Init()
 
 void CBotManager::Think()
 {
+#ifdef __3DS__
+     AC3DS_PHASE("bots: think");
+#endif
 #ifdef __3DS__
     BotFrameTimer frameTimer;
 #endif

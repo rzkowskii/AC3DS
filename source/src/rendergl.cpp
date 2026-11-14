@@ -213,6 +213,7 @@ void gl_checkextensions()
         ac3ds_log_memory([](const char *line) { clientlogf("%s", line); });
         extern float ac3ds_cpu_clock_ratio;
         clientlogf("cpu: boost clock ratio %.2f (about 3.0 means 804 MHz is active)", ac3ds_cpu_clock_ratio);
+        clientlogf("AC3DS build %d", AC3DS_BUILD_NUMBER);
     }
 #endif
 

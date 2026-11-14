@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stddef.h>
+
 // Handheld crash and stall reports. A CPU exception is written to
 // sdmc:/3ds/assaultcube/profile/crash.txt and a main loop that stops advancing
 // to stall.txt; both are shown on the touch screen. Addresses can be resolved with scripts/symbolize-crash.py.
@@ -15,6 +17,8 @@ void ac3ds_crash_pause(bool paused);
 void ac3ds_crash_start_watchdog();
 void ac3ds_crash_stop_watchdog();
 void ac3ds_crash_tick();
+// One line of heap and linear-heap usage for the client log.
+void ac3ds_memory_line(char *out, size_t size);
 
 // The last main-loop phase entered. Must point at a string literal.
 extern const char *volatile ac3ds_crash_phase;

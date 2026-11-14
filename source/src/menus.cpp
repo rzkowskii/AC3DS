@@ -2036,15 +2036,16 @@ static void renderhandheldmenu(gmenu &menu)
 
 #ifdef __3DS__
 #include "ac3ds_servers.h"
-// Top-screen server list sized for 400x240: one row per server with ping,
-// players, name and map at the handheld text size; the selected server's
-// address and mode below. The lower screen carries the actions.
+// Top-screen server list sized for the 3DS: about 17 px text (half the
+// virtual HUD size), one row per server with a coloured ping marker, players
+// and name; the selected server's map, mode and time below. The lower screen
+// carries the details and actions.
 static void renderhandheldservers(gmenu &menu)
 {
     static Ac3dsServerRow rows[256];
     int selected = -1;
     const int count = ac3ds_server_rows(&menu, rows, 256, selected);
-    const int width = VIRTW * 3 / 4, height = VIRTH * 3 / 4, pad = 40;
+    const int width = VIRTW / 2, height = VIRTH / 2, pad = FONTH / 2;
     glPushMatrix();
     glLoadIdentity();
     glOrtho(0, width, height, 0, -1, 1);
@@ -2053,78 +2054,74 @@ static void renderhandheldservers(gmenu &menu)
     glEnable(GL_BLEND);
     handheldmenurect(0, 0, width, height, 6, 11, 9, 255);
 
-    // Header: title, count and sort order.
+    // Header: title and count, sort order on the right.
     const int headerh = FONTH * 3 / 2;
     handheldmenurect(0, 0, width, headerh, 12, 21, 18, 255);
-    handheldmenurect(0, headerh - 6, width, 6, 169, 207, 118, 255);
+    handheldmenurect(0, headerh - FONTH / 10, width, FONTH / 10, 169, 207, 118, 255);
     extern void *searchmenu;
-    defformatstring(title)("%s  %d", &menu == searchmenu ? "Search results" : "Servers", count);
+    defformatstring(title)("%s %d", &menu == searchmenu ? "Found" : "Servers", count);
     draw_text(title, pad, (headerh - FONTH) / 2, 235, 246, 231, 255);
-    defformatstring(sorted)("sorted by %s", ac3ds_server_sort_name());
+    defformatstring(sorted)("by %s", ac3ds_server_sort_name());
     draw_text(sorted, width - pad - text_width(sorted), (headerh - FONTH) / 2, 171, 195, 174, 255);
 
     // Rows.
-    const int footerh = FONTH * 5 / 2, rowh = FONTH * 5 / 4;
-    const int top = headerh + FONTH / 4, visible = max(1, (height - headerh - footerh - FONTH / 4) / rowh);
+    const int footerh = FONTH * 2, rowh = FONTH * 6 / 5;
+    const int top = headerh + FONTH / 6, visible = max(1, (height - headerh - footerh - FONTH / 6) / rowh);
     int first = 0;
     if(selected >= 0) first = clamp(selected - visible / 2, 0, max(0, count - visible));
-    const int pingx = pad, playersx = pad + text_width("999") + FONTH / 2;
-    const int descx = playersx + text_width("88/88") + FONTH / 2;
+    const int marker = FONTH / 2, playersx = pad + marker + FONTH / 3;
+    const int namex = playersx + text_width("88/88") + FONTH / 3;
     if(!count)
-        draw_text(ac3ds_server_total() ? "Waiting for servers to answer..." : "No servers yet. Tap REFRESH.", pad, top + rowh, 185, 207, 188, 255);
+        draw_text(ac3ds_server_total() ? "Waiting for servers..." : "No servers. Tap SCAN.", pad, top + rowh, 185, 207, 188, 255);
     for(int i = first; i < count && i < first + visible; ++i)
     {
         const Ac3dsServerRow &r = rows[i];
         const int y = top + (i - first) * rowh;
         if(i == selected)
         {
-            handheldmenurect(pad / 2, y - FONTH / 8, width - pad, rowh, 32, 58, 34, 255);
-            handheldmenurect(pad / 2, y - FONTH / 8, 10, rowh, 169, 207, 118, 255);
+            handheldmenurect(0, y - FONTH / 10, width, rowh, 32, 58, 34, 255);
+            handheldmenurect(0, y - FONTH / 10, FONTH / 6, rowh, 169, 207, 118, 255);
         }
         const bool usable = r.responded && r.compatible && !r.banned;
-        const int dim = usable ? 255 : 120;
+        const int dim = usable ? 255 : 110;
+        // Ping as a coloured square: green fast, yellow middling, red slow.
         if(r.responded)
         {
-            defformatstring(ping)("%d", min(r.ping, 999));
-            const int pr = r.ping < 100 ? 120 : r.ping < 200 ? 230 : 240, pg = r.ping < 100 ? 220 : r.ping < 200 ? 200 : 110, pb = 110;
-            draw_text(ping, pingx, y, pr, pg, pb, dim);
+            const int pr = r.ping < 100 ? 90 : r.ping < 200 ? 235 : 240, pg = r.ping < 100 ? 210 : r.ping < 200 ? 200 : 90, pb = r.ping < 100 ? 90 : 60;
+            handheldmenurect(pad, y + (FONTH - marker) / 2, marker, marker, pr, pg, pb, dim);
             defformatstring(players)("%d/%d", r.players, r.maxclients);
             draw_text(players, playersx, y, r.full ? 240 : 235, r.full ? 120 : 246, r.full ? 110 : 231, dim);
         }
-        else draw_text("...", pingx, y, 140, 150, 140, 255);
-        // Map on the right; the name gets the rest of the row.
-        int mapw = 0;
-        if(r.map[0])
-        {
-            mapw = text_width(r.map);
-            draw_text(r.map, width - pad - mapw, y, 186, 216, 145, dim);
-        }
+        else draw_text("..", pad, y, 140, 150, 140, 255);
         string name;
-        copystring(name, r.desc);
-        if(r.password) concatstring(name, " [pw]");
-        if(!r.compatible && r.responded) copystring(name, "(other version) ", sizeof(name)), concatstring(name, r.desc);
-        const int namew = width - pad - mapw - FONTH - descx;
+        if(!r.compatible && r.responded) formatstring(name)("(other version) %s", r.desc);
+        else copystring(name, r.desc);
+        if(r.password) concatstring(name, " *");
+        const int namew = width - pad - namex;
         name[text_visible(name, namew, 0, -1)] = '\0';
-        draw_text(name, descx, y, r.connected ? 169 : 235, r.connected ? 230 : 246, r.connected ? 118 : 231, dim);
+        draw_text(name, namex, y, r.connected ? 169 : 235, r.connected ? 230 : 246, r.connected ? 118 : 231, dim);
     }
+    // Scroll position: a thin bar on the right edge.
     if(count > visible)
     {
-        defformatstring(range)("%d-%d of %d", first + 1, min(count, first + visible), count);
-        draw_text(range, width - pad - text_width(range), height - footerh - FONTH, 120, 140, 125, 255);
+        const int trackh = visible * rowh, barh = max(FONTH / 2, trackh * visible / count);
+        const int bary = top + (trackh - barh) * first / max(1, count - visible);
+        handheldmenurect(width - FONTH / 8, top, FONTH / 8, trackh, 30, 45, 35, 255);
+        handheldmenurect(width - FONTH / 8, bary, FONTH / 8, barh, 169, 207, 118, 255);
     }
 
-    // Footer: the selected server in full.
+    // Footer: the selected server's map, mode and time left.
     handheldmenurect(0, height - footerh, width, footerh, 12, 21, 18, 255);
+    string line;
     if(selected >= 0)
     {
         const Ac3dsServerRow &r = rows[selected];
-        string line;
-        if(r.map[0]) formatstring(line)("%s  %s  %d min left", r.mode, r.map, r.minremain);
-        else copystring(line, r.responded ? "empty server" : "waiting for an answer");
-        draw_text(line, pad, height - footerh + FONTH / 4, 235, 246, 231, 255);
-        draw_text(r.address, pad, height - footerh + FONTH * 5 / 4, 150, 170, 155, 255);
+        if(r.map[0]) formatstring(line)("%s  %s  %dmin", r.map, r.mode, r.minremain);
+        else copystring(line, r.responded ? "Empty server" : "Waiting for an answer");
     }
-    else draw_text("D-Pad or the lower screen to choose a server", pad, height - footerh + FONTH / 2, 150, 170, 155, 255);
+    else copystring(line, "Choose with the D-Pad");
+    line[text_visible(line, width - 2 * pad, 0, -1)] = '\0';
+    draw_text(line, pad, height - footerh + (footerh - FONTH) / 2, 235, 246, 231, 255);
     glPopMatrix();
 }
 #endif

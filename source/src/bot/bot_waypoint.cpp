@@ -8,6 +8,9 @@
 //
 
 #include "cube.h"
+#ifdef __3DS__
+#include "crash_3ds.h"
+#endif
 #include "bot.h"
 
 vec v_debuggoal = g_vecZero;
@@ -109,7 +112,16 @@ bool CWaypointClass::LoadWaypoints()
           {
                header.szMapName[sizeof(header.szMapName)-1] = 0;
 
+#ifdef __3DS__
+               // 11 stock waypoint files (ac_arctic2, ac_dusk, ...) carry a blank map
+               // name. Their file name already names the map, so use them rather than
+               // flooding new waypoints at every bot match start, which stalls frames for
+               // seconds on the handheld. Offline bots only; nothing a server sees.
+               if (!header.szMapName[0]) conoutf("Waypoints for map %s have no map name in the file; using them", m_szMapName);
+               if (strcmp(header.szMapName, m_szMapName) == 0 || !header.szMapName[0])
+#else
                if (strcmp(header.szMapName, m_szMapName) == 0)
+#endif
                {
                     Init();  // remove any existing waypoints
 
@@ -1270,6 +1282,9 @@ void CWaypointClass::StartFlood()
 void CWaypointClass::FloodThink()
 {
      if (!m_bFlooding) return;
+#ifdef __3DS__
+     AC3DS_PHASE("bots: waypoint flood");
+#endif
 
      static int x, y, count;
      count = 0;

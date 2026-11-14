@@ -1322,7 +1322,7 @@ int ac3ds_server_rows(void *menu, Ac3dsServerRow *rows, int max, int &selected)
         filtertext(r.desc, si.sdesc[0] ? si.sdesc : si.name, FTXT_NOCOLOR, sizeof(r.desc) - 1);
         copystring(r.map, si.map[0] ? si.map : "", sizeof(r.map));
         copystring(r.mode, si.map[0] ? modestr(si.mode, true) : "", sizeof(r.mode));
-        formatstring(r.address)("%s:%d", si.name, si.port);
+        snprintf(r.address, sizeof(r.address), "%s:%d", si.name, si.port);
         r.players = si.numplayers;
         r.maxclients = si.maxclients;
         r.ping = si.ping;

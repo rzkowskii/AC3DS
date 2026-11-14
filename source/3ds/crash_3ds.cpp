@@ -8,10 +8,13 @@
 #include "system.h"
 
 #include <3ds.h>
+#include <malloc.h>
+#include <new>
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 
 const char *volatile ac3ds_crash_phase = "startup";
 
@@ -123,7 +126,7 @@ const char *currentThreadName()
         codeEnd = codeInfo.base_addr + codeInfo.size;
 
     crashReport.length = 0;
-    append(crashReport, "AssaultCube 3DS crash report\n");
+    append(crashReport, "AssaultCube 3DS build %d crash report\n", AC3DS_BUILD_NUMBER);
     append(crashReport, "thread: %s\n", currentThreadName());
     append(crashReport, "phase: %s\n", ac3ds_crash_phase ? ac3ds_crash_phase : "?");
     append(crashReport, "exception: %s (%d)\n", exceptionName(excep->type), int(excep->type));
@@ -216,12 +219,15 @@ void watchdogMain(void *)
         const bool loading = phase && !strncmp(phase, "load map", 8);
         if(++stalledSeconds < (loading ? 180 : 30) || reported || reporting.load()) continue;
         reported = true;
-        u32 gpuBusy = 0xffffffff;
-        GSPGPU_ReadHWRegs(0x400034, &gpuBusy, sizeof(gpuBusy));
         stallReport.length = 0;
-        append(stallReport, "AssaultCube 3DS stall report\n");
+        append(stallReport, "AssaultCube 3DS build %d stall report\n", AC3DS_BUILD_NUMBER);
         append(stallReport, "main loop did not advance for %d s after %lu frames\n", stalledSeconds, now);
         append(stallReport, "phase: %s\n", phase ? phase : "?");
+        // Written before asking GSP for the GPU state: if GSP itself is stuck,
+        // the report still reaches the SD card.
+        writeFile(stallPath, stallReport);
+        u32 gpuBusy = 0xffffffff;
+        GSPGPU_ReadHWRegs(0x400034, &gpuBusy, sizeof(gpuBusy));
         append(stallReport, "gpu busy=%08lx (bit 31 = P3D, 30 = PPF, 26/27 = PSC)\n", gpuBusy);
         writeFile(stallPath, stallReport);
         if(!aptIsActive() || reporting.load()) continue;
@@ -235,6 +241,53 @@ void watchdogMain(void *)
 }
 } // namespace
 
+namespace
+{
+// Aborts (out of memory, std::terminate) end in svcBreak, which shows the
+// system error screen without reaching the exception handler or Luma. Record
+// them first.
+void writeFatal(const char *what, void *caller)
+{
+    if(reporting.exchange(true)) return;
+    const struct mallinfo m = mallinfo();
+    crashReport.length = 0;
+    append(crashReport, "AssaultCube 3DS build %d fatal error\n", AC3DS_BUILD_NUMBER);
+    append(crashReport, "%s\n", what);
+    append(crashReport, "thread: %s\n", currentThreadName());
+    append(crashReport, "phase: %s\n", ac3ds_crash_phase ? ac3ds_crash_phase : "?");
+    append(crashReport, "caller=%08lx\n", u32(uintptr_t(caller)));
+    append(crashReport, "heap: arena %u KB, in use %u KB, free %u KB\n", unsigned(m.arena / 1024), unsigned(m.uordblks / 1024), unsigned(m.fordblks / 1024));
+    append(crashReport, "linear free %lu KB, application free %ld KB\n", u32(linearSpaceFree() / 1024),
+           long(s32(osGetMemRegionFree(MEMREGION_APPLICATION)) / 1024));
+    writeFile(crashPath, crashReport);
+}
+
+void onOutOfMemory()
+{
+    writeFatal("out of memory (operator new failed)", __builtin_return_address(0));
+    abort();
+}
+}
+
+// libctru, Citro3D and NDSP panics (for example a full GX command queue) call
+// svcBreak directly: the system error screen, no exception, no Luma dump.
+extern "C" void __real_svcBreak(UserBreakType reason);
+extern "C" void __wrap_svcBreak(UserBreakType reason)
+{
+    char what[48];
+    snprintf(what, sizeof(what), "svcBreak(%d) called (library panic)", int(reason));
+    writeFatal(what, __builtin_return_address(0));
+    __real_svcBreak(reason);
+}
+
+extern "C" void __real_abort(void) __attribute__((noreturn));
+extern "C" void __wrap_abort(void) __attribute__((noreturn));
+extern "C" void __wrap_abort(void)
+{
+    writeFatal("abort() called", __builtin_return_address(0));
+    __real_abort();
+}
+
 void ac3ds_crash_install(const char *thread_name)
 {
     // Worker threads come and go with each map load, so slots are reused.
@@ -244,6 +297,7 @@ void ac3ds_crash_install(const char *thread_name)
         if(!slotUsed[slot].compare_exchange_strong(expected, true)) continue;
         threadNames[slot] = thread_name;
         threadOnException(onException, handlerStacks[slot] + handlerStackBytes, WRITE_DATA_TO_HANDLER_STACK);
+        std::set_new_handler(onOutOfMemory);
         return;
     }
 }
@@ -291,6 +345,13 @@ void ac3ds_crash_stop_watchdog()
     threadJoin(watchdogThread, U64_MAX);
     threadFree(watchdogThread);
     watchdogThread = nullptr;
+}
+
+void ac3ds_memory_line(char *out, size_t size)
+{
+    const struct mallinfo m = mallinfo();
+    snprintf(out, size, "heap %u KB in use, %u KB free in arena; linear free %lu KB",
+             unsigned(m.uordblks / 1024), unsigned(m.fordblks / 1024), u32(linearSpaceFree() / 1024));
 }
 
 void ac3ds_log_memory(void (*log)(const char *))
