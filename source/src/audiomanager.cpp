@@ -301,6 +301,9 @@ void audiomanager::setchannels(int num)
 // called at game exit
 void audiomanager::soundcleanup()
 {
+#ifdef __3DS__
+    ac3ds_async_sounds_shutdown(); // before any buffer it decodes for goes away
+#endif
     if(nosound) return;
 
     // destroy consuming code
@@ -338,6 +341,8 @@ void audiomanager::mapsoundreset()
 #ifdef __3DS__
     mapsoundentitycount = -1;
     // Ambient PCM may be several MiB per sample. Release clips from the previous map.
+    // The buffer pool is keyed by name, so a map config's mapsound can name a
+    // game sound's file. Such a buffer stays loaded, or keeps decoding.
     loopv(mapsounds)
     {
         sbuffer *sample = mapsounds[i].buf;
@@ -347,6 +352,9 @@ void audiomanager::mapsoundreset()
     }
 #endif
     mapsounds.shrink(0);
+#ifdef __3DS__
+    ac3ds_async_sounds_poll(); // reap cancelled and finished jobs before the next map queues more
+#endif
 }
 
 VARP(footsteps, 0, 1, 1);
@@ -902,11 +910,31 @@ COMMANDF(registersound, "siii", (char *name, int *vol, int *loop, int *audiblera
 
 void registerdefaultsounds()
 {
+#ifdef __3DS__
+    // Decoding all of these up front held the menu for seconds. Register them
+    // in slot order, then queue the decodes for core 2: menu and vote sounds
+    // first, then the rest, then voicecoms. One played before it is ready is
+    // claimed (sbuffer::claim), so it still plays.
+    int slots[S_NULL];
+    loopi(S_NULL)
+    {
+        ASSERT(soundcfg[i].key == i);
+        slots[i] = audiomgr.addsound(soundcfg[i].name, soundcfg[i].vol, -1, soundcfg[i].loop != 0, gamesounds, false, soundcfg[i].audibleradius);
+    }
+    loopk(3) loopi(S_NULL)
+    {
+        const int flags = soundcfg[i].flags, tier = flags & (1 << SC_VOICECOM) ? 2 : (flags & (1 << SC_OTHER) ? 0 : 1);
+        if(tier != k || !gamesounds.inrange(slots[i])) continue;
+        sbuffer *b = gamesounds[slots[i]].buf;
+        if(b && !b->loadasync()) conoutf("\f3failed to load sample %s", soundcfg[i].name);
+    }
+#else
     loopi(S_NULL)
     {
         ASSERT(soundcfg[i].key == i);
         audiomgr.addsound(soundcfg[i].name, soundcfg[i].vol, -1, soundcfg[i].loop != 0, gamesounds, true, soundcfg[i].audibleradius);
     }
+#endif
 }
 
 const char *soundcategories[SC_NUM + 1] = { "PAIN", "OWNPAIN", "WEAPON", "PICKUP", "MOVEMENT", "BULLET", "OTHER", "VOICECOM", "TEAM", "PUBLIC", "FFA", "FLAGONLY", "" };

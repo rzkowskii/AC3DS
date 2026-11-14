@@ -177,18 +177,19 @@ public:
     const char *name;
 #ifdef __3DS__
     bool pending = false;   // decoding in the background
-    bool loadasync();       // queue an Ogg map sound for background decode
+    bool loadasync();       // queue an Ogg sound for background decode
+    bool claim();           // finish a pending sound now: decode, wait or adopt
 #endif
 
     sbuffer();
     ~sbuffer();
 
-    bool load(bool trydl = false);
+    bool load(bool trydl = false); // claims a pending sound
     void unload();
 };
 #ifdef __3DS__
-void ac3ds_async_sounds_poll();
-void ac3ds_async_sounds_cancel_all();
+void ac3ds_async_sounds_poll();     // main thread: adopt finished sounds
+void ac3ds_async_sounds_shutdown(); // stop the decode worker, drop its jobs
 #endif
 
 // buffer storage

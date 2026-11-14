@@ -9,7 +9,9 @@ extern "C" {
 #include <3ds/svc.h>
 #include <3ds/synchronization.h>
 #include <3ds/thread.h>
+#include <3ds/os.h>
 }
+#include "crash_3ds.h"
 
 COMMANDF(ac3dsaudiostats, "", ()
 {
@@ -355,35 +357,51 @@ static bool load_native_ogg_sample(ALuint id, OggVorbis_File &file, const vorbis
 #endif
 
 #ifdef __3DS__
-// Background decode of map ambience on the New 3DS's second application core.
-// Ambient loops are full Ogg Vorbis decodes (12.7 s for ac_keller's 12 sounds
-// in Azahar), and none of it is needed before the player can move. Loading
-// queues them; a low-priority worker on core 2 decodes into the same PCM or
-// packed blocks the synchronous path produces; the main thread adopts each
-// finished sample in ac3ds_async_sounds_poll(). A map sound location with no
-// buffer yet is stale and is retried on the next map sound refresh, so each
-// loop starts as soon as it is ready.
+// Background decode of game sounds and map ambience on the New 3DS's second
+// application core. Every sample is a full Ogg Vorbis decode: about 100 game
+// sounds at startup, and 12.7 s for ac_keller's 12 ambient loops in Azahar.
+// Loading queues a job; a low-priority worker on core 2 decodes into the same
+// PCM or packed blocks the synchronous path produces; the main thread adopts
+// each finished sample in ac3ds_async_sounds_poll().
+// - A game sound played before its job is adopted is claimed (sbuffer::claim):
+//   decoded on the spot if still queued, waited for if the worker has it,
+//   adopted at once if done. No game sound is dropped.
+// - A map sound location with no buffer yet is stale and is retried on the
+//   next map sound refresh, so each ambient loop starts as soon as it is ready.
+// The worker never looks files up: the main thread resolves the path when it
+// queues the job, the lookup load() would make at that moment. Files inside zip
+// mods load synchronously, since zipstreams share one archive stream unlocked.
+extern stream *openrawfile(const char *filename, const char *mode);
+
 namespace
 {
 struct asyncsound
 {
-    sbuffer *buf = nullptr;
-    string path;
-    bool cancelled = false, ok = false;
-    int state = 0; // 0 queued, 1 decoding, 2 done
+    sbuffer *buf = nullptr; // never dereferenced once cancelled: it may be gone
+    string path;            // resolved file system path
+    bool cancelled = false; // atomic: set by the main thread, polled by the decoder
+    bool ok = false;
+    int state = 0;          // 0 queued, 1 decoding, 2 done; changed under asynclock
     int channels = 0, rate = 0, frames = 0;
     int16_t *pcm = nullptr;
     Ac3dsPcmBlocks *blocks = nullptr;
 };
 LightLock asynclock;
-LightEvent asyncwake;
+LightEvent asyncwake, asyncdone;
 Thread asyncworker = nullptr;
-bool asyncready = false, asyncstop = false, asyncunavailable = false;
+bool asyncready = false, asyncstop = false, asyncshutdown = false;
+u64 asyncretrytick = 0; // after a failed start, loads stay synchronous until then
 vector<asyncsound *> asyncjobs;
+int adoptedcount = 0, claimedcount = 0;
 
+bool iscancelled(const asyncsound &job) { return __atomic_load_n(&job.cancelled, __ATOMIC_ACQUIRE); }
+void cancel(asyncsound &job) { __atomic_store_n(&job.cancelled, true, __ATOMIC_RELEASE); }
+
+// Runs on the worker, or on the main thread for a claimed job. Stops at the
+// next block once the job is cancelled, and keeps nothing partial.
 void decodeasync(asyncsound &job)
 {
-    stream *f = openfile(job.path, "rb");
+    stream *f = openrawfile(job.path, "rb");
     if(!f) return;
     OggVorbis_File file;
     if(ov_open_callbacks(f, &file, NULL, 0, oggcallbacks)) { delete f; return; }
@@ -403,6 +421,7 @@ void decodeasync(asyncsound &job)
         char block[16 * 1024];
         while(pcm)
         {
+            if(iscancelled(job)) { bytes = -1; break; }
             bytes = readvorbispcm(&file, block, sizeof(block), &bitstream);
             if(bytes == OV_HOLE && ++holes <= 4) continue;
             if(bytes <= 0 || bytes > INT_MAX - used) break;
@@ -433,7 +452,7 @@ void decodeasync(asyncsound &job)
         static thread_local int16_t pcm[ac3ds_pcm_block_frames * 2];
         const int blockbytes = ac3ds_pcm_block_frames * framebytes;
         int used = 0;
-        while(sample)
+        while(sample && !iscancelled(job))
         {
             const long bytes = readvorbispcm(&file, reinterpret_cast<char *>(pcm) + used, blockbytes - used, &bitstream);
             if(bytes == OV_HOLE && ++holes <= 4) continue;
@@ -460,40 +479,55 @@ void decodeasync(asyncsound &job)
 
 void asyncworkermain(void *)
 {
+    ac3ds_crash_install("sound decode");
     for(;;)
     {
         LightLock_Lock(&asynclock);
         if(asyncstop) { LightLock_Unlock(&asynclock); return; }
         asyncsound *job = NULL;
-        loopv(asyncjobs) if(asyncjobs[i]->state == 0 && !asyncjobs[i]->cancelled) { job = asyncjobs[i]; break; }
-        if(job) job->state = 1;
+        loopv(asyncjobs)
+        {
+            asyncsound *queued = asyncjobs[i];
+            if(queued->state != 0) continue;
+            if(iscancelled(*queued)) { queued->state = 2; continue; } // nothing to decode; the poll frees it
+            job = queued;
+            job->state = 1;
+            break;
+        }
         LightLock_Unlock(&asynclock);
         if(!job) { LightEvent_WaitTimeout(&asyncwake, 100000000LL); continue; }
         decodeasync(*job);
         LightLock_Lock(&asynclock);
         job->state = 2;
         LightLock_Unlock(&asynclock);
+        LightEvent_Signal(&asyncdone);
     }
 }
 
 bool startasyncworker()
 {
     if(asyncworker) return true;
-    if(asyncunavailable) return false;
+    if(asyncshutdown) return false;
+    const u64 now = svcGetSystemTick();
+    if(asyncretrytick && now < asyncretrytick) return false;
     if(!asyncready)
     {
         LightLock_Init(&asynclock);
         LightEvent_Init(&asyncwake, RESET_ONESHOT);
+        LightEvent_Init(&asyncdone, RESET_ONESHOT);
         asyncready = true;
     }
-    if(!ac3ds_audio_prepare_pcm_blocks()) { asyncunavailable = true; return false; }
-    s32 priority = 0x30;
-    svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
-    // Below the game and the audio mixer, on core 2.
-    asyncstop = false;
-    asyncworker = threadCreate(asyncworkermain, NULL, 64 * 1024, min(int(priority) + 2, 0x3F), 2, false);
-    if(!asyncworker) asyncunavailable = true;
-    clientlogf("map sounds: background decode on core 2 %s", asyncworker ? "started" : "unavailable");
+    if(ac3ds_audio_prepare_pcm_blocks())
+    {
+        s32 priority = 0x30;
+        svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
+        // Below the game and the audio mixer, on core 2.
+        asyncstop = false;
+        asyncworker = threadCreate(asyncworkermain, NULL, 64 * 1024, min(int(priority) + 2, 0x3F), 2, false);
+    }
+    // A failed start (memory, thread limit) is retried two seconds later.
+    asyncretrytick = asyncworker ? 0 : now + 2 * u64(SYSCLOCK_ARM11);
+    clientlogf("sounds: background decode on core 2 %s", asyncworker ? "started" : "unavailable, loading synchronously");
     return asyncworker != NULL;
 }
 
@@ -503,19 +537,48 @@ void freejob(asyncsound *job)
     ac3ds_audio_discard_pcm_blocks(job->blocks);
     delete job;
 }
+
+// Main thread. The job is out of asyncjobs and not cancelled. Installs the
+// decoded sample in its buffer, or loads the buffer synchronously if the
+// decode failed.
+bool adoptjob(asyncsound *job)
+{
+    sbuffer *buf = job->buf;
+    bool adopted = false;
+    if(job->ok && buf->pending && !buf->id)
+    {
+        ALuint id = 0;
+        alclearerr();
+        alGenBuffers(1, &id);
+        if(!alerr(false) && id)
+        {
+            adopted = job->pcm ? ac3ds_audio_take_pcm16(id, job->pcm, job->frames, job->channels, job->rate)
+                               : ac3ds_audio_take_pcm_blocks(id, job->blocks, job->rate);
+            if(adopted) { job->pcm = NULL; job->blocks = NULL; buf->id = id; }
+            else alDeleteBuffers(1, &id);
+        }
+    }
+    freejob(job);
+    buf->pending = false;
+    if(!adopted && !buf->id && !buf->load()) conoutf("\f3failed to load sample %s", buf->name);
+    return adopted;
+}
 }
 
 bool sbuffer::loadasync()
 {
     if(!name) return false;
     if(id || pending) return true;
-    string filepath;
+    string filepath, resolved;
     const char *exts[] = { "", ".wav", ".ogg" };
     loopi(sizeof(exts)/sizeof(exts[0]))
     {
         formatstring(filepath)("packages/audio/%s%s", name, exts[i]);
         path(filepath);
-        stream *f = openfile(filepath, "rb");
+        // The lookup openfile() makes, so that the worker never reads the zip tables.
+        copystring(resolved, findfile(filepath, "rb"));
+        if(findfilelocation == FFL_ZIP) return load(); // zip mod member: synchronous, as upstream
+        stream *f = openrawfile(resolved, "rb");
         if(!f) continue;
         delete f;
         size_t len = strlen(filepath);
@@ -523,7 +586,7 @@ bool sbuffer::loadasync()
         if(!ogg || !startasyncworker()) return load(); // WAV and fallbacks stay synchronous
         asyncsound *job = new asyncsound;
         job->buf = this;
-        copystring(job->path, filepath);
+        copystring(job->path, resolved);
         LightLock_Lock(&asynclock);
         asyncjobs.add(job);
         LightLock_Unlock(&asynclock);
@@ -532,6 +595,50 @@ bool sbuffer::loadasync()
         return true;
     }
     return false;
+}
+
+bool sbuffer::claim()
+{
+    if(id) return true;
+    if(!pending) return false;
+    asyncsound *job = NULL;
+    int state = -1;
+    LightLock_Lock(&asynclock);
+    loopv(asyncjobs) if(asyncjobs[i]->buf == this && !iscancelled(*asyncjobs[i]))
+    {
+        job = asyncjobs[i];
+        state = job->state;
+        if(state != 1) asyncjobs.remove(i); // queued or done: ours now
+        break;
+    }
+    LightLock_Unlock(&asynclock);
+    if(!job)
+    {
+        pending = false;
+        return load();
+    }
+    if(state == 0) decodeasync(*job); // from the file resolved when it was queued
+    else if(state == 1)
+    {
+        // The worker has it. Game sound clips decode in milliseconds.
+        const u64 deadline = svcGetSystemTick() + 5 * u64(SYSCLOCK_ARM11);
+        for(;;)
+        {
+            LightLock_Lock(&asynclock);
+            const bool done = job->state == 2;
+            if(done) asyncjobs.removeobj(job);
+            LightLock_Unlock(&asynclock);
+            if(done) break;
+            if(svcGetSystemTick() > deadline)
+            {
+                clientlogf("sounds: %s is still decoding", name);
+                return false; // the poll adopts it later
+            }
+            LightEvent_WaitTimeout(&asyncdone, 2000000LL);
+        }
+    }
+    if(adoptjob(job)) ++claimedcount;
+    return id != 0;
 }
 
 void ac3ds_async_sounds_poll()
@@ -544,42 +651,41 @@ void ac3ds_async_sounds_poll()
         if(job->state != 2) continue;
         asyncjobs.remove(i--);
         LightLock_Unlock(&asynclock);
-        bool adopted = false;
-        if(!job->cancelled && job->ok && job->buf->pending && !job->buf->id)
-        {
-            ALuint id = 0;
-            alclearerr();
-            alGenBuffers(1, &id);
-            if(!alerr(false) && id)
-            {
-                adopted = job->pcm ? ac3ds_audio_take_pcm16(id, job->pcm, job->frames, job->channels, job->rate)
-                                   : ac3ds_audio_take_pcm_blocks(id, job->blocks, job->rate);
-                if(adopted) { job->pcm = NULL; job->blocks = NULL; job->buf->id = id; }
-                else alDeleteBuffers(1, &id);
-            }
-            if(!adopted) conoutf("\f3failed to load sample %s", job->buf->name);
-        }
-        if(!job->cancelled) job->buf->pending = false;
-        freejob(job);
-        static int adoptedcount = 0;
-        if(adopted) ++adoptedcount;
+        if(iscancelled(*job)) freejob(job);
+        else if(adoptjob(job)) ++adoptedcount;
         LightLock_Lock(&asynclock);
-        if(asyncjobs.empty() && adoptedcount)
-        {
-            LightLock_Unlock(&asynclock);
-            clientlogf("map sounds: %d decoded in the background", adoptedcount);
-            adoptedcount = 0;
-            LightLock_Lock(&asynclock);
-        }
     }
+    const bool idle = asyncjobs.empty();
     LightLock_Unlock(&asynclock);
+    if(idle && (adoptedcount || claimedcount))
+    {
+        clientlogf("sounds: %d decoded in the background, %d claimed on first use", adoptedcount, claimedcount);
+        adoptedcount = claimedcount = 0;
+    }
 }
 
-void ac3ds_async_sounds_cancel_all()
+void ac3ds_async_sounds_shutdown()
 {
-    if(!asyncready) return;
+    if(!asyncready || !ismainthread()) return;
+    asyncshutdown = true;
     LightLock_Lock(&asynclock);
-    loopv(asyncjobs) { asyncjobs[i]->cancelled = true; asyncjobs[i]->buf->pending = false; }
+    asyncstop = true;
+    loopv(asyncjobs) if(!iscancelled(*asyncjobs[i]))
+    {
+        asyncjobs[i]->buf->pending = false;
+        cancel(*asyncjobs[i]); // a decode in progress stops at its next block
+    }
+    LightLock_Unlock(&asynclock);
+    LightEvent_Signal(&asyncwake);
+    if(asyncworker)
+    {
+        threadJoin(asyncworker, U64_MAX);
+        threadFree(asyncworker);
+        asyncworker = NULL;
+    }
+    LightLock_Lock(&asynclock);
+    loopv(asyncjobs) freejob(asyncjobs[i]);
+    asyncjobs.setsize(0);
     LightLock_Unlock(&asynclock);
 }
 #endif
@@ -589,7 +695,7 @@ bool sbuffer::load(bool trydl)
     if(!name) return false;
     if(id) return true;
 #ifdef __3DS__
-    if(pending) return false;
+    if(pending) return claim();
 #endif
     AC3DS_LOAD_TIME(AC3DS_LOAD_SOUND_TOTAL);
     alclearerr();
@@ -717,8 +823,16 @@ void sbuffer::unload()
 #ifdef __3DS__
     if(pending)
     {
+        // Queued and finished jobs go now. One being decoded stops at its
+        // next block, and the poll frees it.
         LightLock_Lock(&asynclock);
-        loopv(asyncjobs) if(asyncjobs[i]->buf == this) asyncjobs[i]->cancelled = true;
+        loopv(asyncjobs)
+        {
+            asyncsound *job = asyncjobs[i];
+            if(job->buf != this || iscancelled(*job)) continue;
+            if(job->state == 1) cancel(*job);
+            else { asyncjobs.remove(i--); freejob(job); }
+        }
         LightLock_Unlock(&asynclock);
         pending = false;
     }

@@ -33,6 +33,11 @@ location::location(int sound, const worldobjreference &r, int priority) : cfg(NU
 
     // assign buffer
     sbuffer *buf = cfg->buf;
+#ifdef __3DS__
+    // A game sound still decoding in the background is claimed now, so it
+    // plays. Map ambience doesn't wait: it is retried on the next refresh.
+    if(buf && !buf->id && buf->pending && r.type!=worldobjreference::WR_ENTITY) buf->claim();
+#endif
     if(!buf || !buf->id)
     {
         stale = true;
