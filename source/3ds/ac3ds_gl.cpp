@@ -13,17 +13,44 @@
 #include <utility>
 #include <vector>
 
+unsigned ac3dsCommandDumps = 0;
+const u32 *ac3dsLastList = nullptr;
+u32 ac3dsLastListBytes = 0;
+// High half: GX commands handed to GSP. Low half: the last command id.
+u32 ac3dsGxSubmit = 0, ac3dsGxResult = 0;
 extern "C" {
 extern const unsigned char cube_vertex_shbin[];
 extern const unsigned int cube_vertex_shbin_size;
 Result __real_GX_ProcessCommandList(u32 *buffer, u32 bytes, u8 flags);
 
+Result __real_gspSubmitGxCommand(const u32 command[8]);
+
+Result __wrap_gspSubmitGxCommand(const u32 command[8])
+{
+    // Record what GSP answered for the startup report.
+    const Result result = __real_gspSubmitGxCommand(command);
+    ac3dsGxSubmit = (ac3dsGxSubmit & 0xffff0000) + 0x10000 + (command[0] & 0xff);
+    ac3dsGxResult = u32(result);
+    return result;
+}
+
 Result __wrap_GX_ProcessCommandList(u32 *buffer, u32 bytes, u8 flags)
 {
-    // Clean every segment, including Citro3D's internal clear/transfer
-    // splits, before publishing it to the GSP queue.
-    if(R_SUCCEEDED(GSPGPU_FlushDataCache(buffer,bytes))) flags &= ~GX_CMDLIST_FLUSH;
-    else flags |= GX_CMDLIST_FLUSH;
+    // Submission is stock Citro3D. The first lists of a launch are kept on
+    // the SD card so a handheld startup failure can be inspected offline.
+    if(ac3dsCommandDumps)
+    {
+        char path[96];
+        std::snprintf(path,sizeof(path),"sdmc:/3ds/assaultcube/profile/gpu-list-%u.bin",6-ac3dsCommandDumps);
+        if(FILE *f = std::fopen(path,"wb"))
+        {
+            std::fwrite(buffer,1,bytes,f);
+            std::fclose(f);
+        }
+        --ac3dsCommandDumps;
+    }
+    ac3dsLastList = buffer;
+    ac3dsLastListBytes = bytes;
     return __real_GX_ProcessCommandList(buffer,bytes,flags);
 }
 }
@@ -228,7 +255,15 @@ struct WaterWorldSnapshot
 };
 std::array<WaterWorldSnapshot, 2> waterWorldSnapshots;
 DVLB_s *shader = nullptr;
-shaderProgram_s program{};
+enum Program { DefaultProgram, ProjectiveProgram, ProbeProgram, ProgramCount };
+shaderProgram_s programs[ProgramCount]{};
+Program activeProgram = DefaultProgram;
+bool projectiveAllowed = true, forceProjective = false;
+int locProbeTransform = -1;
+// Unit zero: 0 unbound, 1 placeholder, 2 texture. Unit one stays unbound
+// until a texture first uses it, so the units are never enabled out of order.
+int unit0Binding = 0;
+bool unit1Bound = false;
 C3D_AttrInfo attributes[size_t(VertexLayout::Count)]{};
 C3D_BufInfo vertexBuffers{};
 VertexLayout appliedLayout = VertexLayout::Count;
@@ -550,14 +585,26 @@ void applyTex()
         Tex *t = u.on ? findTex(u.id) : nullptr;
         if(!t || !t->gpu.data)
         {
-            // Older Citro3D dereferences the pointer on units 1 and 2.
-            // Bind a defined texel rather than passing null to unit one.
-            if(!tevInitialized || textureWasActive[n]) C3D_TexBind(n,n ? &dummyUnit1 : nullptr);
+            // Citro3D cannot unbind unit one, so it keeps a defined texel
+            // once used. Unit zero then gets the same placeholder: the PICA
+            // never runs with unit one enabled alone.
+            if(n)
+            {
+                if(textureWasActive[n]) C3D_TexBind(n,&dummyUnit1);
+            }
+            else
+            {
+                const Tex *other = texUnit[1].on ? findTex(texUnit[1].id) : nullptr;
+                const int want = unit1Bound || (other && other->gpu.data) ? 1 : 0;
+                if(!tevInitialized || unit0Binding != want) C3D_TexBind(0,want ? &dummyUnit1 : nullptr);
+                unit0Binding = want;
+            }
             textureWasActive[n] = false;
             continue;
         }
         textureWasActive[n] = true;
-        applySampler(*t, n == 0 && projected(n));
+        if(n) unit1Bound = true; else unit0Binding = 2;
+        applySampler(*t, n == 0 && projectiveAllowed && projected(n));
         C3D_TexBind(n, &t->gpu);
         C3D_TexEnv *env = &next[stage];
         C3D_TexEnvInit(env);
@@ -609,7 +656,7 @@ void applySamplers()
         if(!(samplerDirty & (1u << n))) continue;
         Tex *t = findTex(texUnit[n].id);
         if(!texUnit[n].on || !t || !t->gpu.data) continue;
-        applySampler(*t, n == 0 && projected(n));
+        applySampler(*t, n == 0 && projectiveAllowed && projected(n));
         C3D_TexBind(n, &t->gpu);
     }
     samplerDirty = 0;
@@ -753,6 +800,14 @@ void applyFog()
 }
 void apply(bool clip)
 {
+    const Program wanted = forceProjective || (projectiveAllowed && texUnit[0].on && projected(0)) ?
+                           ProjectiveProgram : DefaultProgram;
+    if(wanted != activeProgram)
+    {
+        // Both programs share one uniform layout; only the code changes.
+        C3D_BindProgram(&programs[wanted]);
+        activeProgram = wanted;
+    }
     if(clip != clipWasOn) rasterDirty = true;
     if(rasterDirty) { applyRaster(clip); rasterDirty = false; }
     if(tevDirty) { applyTex(); tevDirty = false; }
@@ -1452,19 +1507,32 @@ bool ac3ds_gl_init()
         ac3ds_gl_shutdown();
         return false;
     }
-    shaderProgramInit(&program);
-    if(R_FAILED(shaderProgramSetVsh(&program,&shader->DVLE[0])))
+    bool programsReady = shader->numDVLE >= ProgramCount;
+    for(int i = 0; programsReady && i < ProgramCount; ++i)
+    {
+        shaderProgramInit(&programs[i]);
+        programsReady = R_SUCCEEDED(shaderProgramSetVsh(&programs[i],&shader->DVLE[i]));
+    }
+    if(!programsReady)
     {
         ac3ds_gl_shutdown();
         return false;
     }
-    C3D_BindProgram(&program);
-    locTransform = shaderInstanceGetUniformLocation(program.vertexShader,"transform");
-    locTex[0] = shaderInstanceGetUniformLocation(program.vertexShader,"tex0");
-    locTex[1] = shaderInstanceGetUniformLocation(program.vertexShader,"tex1");
-    locColorScale = shaderInstanceGetUniformLocation(program.vertexShader,"colorScale");
-    locColor = shaderInstanceGetUniformLocation(program.vertexShader,"flatColor");
-    if(locTransform < 0 || locTex[0] < 0 || locTex[1] < 0 || locColorScale < 0 || locColor < 0)
+    C3D_BindProgram(&programs[DefaultProgram]);
+    activeProgram = DefaultProgram;
+    shaderInstance_s *vsh = programs[DefaultProgram].vertexShader, *projective = programs[ProjectiveProgram].vertexShader;
+    locTransform = shaderInstanceGetUniformLocation(vsh,"transform");
+    locTex[0] = shaderInstanceGetUniformLocation(vsh,"tex0");
+    locTex[1] = shaderInstanceGetUniformLocation(vsh,"tex1");
+    locColorScale = shaderInstanceGetUniformLocation(vsh,"colorScale");
+    locColor = shaderInstanceGetUniformLocation(vsh,"flatColor");
+    locProbeTransform = shaderInstanceGetUniformLocation(programs[ProbeProgram].vertexShader,"transform");
+    if(locTransform < 0 || locTex[0] < 0 || locTex[1] < 0 || locColorScale < 0 || locColor < 0 || locProbeTransform < 0 ||
+       locTransform != shaderInstanceGetUniformLocation(projective,"transform") ||
+       locTex[0] != shaderInstanceGetUniformLocation(projective,"tex0") ||
+       locTex[1] != shaderInstanceGetUniformLocation(projective,"tex1") ||
+       locColorScale != shaderInstanceGetUniformLocation(projective,"colorScale") ||
+       locColor != shaderInstanceGetUniformLocation(projective,"flatColor"))
     {
         ac3ds_gl_shutdown();
         return false;
@@ -1556,7 +1624,7 @@ void ac3ds_gl_shutdown()
     }
     activeWorldGeometry = nullptr;
     lists.clear(); retiredGeometry.clear();
-    if(program.vertexShader) shaderProgramFree(&program);
+    for(auto &program : programs) if(program.vertexShader) shaderProgramFree(&program);
     if(shader) DVLB_Free(shader);
     if(vertices) linearFree(vertices);
     if(indices) linearFree(indices);
@@ -1567,7 +1635,10 @@ void ac3ds_gl_shutdown()
     C3D_Fini();
     top = target = nullptr; shader = nullptr; vertices = nullptr; indices = nullptr; pixels = nullptr;
     fontIndices = nullptr;
-    program = {}; dummyUnit1 = {}; aimTile = nullptr; aimQueued = false; shadowTargets.fill(nullptr);
+    for(auto &program : programs) program = {};
+    activeProgram = DefaultProgram; forceProjective = false; unit0Binding = 0; unit1Bound = false;
+    textureWasActive[0] = textureWasActive[1] = false;
+    dummyUnit1 = {}; aimTile = nullptr; aimQueued = false; shadowTargets.fill(nullptr);
     texUnit[0] = Unit{}; texUnit[1] = Unit{}; active = client = 0;
     model = MatrixStack{}; projection = MatrixStack{}; matrixMode = GL_MODELVIEW;
     depthOn = blendOn = stencilOn = cullOn = alphaOn = fogOn = scissorOn = false;
@@ -1618,6 +1689,90 @@ void ac3ds_gl_startup_clear()
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     ac3ds_gl_end_frame();
+}
+
+void ac3ds_gl_set_command_dumps(unsigned count)
+{
+    ac3dsCommandDumps = std::min(count,6u);
+}
+
+void ac3ds_gl_set_projective(bool allowed)
+{
+    submitPending();
+    projectiveAllowed = allowed;
+    tevDirty = true;
+}
+
+void ac3ds_gl_probe_empty()
+{
+    // A command list with no draw: checks submission and the P3D interrupt
+    // without running the vertex loader, the shader or the rasterizer.
+    if(!startFrame(false)) return;
+    GPUCMD_AddMaskedWrite(GPUREG_PRIMITIVE_CONFIG,0x8,0);
+    top->used = false;
+    C3D_FrameEnd(0);
+    frame = false;
+    frameHasVblank = false;
+}
+
+void ac3ds_gl_probe_minimal()
+{
+    // The Citro3D sample pipeline: two loaded attributes, position and
+    // color outputs, no texture units, DrawArrays, default buffer base.
+    struct ProbeVertex { float p[3]; u8 color[4]; };
+    static ProbeVertex *probe = static_cast<ProbeVertex *>(linearAlloc(3*sizeof(ProbeVertex)));
+    if(!probe || !startFrame(false)) return;
+    const float xy[3][2] = {{-.5f,-.5f},{.5f,-.5f},{0,.5f}};
+    for(int i = 0; i < 3; ++i) probe[i] = {{xy[i][0],xy[i][1],-.5f},{0,0,0,255}};
+    GSPGPU_FlushDataCache(probe,3*sizeof(ProbeVertex));
+    C3D_BindProgram(&programs[ProbeProgram]);
+    C3D_AttrInfo attr;
+    AttrInfo_Init(&attr);
+    AttrInfo_AddLoader(&attr,0,GPU_FLOAT,3);
+    AttrInfo_AddLoader(&attr,1,GPU_UNSIGNED_BYTE,4);
+    C3D_SetAttrInfo(&attr);
+    C3D_BufInfo buffer;
+    BufInfo_Init(&buffer);
+    BufInfo_Add(&buffer,probe,sizeof(ProbeVertex),2,0x10);
+    C3D_SetBufInfo(&buffer);
+    C3D_TexEnv *env = C3D_GetTexEnv(0);
+    C3D_TexEnvInit(env);
+    C3D_TexEnvSrc(env,C3D_Both,GPU_PRIMARY_COLOR,GPU_PRIMARY_COLOR,GPU_PRIMARY_COLOR);
+    C3D_TexEnvFunc(env,C3D_Both,GPU_REPLACE);
+    C3D_CullFace(GPU_CULL_NONE);
+    C3D_DepthTest(false,GPU_ALWAYS,GPU_WRITE_COLOR);
+    const Mat identity = Mat::identity();
+    for(int i = 0; i < 4; ++i) uniformRow(locProbeTransform+i,identity,i);
+    C3D_DrawArrays(GPU_TRIANGLES,0,3);
+    // Hand every cached binding back to the renderer.
+    C3D_BindProgram(&programs[DefaultProgram]);
+    activeProgram = DefaultProgram;
+    tevInitialized = false;
+    rasterStateValid = false;
+    appliedLayout = VertexLayout::Count;
+    vertexBufferValid = false;
+    rasterDirty = transformDirty = tevDirty = true;
+    fullFlush = true;
+    ac3ds_gl_end_frame();
+}
+
+void ac3ds_gl_probe_projective()
+{
+    forceProjective = true;
+    ac3ds_gl_startup_draw();
+    forceProjective = false;
+}
+
+void ac3ds_gl_startup_state(uint32_t out[6])
+{
+    // GX submissions and the last GSP result, the last list, and the GPU busy bits.
+    out[0] = ac3dsGxSubmit;
+    out[1] = ac3dsGxResult;
+    out[2] = ac3dsLastList ? osConvertVirtToPhys(ac3dsLastList) : 0;
+    out[3] = ac3dsLastListBytes;
+    out[4] = 0xffffffff;
+    GSPGPU_ReadHWRegs(0x400034,&out[4],sizeof(u32));
+    out[5] = osGetMemRegionFree(MEMREGION_APPLICATION);
 }
 
 void ac3ds_gl_startup_draw()
