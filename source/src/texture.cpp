@@ -374,9 +374,11 @@ GLuint loadsurface(const char *texname, int &xs, int &ys, int &bpp, int clamp = 
 #ifdef __3DS__
         bool prefetched = false;
         s = ac3ds_texprefetch_take(ffile, prefetched);
-        if(!prefetched)
-#endif
+        // A failed worker decode is retried here, as the original single-threaded load would.
+        if(!s) s = ac3ds_load_image_file(ffile);
+#else
         s = IMG_Load(ffile);
+#endif
     }
     if(!s)
     {
@@ -650,6 +652,27 @@ Texture *lookuptexture(int tex, Texture *failtex, bool trydl)
 }
 
 #ifdef __3DS__
+// Queues the decode of a texture that textureload/reloadtexture is about to
+// read from disk. Skips textures already resident and zip-mounted files.
+void ac3ds_prefetch_texture(const char *name, float scale)
+{
+    defformatstring(key)("%.7g        ", scale);
+    copystring(key + TEXSCALEPREFIXSIZE, name, MAXSTRLEN - TEXSCALEPREFIXSIZE);
+    path(key + TEXSCALEPREFIXSIZE);
+    Texture *existing = textures.access(key);
+    if(existing && existing->id) return;
+    const char *file = key + TEXSCALEPREFIXSIZE;
+    if(file[0] == '<')
+    {
+        file = strchr(file, '>');
+        if(!file) return;
+        ++file;
+    }
+    const char *resolved = findfile(file, "rb");
+    if(findfilelocation == FFL_ZIP) return;
+    ac3ds_texprefetch_add(resolved);
+}
+
 // Queues the decode of every world texture this load will read from disk, in
 // the order load_world looks them up.
 void ac3ds_prefetch_world_textures(const char *texuse)
@@ -660,21 +683,7 @@ void ac3ds_prefetch_world_textures(const char *texuse)
         Slot &s = slots[i];
         if(s.loaded) continue;
         defformatstring(name)("packages/textures/%s", path(s.name, true));
-        defformatstring(key)("%.7g        ", s.scale);
-        copystring(key + TEXSCALEPREFIXSIZE, name, MAXSTRLEN - TEXSCALEPREFIXSIZE);
-        path(key + TEXSCALEPREFIXSIZE);
-        Texture *existing = textures.access(key);
-        if(existing && existing->id) continue;
-        const char *file = key + TEXSCALEPREFIXSIZE;
-        if(file[0] == '<')
-        {
-            file = strchr(file, '>');
-            if(!file) continue;
-            ++file;
-        }
-        const char *resolved = findfile(file, "rb");
-        if(findfilelocation == FFL_ZIP) continue;
-        ac3ds_texprefetch_add(resolved);
+        ac3ds_prefetch_texture(name, s.scale);
     }
 }
 
@@ -760,6 +769,14 @@ bool loadskymap(bool reload)
     }
     bool old_silent_texture_load = silent_texture_load, success = true;
     if(autodownload && execcontext == IEXC_MAPCFG) silent_texture_load = true;
+#ifdef __3DS__
+    // Decode the six faces on core 2 while the main thread uploads.
+    loopi(6)
+    {
+        defformatstring(name)("packages/%s%s_%s.jpg", legacyprefix, loadsky, side[i]);
+        ac3ds_prefetch_texture(name, 1.0f);
+    }
+#endif
     loopi(6)
     {
         defformatstring(name)("packages/%s%s_%s.jpg", legacyprefix, loadsky, side[i]);

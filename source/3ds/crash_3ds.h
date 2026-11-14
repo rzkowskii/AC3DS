@@ -1,11 +1,16 @@
 #pragma once
 
-// Handheld crash and stall reports. A CPU exception or a main loop that stops
-// advancing is written to sdmc:/3ds/assaultcube/profile/crash.txt and shown on
-// the touch screen. Addresses can be resolved with scripts/symbolize-crash.py.
+// Handheld crash and stall reports. A CPU exception is written to
+// sdmc:/3ds/assaultcube/profile/crash.txt and a main loop that stops advancing
+// to stall.txt; both are shown on the touch screen. Addresses can be resolved with scripts/symbolize-crash.py.
 
 // Installs the exception handler for the calling thread. Call once per thread.
 void ac3ds_crash_install(const char *thread_name);
+// Releases the calling thread's handler slot. Call before the thread exits.
+void ac3ds_crash_uninstall();
+// Pauses the stall watchdog while the app is suspended or blocked in a system
+// applet (HOME menu, sleep, software keyboard).
+void ac3ds_crash_pause(bool paused);
 // Starts the stall watchdog. The main loop reports progress with ac3ds_crash_tick.
 void ac3ds_crash_start_watchdog();
 void ac3ds_crash_stop_watchdog();

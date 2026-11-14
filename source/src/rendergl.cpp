@@ -65,6 +65,16 @@ static struct { u64 interval, phases[int(Ac3dsPhase::Count)]; unsigned frame, sl
 static unsigned timedFrame;
 static struct { unsigned calls, minCoverage, maxCoverage; u64 coverageSum; } waterTargetTiming;
 static unsigned sharedRefractionFrames;
+static struct { double drawSum, procSum; float drawPeak, procPeak; unsigned samples; } gpuTiming;
+
+void ac3dsRecordGpu(float drawingMs, float processingMs)
+{
+    gpuTiming.drawSum += drawingMs;
+    gpuTiming.procSum += processingMs;
+    gpuTiming.drawPeak = max(gpuTiming.drawPeak, drawingMs);
+    gpuTiming.procPeak = max(gpuTiming.procPeak, processingMs);
+    ++gpuTiming.samples;
+}
 
 void ac3dsRecordPhase(Ac3dsPhase phase, u64 ticks)
 {
@@ -114,6 +124,7 @@ void ac3dsprofile(int *intervals)
     timedFrame = 0;
     waterTargetTiming = {};
     sharedRefractionFrames = 0;
+    gpuTiming = {};
     ++ac3dsTimingGeneration;
     ac3dsTimingPhases = false;
     ac3dsTimingPending = true;
@@ -171,10 +182,15 @@ void ac3ds_report_profile()
     extern void ac3ds_report_hud_profile();
     ac3ds_report_hud_profile();
     ac3ds_report_world_batches();
-    clientlogf("AC3DS_PERF map=%s mode=%d intervals=%u fps=%.3f p99_ms=%.3f max_ms=%.3f over20ms=%u vblanks=%u missed_vblanks=%u",
+    if(gpuTiming.samples)
+        clientlogf("AC3DS_GPU frames=%u drawing_mean_ms=%.3f drawing_max_ms=%.3f processing_mean_ms=%.3f processing_max_ms=%.3f",
+                   gpuTiming.samples, gpuTiming.drawSum / gpuTiming.samples, gpuTiming.drawPeak,
+                   gpuTiming.procSum / gpuTiming.samples, gpuTiming.procPeak);
+    extern float ac3ds_cpu_clock_ratio;
+    clientlogf("AC3DS_PERF map=%s mode=%d intervals=%u fps=%.3f p99_ms=%.3f max_ms=%.3f over20ms=%u vblanks=%u missed_vblanks=%u cpu_clock_ratio=%.2f",
                getclientmap(), gamemode, intervals, intervals * ticksPerSecond / ticks,
                p99Ticks * 1000.0 / ticksPerSecond, maxTicks * 1000.0 / ticksPerSecond,
-               over20ms, vblanks, missed);
+               over20ms, vblanks, missed, ac3ds_cpu_clock_ratio);
     if(clientlogfile) clientlogfile->fflush();
 }
 #endif
@@ -195,6 +211,8 @@ void gl_checkextensions()
         // method decides it (64 MB Old 3DS mode or 124/178 MB New 3DS mode).
         extern void ac3ds_log_memory(void (*log)(const char *));
         ac3ds_log_memory([](const char *line) { clientlogf("%s", line); });
+        extern float ac3ds_cpu_clock_ratio;
+        clientlogf("cpu: boost clock ratio %.2f (about 3.0 means 804 MHz is active)", ac3ds_cpu_clock_ratio);
     }
 #endif
 

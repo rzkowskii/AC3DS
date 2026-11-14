@@ -785,6 +785,10 @@ struct filestream : stream
     {
         if(file) return false;
         file = fopen(name, mode);
+#ifdef __3DS__
+        // Larger reads mean fewer FS IPC round trips for maps, models and configs.
+        if(file && mode[0] == 'r') setvbuf(file, NULL, _IOFBF, 32 * 1024);
+#endif
 #if !defined(WIN32) && !defined(__3DS__)
         struct statvfs buf;
         if(file && strchr(mode,'w'))

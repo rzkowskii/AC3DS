@@ -3,12 +3,37 @@
 #include "cube.h"
 #ifdef __3DS__
 #include "crash_3ds.h"
+extern "C" {
+#include <3ds/types.h>
+#include <3ds/os.h>
+#include <3ds/svc.h>
+}
 // Map loads take tens of seconds on the handheld. Name each stage and flush
 // the log so a slow stage can be told apart from a stalled one.
 #include "loadprofile_3ds.h"
 #include "texprefetch_3ds.h"
 #include "system.h"
-#define AC3DS_LOAD_STAGE(name, label, progress) do { AC3DS_PHASE("load map: " name); ac3ds_loading_screen(NULL, label, progress); clientlogf("load map: " name); if(clientlogfile) clientlogfile->fflush(); } while(0)
+static u64 ac3ds_load_start = 0, ac3ds_stage_start = 0;
+static inline unsigned ac3ds_ms(u64 ticks) { return unsigned(ticks * 1000 / SYSCLOCK_ARM11); }
+// Each stage line carries the previous stage's duration and the running total.
+#define AC3DS_LOAD_STAGE(name, label, progress) do { \
+    const u64 now_ = svcGetSystemTick(); \
+    AC3DS_PHASE("load map: " name); ac3ds_loading_screen(NULL, label, progress); \
+    clientlogf("load map: " name " (previous +%u ms, %u ms total)", ac3ds_ms(now_ - ac3ds_stage_start), ac3ds_ms(now_ - ac3ds_load_start)); \
+    ac3ds_stage_start = now_; \
+    if(clientlogfile) clientlogfile->fflush(); } while(0)
+
+// Network keepalive inside long load loops, throttled to every 100 ms. Same
+// call upstream makes between load stages; it only services ENet so a long
+// stage cannot time out the connection to a server.
+void ac3ds_load_keepalive()
+{
+    static u64 last = 0;
+    const u64 now = svcGetSystemTick();
+    if(now - last < SYSCLOCK_ARM11 / 10) return;
+    last = now;
+    c2skeepalive();
+}
 #else
 #define AC3DS_LOAD_STAGE(name, label, progress) do {} while(0)
 #endif
@@ -941,9 +966,21 @@ int load_world(char *mname)        // still supports all map formats that have e
     const char *const previousPhase = ac3ds_crash_phase;
     AC3DS_PHASE("load map");
     ac3ds_load_profile_reset();
+    ac3ds_load_start = ac3ds_stage_start = svcGetSystemTick();
     clientlogf("loading map %s", mname);
     if(clientlogfile) clientlogfile->fflush();
-    struct RestorePhase { const char *p; ~RestorePhase() { ac3ds_crash_phase = p; ac3ds_loading_done(); } } restorePhase{previousPhase};
+    struct RestorePhase
+    {
+        const char *p;
+        ~RestorePhase()
+        {
+            ac3ds_crash_phase = p;
+            ac3ds_loading_done();
+            const u64 now = svcGetSystemTick();
+            clientlogf("load map: done (last stage +%u ms, %u ms total)", ac3ds_ms(now - ac3ds_stage_start), ac3ds_ms(now - ac3ds_load_start));
+            if(clientlogfile) clientlogfile->fflush();
+        }
+    } restorePhase{previousPhase};
     {
         defformatstring(loadingtitle)("%s", mname);
         ac3ds_loading_screen(loadingtitle, "Reading the map", 0.02f);
@@ -1122,6 +1159,11 @@ int load_world(char *mname)        // still supports all map formats that have e
     conoutf("read map %s rev %d (%d milliseconds)", cgzname, hdr.maprevision, watch.elapsed());
     conoutf("%s", hdr.maptitle);
     AC3DS_LOAD_STAGE("map config", "Reading the map settings", 0.06f);
+#ifdef __3DS__
+    // Start the decode worker before the map config runs: its loadsky decodes
+    // the six sky faces, which the worker and main thread then share.
+    ac3ds_texprefetch_begin();
+#endif
     mapconfigerror = 0;
     pushscontext(IEXC_MAPCFG); // untrusted altogether
     if(hdr.flags & MHF_AUTOMAPCONFIG)
@@ -1131,10 +1173,13 @@ int load_world(char *mname)        // still supports all map formats that have e
     else
     { // map config from files
         execfile("config/default_map_settings.cfg");
+        AC3DS_LOAD_STAGE("map config file", "Reading the map settings", 0.07f);
         execfile(mcfname);
         copystring(lastloadedconfigfile, mcfname);
     }
+    AC3DS_LOAD_STAGE("map header extras", "Reading the map settings", 0.08f);
     parseheaderextra();
+    AC3DS_LOAD_STAGE("map config done", "Reading the map settings", 0.09f);
     popscontext();
 
     c2skeepalive();
@@ -1143,7 +1188,6 @@ int load_world(char *mname)        // still supports all map formats that have e
     watch.start();
 #ifdef __3DS__
     extern void ac3ds_prefetch_world_textures(const char *texuse);
-    ac3ds_texprefetch_begin();
     ac3ds_prefetch_world_textures(texuse);
 #endif
 #ifdef __3DS__
@@ -1153,13 +1197,12 @@ int load_world(char *mname)        // still supports all map formats that have e
     {
         lookupworldtexture(i, autodownload ? true : false);
         ac3ds_loading_screen(NULL, NULL, 0.10f + 0.50f * float(++texdone) / max(textotal, 1));
+        ac3ds_load_keepalive();
     }
 #else
     loopi(256) if(texuse[i]) lookupworldtexture(i, autodownload ? true : false);
 #endif
-#ifdef __3DS__
-    ac3ds_texprefetch_end([](const char *line) { clientlogf("%s", line); });
-#endif
+
     int texloadtime = watch.elapsed();
 
     c2skeepalive();
@@ -1186,8 +1229,13 @@ int load_world(char *mname)        // still supports all map formats that have e
 
     c2skeepalive();
 
-    AC3DS_LOAD_STAGE("sky and checks", "Loading the sky", 0.96f);
+    AC3DS_LOAD_STAGE("sky", "Loading the sky", 0.96f);
     res |= loadskymap(true) ? 0 : LWW_MISSINGMEDIA * 1;
+#ifdef __3DS__
+    // The prefetch window covers world textures, cached model skins and the sky.
+    ac3ds_texprefetch_end([](const char *line) { clientlogf("%s", line); });
+    AC3DS_LOAD_STAGE("checks", "Checking map media", 0.98f);
+#endif
 
     watch.start();
     loopi(256) if(texuse[i] && lookuptexture(i, notexture, false) == notexture && (!_ignoreillegalpaths || gettextureslot(i))) res |= LWW_MISSINGMEDIA * 2;
@@ -1224,6 +1272,7 @@ int load_world(char *mname)        // still supports all map formats that have e
 
     defformatstring(startmillis)("%d", totalmillis);
     alias("gametimestart", startmillis, true);
+    AC3DS_LOAD_STAGE("start map", "Starting the match", 0.99f);
     startmap(mname);
     res |= mapconfigerror;
     if(res) conoutf("\f3unresolved problems occurred during load_world(), warning: 0x%x", res);

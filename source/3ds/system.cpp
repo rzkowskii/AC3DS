@@ -2,10 +2,12 @@
 #include <malloc.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <atomic>
 
 #include "cube.h"
 #include "audio_3ds.h"
 #include "system.h"
+#include "crash_3ds.h"
 
 extern void pushevent(const SDL_Event &event);
 
@@ -20,7 +22,60 @@ VARP(cstickdeadzone, 0, 10, 40);
 FVARP(csticksensitivity, 0.1f, 1.0f, 5.0f);
 FVARP(cstickysensitivity, 0.1f, 1.0f, 2.0f);
 FVARP(touchsensitivity, 0.1f, 5.0f, 20.0f);
+extern bool inmainloop;
+extern void writeinitcfg();
+extern void writecfg();
 VARP(touchaim, 0, 1, 1);
+
+// Network keepalive while the main thread is blocked in a system applet (the
+// software keyboard) or suspended in the HOME menu. Runs upstream's own
+// c2skeepalive() so the server does not time the 3DS out; the main thread does
+// not touch ENet while the flag is set, and takes the lock before it resumes.
+namespace
+{
+    LightLock netkeep_lock;
+    LightEvent netkeep_wake;
+    Thread netkeep_thread = NULL;
+    std::atomic<bool> netkeep_active{false};
+
+    void netkeep_main(void *)
+    {
+        for(;;)
+        {
+            LightEvent_WaitTimeout(&netkeep_wake, 50000000LL); // 50 ms
+            if(!netkeep_active.load(std::memory_order_acquire)) continue;
+            LightLock_Lock(&netkeep_lock);
+            if(netkeep_active.load(std::memory_order_acquire)) c2skeepalive();
+            LightLock_Unlock(&netkeep_lock);
+        }
+    }
+
+    void netkeep_begin()
+    {
+        if(!netkeep_thread)
+        {
+            LightLock_Init(&netkeep_lock);
+            LightEvent_Init(&netkeep_wake, RESET_ONESHOT);
+            s32 priority = 0x30;
+            svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
+            const s32 lower = priority + 1 > 0x3f ? 0x3f : priority + 1;
+            netkeep_thread = threadCreate(netkeep_main, NULL, 16 * 1024, lower, 2, true);
+            if(!netkeep_thread) netkeep_thread = threadCreate(netkeep_main, NULL, 16 * 1024, lower, 0, true);
+            if(!netkeep_thread) return;
+        }
+        netkeep_active.store(true, std::memory_order_release);
+        LightEvent_Signal(&netkeep_wake);
+    }
+
+    void netkeep_end()
+    {
+        if(!netkeep_thread) return;
+        netkeep_active.store(false, std::memory_order_release);
+        // Wait out a keepalive in progress before the main thread uses ENet.
+        LightLock_Lock(&netkeep_lock);
+        LightLock_Unlock(&netkeep_lock);
+    }
+}
 
 namespace
 {
@@ -29,6 +84,7 @@ namespace
     constexpr int max_config_size = 1 << 20;
     bool gfx_ready, romfs_ready, network_ready, apt_hooked, lcd_ready;
     bool clock_reset, controls_dirty = true, active = true;
+    bool resumed_from_suspend = false; // HOME menu or sleep, not the keyboard applet
     aptHookCookie apt_cookie;
     u32 *socket_buffer;
     u32 original_brightness;
@@ -301,12 +357,27 @@ namespace
         switch(hook)
         {
             case APTHOOK_ONSUSPEND:
+                netkeep_begin(); // HOME menu: stay connected
+                [[fallthrough]];
             case APTHOOK_ONSLEEP:
+            {
+                // aptMainLoop runs this hook from the top of a frame on the main
+                // thread; save settings now in case the console is powered off
+                // from the HOME menu or while asleep.
+                if(inmainloop && hook != APTHOOK_ONEXIT) { writeinitcfg(); writecfg(); }
+                ac3ds_crash_pause(true); // the main loop legitimately stops
+                ac3ds_audio_lifecycle_event(true);
+                break;
+            }
             case APTHOOK_ONEXIT:
+                ac3ds_crash_pause(true); // the main loop legitimately stops
                 ac3ds_audio_lifecycle_event(true);
                 break;
             case APTHOOK_ONRESTORE:
             case APTHOOK_ONWAKEUP:
+                resumed_from_suspend = true;
+                netkeep_end();
+                ac3ds_crash_pause(false);
                 ac3ds_audio_lifecycle_event(false);
                 clock_reset = true;
                 controls_dirty = true;
@@ -481,13 +552,38 @@ namespace
     }
 }
 
+// Measured ratio of CPU speed with the New 3DS boost requested vs not; about
+// 3.0 means 804 MHz is really in effect for this .3dsx, about 1.0 means not.
+float ac3ds_cpu_clock_ratio = 0.0f;
+
+static __attribute__((noinline)) u64 time_spin(u32 iterations)
+{
+    const u64 start = svcGetSystemTick();
+    asm volatile("1: subs %0, %0, #1\n\tbne 1b" : "+r"(iterations) :: "cc");
+    return svcGetSystemTick() - start;
+}
+
+static float measure_cpu_boost()
+{
+    constexpr u32 iterations = 400000;
+    osSetSpeedupEnable(false);
+    svcSleepThread(2000000LL);
+    u64 slow = time_spin(iterations);
+    slow = min(slow, time_spin(iterations));
+    osSetSpeedupEnable(true);
+    svcSleepThread(2000000LL);
+    u64 fast = time_spin(iterations);
+    fast = min(fast, time_spin(iterations));
+    return fast ? float(double(slow) / double(fast)) : 0.0f;
+}
+
 const char *ac3ds_system_init()
 {
     SDL_SetMainReady();
     bool is_new = false;
     if(R_FAILED(APT_CheckNew3DS(&is_new)) || !is_new)
         return "AssaultCube requires a New Nintendo 3DS or New Nintendo 2DS XL.";
-    osSetSpeedupEnable(true);
+    ac3ds_cpu_clock_ratio = measure_cpu_boost(); // leaves the boost on
     mkdir("sdmc:/3ds", 0777);
     mkdir(game_dir, 0777);
     romfs_ready = R_SUCCEEDED(romfsInit());
@@ -574,6 +670,19 @@ bool ac3ds_main_loop()
     ac3ds_audio_lifecycle_event(true);
     ac3ds_audio_service();
     return false;
+}
+
+void ac3ds_set_hosting(bool hosting)
+{
+    aptSetSleepAllowed(!hosting);
+    aptSetHomeAllowed(!hosting);
+}
+
+bool ac3ds_take_resume()
+{
+    const bool resumed = resumed_from_suspend;
+    resumed_from_suspend = false;
+    return resumed;
 }
 
 bool ac3ds_take_clock_reset()
@@ -688,7 +797,11 @@ bool ac3ds_edit_text(const char *title, const char *initial, char *out, size_t c
     swkbdSetButton(&keyboard, SWKBD_BUTTON_LEFT, "Cancel", false);
     swkbdSetButton(&keyboard, SWKBD_BUTTON_RIGHT, "OK", true);
     if(password) swkbdSetPasswordMode(&keyboard, SWKBD_PASSWORD_HIDE);
+    ac3ds_crash_pause(true); // the keyboard applet blocks the main loop
+    netkeep_begin();         // ...so keep the server connection serviced meanwhile
     SwkbdButton button = swkbdInputText(&keyboard, out, capacity);
+    netkeep_end();
+    ac3ds_crash_pause(false);
 
     hidScanInput();
     inhibited_buttons |= hidKeysHeld();
@@ -723,6 +836,19 @@ void ac3ds_sync_input_context()
     reset_physical_input();
 }
 
+extern votedisplayinfo *curvote;
+bool ac3ds_radar_view(playerent *&p, playerent *&d, bool &spect3rd, int &p_baseteam, float &yaw);
+bool ac3ds_radar_shows_player(playerent *p, playerent *d, bool spect3rd, int p_baseteam, playerent *pl);
+bool ac3ds_radar_shows_thief(playerent *p, int p_baseteam, int flag);
+
+// Lower-screen loading state (see ac3ds_loading_screen).
+namespace
+{
+    char loading_title[64] = "", loading_stage[64] = "";
+    int loading_percent = -1;
+    u64 loading_drawn_tick = 0;
+}
+
 // ---------------------------------------------------------------------------
 // Match screen: the lower screen during play. A rotating radar built from the
 // map's own GPU-rendered minimap fills the middle and doubles as the stylus
@@ -741,6 +867,28 @@ namespace
         {214, hud_bottom_bar, 318, 238, KEYCODE_SCOPE, "SCOPE", false},
     };
     constexpr int hud_button_count = sizeof(hud_buttons) / sizeof(hud_buttons[0]);
+
+    // Vote strip across the top of the radar while a vote waits for this player.
+    const HudButton vote_buttons[] = {
+        {4, radar_top + 2, 158, radar_top + 32, KEYCODE_VOTEYES, "VOTE YES", false},
+        {162, radar_top + 2, 316, radar_top + 32, KEYCODE_VOTENO, "VOTE NO", false},
+    };
+    u64 vote_shown_tick = 0;
+    const void *vote_shown_for = NULL;
+
+    bool vote_pending()
+    {
+        return curvote && curvote->millis >= totalmillis && curvote->result == VOTE_NEUTRAL && !curvote->localplayervoted;
+    }
+
+    // Touches are ignored briefly after the strip appears, so a tap meant for
+    // the radar cannot cast a vote by accident.
+    bool vote_armed()
+    {
+        if(!vote_pending()) { vote_shown_for = NULL; return false; }
+        if(vote_shown_for != curvote) { vote_shown_for = curvote; vote_shown_tick = svcGetSystemTick(); }
+        return svcGetSystemTick() - vote_shown_tick >= SYSCLOCK_ARM11 / 2;
+    }
 
     // Minimap copy from the GPU (RGB565, half the minimap texture size).
     u16 *minimap_pixels = NULL;
@@ -838,12 +986,14 @@ namespace
     {
         radar_probe();
         const int cx = touch_width / 2, cy = (radar_top + radar_bottom) / 2;
-        playerent *p = player1;
-        const bool spectating = p && p->isspectating();
-        playerent *view = p;
-        if(spectating && p->spectatemode > SM_FOLLOW1ST && p->spectatemode <= SM_FOLLOW3RD_TRANSPARENT &&
-           players.inrange(p->followplayercn) && players[p->followplayercn]) view = players[p->followplayercn];
-        const float yaw = view ? view->yaw * RAD : 0.0f, c = cosf(yaw), s = sinf(yaw);
+        // Subject, centre and rotation follow the PC radar (renderhud.cpp).
+        playerent *p = NULL, *view = NULL;
+        bool spect3rd = false;
+        int baseteam = 0;
+        float yawdeg = 0;
+        const bool radar = ac3ds_radar_view(p, view, spect3rd, baseteam, yawdeg);
+        if(!radar) view = player1;
+        const float yaw = yawdeg * RAD, c = cosf(yaw), s = sinf(yaw);
         const float zoom = 2.2f; // screen pixels per world unit
         if(minimap_valid && view)
         {
@@ -865,7 +1015,7 @@ namespace
             }
         }
         else fill_rect(screen, 0, radar_top, touch_width, radar_bottom, radar_void);
-        if(!view) return;
+        if(!radar || !view) return; // the PC draws no radar in overview spectating
 
         auto toscreen = [&](const vec &o, int &sx, int &sy)
         {
@@ -873,38 +1023,59 @@ namespace
             sx = cx + int(zoom * (rx * c + ry * s));
             sy = cy + int(zoom * (-rx * s + ry * c));
         };
-        // Same visibility as the PC radar: teammates in team modes, the
-        // followed player when spectating, never opponents.
-        const int baseteam = team_base(view->team);
         loopv(players)
         {
             playerent *pl = players[i];
-            if(!pl || pl == p || pl == view || !team_isactive(pl->team) || pl->state != CS_ALIVE) continue;
-            if(p->team < TEAM_SPECT && !(m_teammode && isteam(baseteam, team_base(pl->team)))) continue;
-            if(p->team == TEAM_SPECT && !isteam(baseteam, team_base(pl->team))) continue;
+            if(!ac3ds_radar_shows_player(p, view, spect3rd, baseteam, pl)) continue;
             int sx, sy;
             toscreen(pl->o, sx, sy);
-            draw_dot(screen, sx, sy, 3, team_base(pl->team) ? hud_rvsf : hud_cla);
+            const u16 color = spect3rd && pl == view ? hud_self : team_base(pl->team) ? hud_rvsf : hud_cla;
+            draw_dot(screen, sx, sy, 3, pl->state == CS_ALIVE ? color : RGB565(12, 24, 12));
         }
         if(m_flags_) loopi(2)
         {
             const flaginfo &f = flaginfos[i];
             const u16 color = m_ktf ? RGB565(31, 55, 0) : f.team ? hud_rvsf : hud_cla;
-            if(f.flagent && f.flagent->x != -1 && f.flagent->y != -1)
+            const entity *e = f.flagent;
+            const bool hasflagent = e && e->x != -1 && e->y != -1; // no base for HTF dummies
+            if(hasflagent)
             {
                 int sx, sy;
-                toscreen(vec(f.flagent->x, f.flagent->y, 0), sx, sy);
+                toscreen(vec(e->x, e->y, 0), sx, sy);
                 for(int j = -4; j <= 4; ++j) for(int k2 = -4; k2 <= 4; ++k2)
                     if(abs(j) == 4 || abs(k2) == 4) plot(screen, sx + k2, sy + j, color);
             }
-            if(f.state == CTFF_INBASE || f.state == CTFF_DROPPED)
+            if((f.state == CTFF_INBASE && hasflagent) || f.state == CTFF_DROPPED)
             {
                 int sx, sy;
                 toscreen(f.pos, sx, sy);
                 draw_dot(screen, sx, sy, 2, color);
             }
+            if(ac3ds_radar_shows_thief(p, baseteam, i))
+            {
+                // Flag carrier marker: a pulsing ring, as the PC radar's
+                // blinking flag icon near the thief.
+                int sx, sy;
+                toscreen(f.actor->o, sx, sy);
+                const int r = 5 + (lastmillis / 150) % 2;
+                for(int a = 0; a < 32; ++a)
+                {
+                    const float t = a * (2 * PI / 32);
+                    plot(screen, sx + int(r * cosf(t)), sy + int(r * sinf(t)), color);
+                }
+            }
         }
-        draw_self(screen, cx, cy);
+        if(!(p->isspectating() && spect3rd)) draw_self(screen, cx, cy);
+    }
+}
+
+namespace
+{
+    void draw_vote_strip(u16 *screen)
+    {
+        if(!vote_pending()) return;
+        const bool armed = vote_armed();
+        for(const HudButton &b : vote_buttons) draw_hud_button(screen, b, armed, false);
     }
 }
 
@@ -1015,7 +1186,16 @@ void ac3ds_poll_input()
             if(panel == GAME_PANEL && drawn_panel == panel)
             {
                 touch_aim = false;
-                for(int i = 0; i < hud_button_count; ++i)
+                if(vote_armed()) for(const HudButton &b : vote_buttons)
+                {
+                    if(touch.px < b.x0 || touch.px >= b.x1 || touch.py < b.y0 || touch.py >= b.y1) continue;
+                    touch_key = b.code;
+                    touch_key_context = button_context;
+                    controls_dirty = true;
+                    push_key(touch_key, true, false, touch_key_context);
+                    break;
+                }
+                if(!touch_key) for(int i = 0; i < hud_button_count; ++i)
                 {
                     const HudButton &b = hud_buttons[i];
                     if(touch.px < b.x0 || touch.px >= b.x1 || touch.py < b.y0 || touch.py >= b.y1) continue;
@@ -1059,6 +1239,12 @@ void ac3ds_poll_input()
         touch_key = 0;
         touch_held = touch_aim = false;
     }
+    else if(pressed_hud_button >= 0)
+    {
+        // Released while the panel changed (or input was reset): clear the highlight.
+        pressed_hud_button = -1;
+        controls_dirty = true;
+    }
 
     if(can_aim)
     {
@@ -1085,9 +1271,14 @@ void ac3ds_poll_input()
     last_poll = now;
 }
 
-void ac3ds_draw_controls()
+void ac3ds_service_controls()
 {
     service_minimap();
+}
+
+void ac3ds_draw_controls()
+{
+    if(loading_percent >= 0) return; // the loading screen owns the lower screen
     const int panel = current_panel();
     const int bind_type = editmode ? keym::ACTION_EDITING :
                           player1 && player1->isspectating() ? keym::ACTION_SPECTATOR : keym::ACTION_DEFAULT;
@@ -1118,6 +1309,7 @@ void ac3ds_draw_controls()
         concatstring(status, "|");
         for(int i = 0; i < hud_button_count; ++i)
             concatstring(status, hud_button_enabled(hud_buttons[i].code) ? (pressed_hud_button == i ? "P" : "1") : "0");
+        concatstring(status, vote_pending() ? (vote_armed() ? "V" : "v") : "");
     }
     const bool unchanged = !controls_dirty && drawn_panel == panel && drawn_bind_type == bind_type &&
        drawn_touch_aim == touchaim && !strcmp(status, drawn_status) &&
@@ -1130,7 +1322,8 @@ void ac3ds_draw_controls()
         u16 *screen = reinterpret_cast<u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
         if(!screen) return;
         draw_radar(screen);
-        if(*drawn_status && drawn_status[0] != '|')
+        draw_vote_strip(screen);
+        if(*drawn_status && drawn_status[0] != '|' && !vote_pending())
         {
             fill_rect(screen, 4, radar_top + 3, 8 + 8 * int(strcspn(drawn_status, "|")), radar_top + 15, RGB565(1, 3, 2));
             string label;
@@ -1154,7 +1347,8 @@ void ac3ds_draw_controls()
         for(int i = 0; i < hud_button_count; ++i)
             draw_hud_button(screen, hud_buttons[i], hud_button_enabled(hud_buttons[i].code), pressed_hud_button == i);
         draw_radar(screen);
-        if(*status && status[0] != '|')
+        draw_vote_strip(screen);
+        if(*status && status[0] != '|' && !vote_pending())
         {
             string label;
             copystring(label, status);
@@ -1246,19 +1440,16 @@ void ac3ds_draw_server_controls()
     GSPGPU_FlushDataCache(screen, touch_width * touch_height * sizeof(*screen));
 }
 
-namespace
-{
-    char loading_title[64] = "", loading_stage[64] = "";
-    int loading_percent = -1;
-    u64 loading_drawn_tick = 0;
-}
 
 void ac3ds_loading_screen(const char *title, const char *stage, float progress)
 {
     // Software-drawn on the lower screen, so it keeps moving while the GPU
     // and the main thread are busy loading.
     if(dedicated_display) return;
+    if(!title && !loading_title[0]) return; // progress outside a load (e.g. a model loaded mid-match)
     const bool newtitle = title && strcmp(title, loading_title);
+    if(newtitle && strcmp(title, "Starting up") && strcmp(title, "Applying settings"))
+        minimap_valid = false; // a new map: the old minimap no longer matches
     int percent = max(0, min(100, int(progress * 100 + 0.5f)));
     if(!newtitle && percent < loading_percent) percent = loading_percent; // never moves backwards
     const bool changed = newtitle || (stage && strcmp(stage, loading_stage));
@@ -1288,7 +1479,6 @@ void ac3ds_loading_screen(const char *title, const char *stage, float progress)
     draw_label(screen, x1 - 8 * int(strlen(pct)), 148, pct, muted);
     draw_label(screen, 16, 212, "The first load of a map takes longest.", muted);
     GSPGPU_FlushDataCache(screen, touch_width * touch_height * sizeof(*screen));
-    controls_dirty = true;
     // QA: capture one loading frame when sdmc:/3ds/assaultcube/qa-loadshot exists.
     static int qaload = -1;
     if(qaload < 0) { struct stat st; qaload = stat("sdmc:/3ds/assaultcube/qa-loadshot", &st) == 0; }

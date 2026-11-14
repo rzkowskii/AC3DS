@@ -1270,11 +1270,21 @@ bool preload_mapmodels(bool trydl)
 #ifdef __3DS__
     int modeltotal = 0, modeldone = 0;
     loopv(mapmodels) if(mapmodels[i].flags & (MMF_REQUIRED | MMF_TEMP_USED)) ++modeltotal;
+    // Models cached from an earlier map only need their skins back: decode
+    // those on core 2 in the order restoreskins will ask for them.
+    loopv(mapmodels) if(mapmodels[i].flags & (MMF_REQUIRED | MMF_TEMP_USED))
+    {
+        model *cached = mapmodels[i].m;
+        if(!cached && !mdlnotfound.access(mapmodels[i].name)) { model **m = mdllookup.access(mapmodels[i].name); if(m) cached = *m; }
+        if(cached) static_cast<vertmodel *>(cached)->queueskins();
+    }
+    extern void ac3ds_load_keepalive();
 #endif
     loopv(mapmodels) if(mapmodels[i].flags & (MMF_REQUIRED | MMF_TEMP_USED))
     {
 #ifdef __3DS__
         ac3ds_loading_screen(NULL, NULL, 0.60f + 0.30f * float(modeldone++) / max(modeltotal, 1));
+        ac3ds_load_keepalive();
 #endif
         model *m = loadmodel(NULL, i, trydl);
         if(!m) missing++;

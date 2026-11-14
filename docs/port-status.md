@@ -107,6 +107,31 @@ On the handheld, every TCP connect failed immediately, which blocked both the ma
 
 The match screen on the lower display now shows a rotating radar. It is made from the map's own GPU-rendered minimap, copied to the CPU once per map by the transfer engine, and follows the PC radar's visibility rules: teammates in team modes and flags, never opponents. The radar is the stylus look area. RELOAD sits top centre between MENU and SCORES, with GRENADE, WEAPON and SCOPE along the bottom. Buttons dim when unavailable. The top screen's console and scoreboard text use `hudtextscale` (default 180%). With the radar running, the six-bot `ac_desert` sample averaged 59.835 FPS with a 19.2 ms p99 and no missed VBlanks (`build-azahar/perf-01`).
 
+A review of that work (85 findings, 55 confirmed on an independent second pass) led to a second round of fixes. All figures are from Azahar.
+
+**Load times**
+- Progressive stock JPEGs are transcoded losslessly to baseline at staging, with pixel-identical output checked by the game's own decoder (485 files).
+- The core-2 decode worker starts before the map config and also covers sky faces and cached model skins.
+- Images are read with a single `fread`, and other reads use 32 KB stdio buffers.
+- Startup game sounds decode in the background. A sound needed early is claimed on first use, so none is dropped.
+- Results: `ac_keller` with sound loads in 3.1 s, against 19.0 s before the first round. `initsound` to first frame fell from 17.8 s to 8.2 s.
+- Each load stage logs its duration. `ac_keller`'s embedded map config takes about 0.9 s, mostly the sky decode.
+
+**Correctness**
+- The lower radar uses the PC radar's visibility functions, including spectator modes and the flag-carrier marker.
+- The stall watchdog pauses during HOME, sleep and the keyboard, and writes `stall.txt` instead of `crash.txt`.
+- ENet is serviced during long load loops, and from a helper thread while the keyboard or HOME menu blocks the main loop, so a PC server does not time the 3DS out.
+- Offline matches pause on return from HOME or sleep. Settings are saved on suspend.
+- A dedicated host keeps the console awake.
+- Online players get a "Match menu online" with chat, voting, team and admin menus and disconnect, and with no pause.
+- During a vote, the lower screen shows VOTE YES / VOTE NO.
+
+**Diagnostics**
+- Startup logs `cpu: boost clock ratio` (about 3.0 means 804 MHz is in effect).
+- The 600-frame profile adds `AC3DS_GPU` drawing and processing time from Citro3D. Both are meaningful only on hardware.
+
+**Frame times** on this build: six-bot `ac_desert` 59.84 FPS with a 17.4 ms p99. Venison with eight bots and both water passes is unchanged at about 52.7 FPS, with draw at 14.3 ms including a 5.3 ms reflection pass. The hardware GPU and clock figures will show whether Venison is limited by the CPU or the GPU there. None of this has been verified on the handheld.
+
 To capture the next failure, the main and audio mixer threads now install a CPU exception handler. A fault writes `profile/crash.txt` with the exception type, PC, LR, fault address, registers, nearby code and stack return candidates, and shows the summary on the touch screen. A watchdog on the extra core reports a main loop that makes no progress for 20 seconds. Both reports name the last main loop phase. The client log records the first six frames, every 1,800th frame and each map load. Resolve the addresses with `scripts/symbolize-crash.py crash.txt <build>/assaultcube.elf` using the ELF from the same build. Azahar passed the smoke fixture on this build in `build-azahar/crash-01` without a stall report. Handheld verification is pending.
 
 The 39.749 FPS build passed the original Lockdown Edition desktop server retest at 100% CPU clock. It entered `ac_douze` revision 40 on protocol 1300, exchanged chat and disconnected. See `build-azahar/network-native-ui-100`.

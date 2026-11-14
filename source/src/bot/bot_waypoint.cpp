@@ -269,7 +269,15 @@ bool CWaypointClass::LoadWaypoints()
      if (BotManager.m_sCurrentTriggerNr == -1)
           BotManager.m_sCurrentTriggerNr = 0;
 
+#ifdef __3DS__
+     // Same traces against the same mapmodels, through the bot update's
+     // spatial index (results are identical; see bot_util.cpp).
+     beginBotMapmodelTraces();
      ReCalcCosts();
+     endBotMapmodelTraces();
+#else
+     ReCalcCosts();
+#endif
 
      conoutf("Waypoints for map %s loaded", (m_szMapName));
 

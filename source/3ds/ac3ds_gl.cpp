@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+void ac3dsRecordGpu(float drawingMs, float processingMs); // rendergl.cpp profiler
 unsigned ac3dsCommandDumps = 0;
 const u32 *ac3dsLastList = nullptr;
 u32 ac3dsLastListBytes = 0;
@@ -392,6 +393,12 @@ bool startFrame(bool sync)
     const bool started = C3D_FrameBegin(0);
     queue.stop();
     if(!started) return false;
+    // GPU time of the previous frame's command lists (Citro3D measures it from
+    // the P3D interrupts). Meaningful on hardware; Azahar does not model it.
+    if(ac3dsTimingPhases && sync)
+    {
+        ac3dsRecordGpu(C3D_GetDrawingTime(), C3D_GetProcessingTime());
+    }
     if(sync) lastTopVblank = C3D_FrameCounter(0);
     frameHasVblank = sync;
     frame = true;

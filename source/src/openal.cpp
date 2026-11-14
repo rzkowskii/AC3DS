@@ -480,6 +480,7 @@ void decodeasync(asyncsound &job)
 void asyncworkermain(void *)
 {
     ac3ds_crash_install("sound decode");
+    struct Uninstall { ~Uninstall() { ac3ds_crash_uninstall(); } } uninstall; // frees the handler slot on exit
     for(;;)
     {
         LightLock_Lock(&asynclock);

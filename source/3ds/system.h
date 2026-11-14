@@ -39,10 +39,16 @@ void ac3ds_system_shutdown();
 void ac3ds_show_error(const char *message);
 bool ac3ds_main_loop();
 bool ac3ds_take_clock_reset();
+// True once after returning from the HOME menu or sleep.
+bool ac3ds_take_resume();
+// Dedicated hosting: keeps the console awake and the app in front.
+void ac3ds_set_hosting(bool hosting);
 bool ac3ds_start_network();
 void ac3ds_read_launch_arguments(int &argc, char **&argv);
 void ac3ds_poll_input();
 void ac3ds_draw_controls();
+// GPU-side upkeep for the lower screen; call while a GPU frame is open.
+void ac3ds_service_controls();
 void ac3ds_draw_server_controls();
 void ac3ds_controls_changed();
 void ac3ds_show_startup_report(const char *const *lines, int count);

@@ -18,36 +18,44 @@ const char *volatile ac3ds_crash_phase = "startup";
 namespace
 {
 constexpr const char *crashPath = "/3ds/assaultcube/profile/crash.txt";
+// Stall reports go to their own file so a false positive never replaces a
+// real crash report.
+constexpr const char *stallPath = "/3ds/assaultcube/profile/stall.txt";
 constexpr int handlerStackBytes = 16 * 1024;
-constexpr int maxThreads = 4;
+constexpr int maxThreads = 6;
 
 alignas(8) u8 handlerStacks[maxThreads][handlerStackBytes];
 const char *threadNames[maxThreads] = {};
-std::atomic<int> installedThreads{0};
+std::atomic<bool> slotUsed[maxThreads];
 std::atomic<bool> reporting{false};
 
-char report[4096];
-int reportLength = 0;
-
-void append(const char *format, ...)
+// One report buffer per writer: the exception handler and the watchdog thread.
+struct ReportBuffer
 {
-    if(reportLength >= int(sizeof(report)) - 1) return;
+    char text[4096];
+    int length = 0;
+};
+ReportBuffer crashReport, stallReport;
+
+void append(ReportBuffer &r, const char *format, ...)
+{
+    if(r.length >= int(sizeof(r.text)) - 1) return;
     va_list args;
     va_start(args, format);
-    const int n = vsnprintf(report + reportLength, sizeof(report) - reportLength, format, args);
+    const int n = vsnprintf(r.text + r.length, sizeof(r.text) - r.length, format, args);
     va_end(args);
-    if(n > 0) reportLength = reportLength + n < int(sizeof(report)) ? reportLength + n : int(sizeof(report)) - 1;
+    if(n > 0) r.length = r.length + n < int(sizeof(r.text)) ? r.length + n : int(sizeof(r.text)) - 1;
 }
 
-void writeReport()
+void writeFile(const char *where, const ReportBuffer &r)
 {
     Handle file = 0;
     const FS_Path empty = fsMakePath(PATH_EMPTY, "");
-    const FS_Path path = fsMakePath(PATH_ASCII, crashPath);
+    const FS_Path path = fsMakePath(PATH_ASCII, where);
     if(R_FAILED(FSUSER_OpenFileDirectly(&file, ARCHIVE_SDMC, empty, path, FS_OPEN_WRITE | FS_OPEN_CREATE, 0))) return;
     FSFILE_SetSize(file, 0);
     u32 written = 0;
-    FSFILE_Write(file, &written, 0, report, u32(reportLength), FS_WRITE_FLUSH);
+    FSFILE_Write(file, &written, 0, r.text, u32(r.length), FS_WRITE_FLUSH);
     FSFILE_Close(file);
 }
 
@@ -114,30 +122,30 @@ const char *currentThreadName()
     if(R_SUCCEEDED(svcQueryMemory(&codeInfo, &page, 0x00100000)))
         codeEnd = codeInfo.base_addr + codeInfo.size;
 
-    reportLength = 0;
-    append("AssaultCube 3DS crash report\n");
-    append("thread: %s\n", currentThreadName());
-    append("phase: %s\n", ac3ds_crash_phase ? ac3ds_crash_phase : "?");
-    append("exception: %s (%d)\n", exceptionName(excep->type), int(excep->type));
-    append("pc=%08lx lr=%08lx sp=%08lx cpsr=%08lx\n", regs->pc, regs->lr, regs->sp, regs->cpsr);
-    append("far=%08lx fsr=%08lx fpexc=%08lx fpinst=%08lx\n", excep->far, excep->fsr, excep->fpexc, excep->fpinst);
+    crashReport.length = 0;
+    append(crashReport, "AssaultCube 3DS crash report\n");
+    append(crashReport, "thread: %s\n", currentThreadName());
+    append(crashReport, "phase: %s\n", ac3ds_crash_phase ? ac3ds_crash_phase : "?");
+    append(crashReport, "exception: %s (%d)\n", exceptionName(excep->type), int(excep->type));
+    append(crashReport, "pc=%08lx lr=%08lx sp=%08lx cpsr=%08lx\n", regs->pc, regs->lr, regs->sp, regs->cpsr);
+    append(crashReport, "far=%08lx fsr=%08lx fpexc=%08lx fpinst=%08lx\n", excep->far, excep->fsr, excep->fpexc, excep->fpinst);
     for(int i = 0; i < 13; i += 4)
     {
-        append("r%-2d=%08lx", i, regs->r[i]);
-        for(int j = i + 1; j < i + 4 && j < 13; ++j) append(" r%-2d=%08lx", j, regs->r[j]);
-        append("\n");
+        append(crashReport, "r%-2d=%08lx", i, regs->r[i]);
+        for(int j = i + 1; j < i + 4 && j < 13; ++j) append(crashReport, " r%-2d=%08lx", j, regs->r[j]);
+        append(crashReport, "\n");
     }
-    append("code=%08lx-%08lx\n", codeBase, codeEnd);
+    append(crashReport, "code=%08lx-%08lx\n", codeBase, codeEnd);
     // The instruction words around the PC, when the code is readable.
     const u32 pc = regs->pc & ~3u;
     if(readable(pc - 8, 20))
     {
         const u32 *words = reinterpret_cast<const u32 *>(pc - 8);
-        append("code@pc-8: %08lx %08lx [%08lx] %08lx %08lx\n", words[0], words[1], words[2], words[3], words[4]);
+        append(crashReport, "code@pc-8: %08lx %08lx [%08lx] %08lx %08lx\n", words[0], words[1], words[2], words[3], words[4]);
     }
     // Words on the faulting stack that point into the code region. The first
     // few are usually the caller chain.
-    append("stack return candidates:\n");
+    append(crashReport, "stack return candidates:\n");
     u32 stackEnd = 0;
     int found = 0;
     if(readable(regs->sp & ~3u, 4, &stackEnd))
@@ -148,11 +156,11 @@ const char *currentThreadName()
         {
             const u32 value = sp[i];
             if(!inCode(value & ~1u, codeBase, codeEnd)) continue;
-            append("  sp+%03lx %08lx\n", i * 4, value);
+            append(crashReport, "  sp+%03lx %08lx\n", i * 4, value);
             ++found;
         }
     }
-    writeReport();
+    writeFile(crashPath, crashReport);
 
     char l1[48], l2[48], l3[48], l4[48], l5[48];
     snprintf(l1, sizeof(l1), "%s in %s", exceptionName(excep->type), currentThreadName());
@@ -166,8 +174,11 @@ const char *currentThreadName()
 }
 
 // Stall watchdog: if the main loop stops advancing, record where it was.
+// Paused while the app is suspended (HOME menu, sleep, software keyboard),
+// when the main loop legitimately stops.
 Thread watchdogThread = nullptr;
 std::atomic<bool> watchdogStop{false};
+std::atomic<bool> watchdogPaused{false};
 std::atomic<u32> mainTicks{0};
 LightEvent watchdogWake;
 
@@ -180,13 +191,19 @@ void watchdogMain(void *)
     {
         LightEvent_WaitTimeout(&watchdogWake, 1000000000LL);
         const u32 now = mainTicks.load(std::memory_order_relaxed);
+        if(watchdogPaused.load(std::memory_order_acquire))
+        {
+            lastSeen = now;
+            stalledSeconds = 0;
+            continue;
+        }
         if(now != lastSeen || !now)
         {
-            if(reported && now != lastSeen)
+            if(reported && now != lastSeen && !reporting.load())
             {
                 // The loop resumed: mark the report so it is not mistaken for a hang.
-                append("resumed after %d s at frame %lu\n", stalledSeconds, now);
-                writeReport();
+                append(stallReport, "resumed after %d s at frame %lu\n", stalledSeconds, now);
+                writeFile(stallPath, stallReport);
                 reported = false;
             }
             lastSeen = now;
@@ -201,15 +218,16 @@ void watchdogMain(void *)
         reported = true;
         u32 gpuBusy = 0xffffffff;
         GSPGPU_ReadHWRegs(0x400034, &gpuBusy, sizeof(gpuBusy));
-        reportLength = 0;
-        append("AssaultCube 3DS stall report\n");
-        append("main loop did not advance for %d s after %lu frames\n", stalledSeconds, now);
-        append("phase: %s\n", ac3ds_crash_phase ? ac3ds_crash_phase : "?");
-        append("gpu busy=%08lx\n", gpuBusy);
-        writeReport();
+        stallReport.length = 0;
+        append(stallReport, "AssaultCube 3DS stall report\n");
+        append(stallReport, "main loop did not advance for %d s after %lu frames\n", stalledSeconds, now);
+        append(stallReport, "phase: %s\n", phase ? phase : "?");
+        append(stallReport, "gpu busy=%08lx (bit 31 = P3D, 30 = PPF, 26/27 = PSC)\n", gpuBusy);
+        writeFile(stallPath, stallReport);
+        if(!aptIsActive() || reporting.load()) continue;
         char l1[48], l2[48], l3[48];
         snprintf(l1, sizeof(l1), "No progress after frame %lu", now);
-        snprintf(l2, sizeof(l2), "phase %s", ac3ds_crash_phase ? ac3ds_crash_phase : "?");
+        snprintf(l2, sizeof(l2), "phase %s", phase ? phase : "?");
         snprintf(l3, sizeof(l3), "gpu busy %08lx", gpuBusy);
         const char *lines[] = { l1, l2, l3 };
         showOnTouchScreen("AssaultCube stopped responding", lines, 3);
@@ -219,10 +237,31 @@ void watchdogMain(void *)
 
 void ac3ds_crash_install(const char *thread_name)
 {
-    const int slot = installedThreads.fetch_add(1);
-    if(slot >= maxThreads) return;
-    threadNames[slot] = thread_name;
-    threadOnException(onException, handlerStacks[slot] + handlerStackBytes, WRITE_DATA_TO_HANDLER_STACK);
+    // Worker threads come and go with each map load, so slots are reused.
+    for(int slot = 0; slot < maxThreads; ++slot)
+    {
+        bool expected = false;
+        if(!slotUsed[slot].compare_exchange_strong(expected, true)) continue;
+        threadNames[slot] = thread_name;
+        threadOnException(onException, handlerStacks[slot] + handlerStackBytes, WRITE_DATA_TO_HANDLER_STACK);
+        return;
+    }
+}
+
+void ac3ds_crash_uninstall()
+{
+    // Call from the thread itself, before it returns.
+    const u8 *tls = static_cast<const u8 *>(getThreadLocalStorage());
+    const u32 stack = *reinterpret_cast<const u32 *>(tls + 0x44);
+    threadOnException(NULL, NULL, NULL);
+    for(int slot = 0; slot < maxThreads; ++slot)
+        if(stack == u32(uintptr_t(handlerStacks[slot] + handlerStackBytes))) slotUsed[slot].store(false);
+}
+
+void ac3ds_crash_pause(bool paused)
+{
+    watchdogPaused.store(paused, std::memory_order_release);
+    if(!paused && watchdogThread) LightEvent_Signal(&watchdogWake);
 }
 
 void ac3ds_crash_tick()
@@ -240,8 +279,8 @@ void ac3ds_crash_start_watchdog()
     // The New model's extra core, so a main thread spinning on core 0 cannot
     // starve it. It sleeps for a second at a time.
     const s32 lower = priority + 1 > 0x3f ? 0x3f : priority + 1;
-    watchdogThread = threadCreate(watchdogMain, nullptr, 8 * 1024, lower, 2, false);
-    if(!watchdogThread) watchdogThread = threadCreate(watchdogMain, nullptr, 8 * 1024, lower, 0, false);
+    watchdogThread = threadCreate(watchdogMain, nullptr, 16 * 1024, lower, 2, false);
+    if(!watchdogThread) watchdogThread = threadCreate(watchdogMain, nullptr, 16 * 1024, lower, 0, false);
 }
 
 void ac3ds_crash_stop_watchdog()

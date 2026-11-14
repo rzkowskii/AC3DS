@@ -13,3 +13,5 @@ void ac3ds_texprefetch_add(const char *resolvedpath);
 // then decodes it itself.
 SDL_Surface *ac3ds_texprefetch_take(const char *resolvedpath, bool &prefetched);
 void ac3ds_texprefetch_end(void (*log)(const char *) = nullptr);
+// Decodes an image file read with a single fread (same result as IMG_Load).
+SDL_Surface *ac3ds_load_image_file(const char *path);

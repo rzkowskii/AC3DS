@@ -49,6 +49,7 @@ void cleanup(char *msg)         // single program exit point;
     ac3ds_close_network();
     if(native_network) enet_deinitialize();
     native_network = false;
+    ac3ds_async_sounds_shutdown(); // also on fatal paths that skip soundcleanup
     ac3ds_audio_shutdown();
     if(native_graphics)
     {
@@ -763,8 +764,12 @@ void setupscreen(int &useddepthbits, int &usedfsaa)
 void swapbuffers()
 {
 #ifdef __3DS__
-    ac3ds_draw_controls();
+    // The minimap readback must be queued inside the open GPU frame; the
+    // lower-screen drawing is pure CPU work, so it runs after submission while
+    // the GPU renders the top screen.
+    ac3ds_service_controls();
     ac3ds_gl_end_frame();
+    ac3ds_draw_controls();
 #else
     SDL_GL_SwapWindow(screen);
 #endif
@@ -775,6 +780,10 @@ extern int hirestextures;
 void resetgl()
 {
     clearchanges(CHANGE_GFX);
+#ifdef __3DS__
+    ac3ds_loading_screen("Applying settings", "Reloading textures and models", 0.05f);
+    struct LoadingDone { ~LoadingDone() { ac3ds_loading_done(); } } loadingdone;
+#endif
 
     loadingscreen();
 
@@ -1831,6 +1840,7 @@ int main(int argc, char **argv)
 
     initlog("mainloop");
 #ifdef __3DS__
+    ac3ds_loading_done();
     ac3ds_crash_start_watchdog();
 #endif
 
@@ -1860,6 +1870,11 @@ int main(int argc, char **argv)
             clockreset();
             ac3ds_audio_service();
         }
+        // Coming back from HOME or sleep mid-match offline: pause, so the
+        // player is not dropped straight back into a firefight.
+        if(ac3ds_take_resume() && !multiplayer(NULL) && !watchingdemo && *getclientmap() &&
+           ac3ds_menu_panel() == Ac3dsMenu::None && !getcurcommand(NULL))
+            execute("ac3ds_pause_menu");
 #endif
         static int frames = 0;
         static float fps = 10.0f;
@@ -1977,12 +1992,13 @@ int main(int argc, char **argv)
 #endif
 #ifdef __3DS__
         AC3DS_PHASE("frame end");
-        if(frames <= 6 || frames % 1800 == 0)
+        if(frames <= 6)
         {
             // Progress marks for handheld runs, flushed so a hang leaves a trace.
             clientlogf("frame %d done (%d ms)", frames, elapsed);
             if(clientlogfile) clientlogfile->fflush();
         }
+        else if(frames % 1800 == 0) clientlogf("frame %d done (%d ms)", frames, elapsed); // no SD flush mid-match
 #endif
         pollautodownloadresponse();
         if(onceauthed && sk)

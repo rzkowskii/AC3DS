@@ -629,6 +629,47 @@ void drawradar_showmap(playerent *p, int w, int h)
     glPopMatrix();
 }
 
+#ifdef __3DS__
+// The lower-screen radar uses exactly the PC radar's rules (drawradar_vicinity
+// and drawradar_showmap below) so it never shows what a PC client would hide.
+bool ac3ds_radar_view(playerent *&p, playerent *&d, bool &spect3rd, int &p_baseteam, float &yaw)
+{
+    if(!player1 || player1->spectatemode > SM_FLY) return false; // gl_drawhud draws no radar then
+    p = camera1->type<ENT_CAMERA ? (playerent *)camera1 : player1;
+    spect3rd = p->spectatemode > SM_FOLLOW1ST && p->spectatemode <= SM_FOLLOW3RD_TRANSPARENT;
+    d = p;
+    if(spect3rd)
+    {
+        if(!players.inrange(p->followplayercn) || !players[p->followplayercn]) return false;
+        d = players[p->followplayercn];
+    }
+    p_baseteam = p->team == TEAM_SPECT && spect3rd ? team_base(d->team) : team_base(p->team);
+    yaw = camera1->yaw;
+    return true;
+}
+
+bool ac3ds_radar_shows_player(playerent *p, playerent *d, bool spect3rd, int p_baseteam, playerent *pl)
+{
+    if(!pl || pl == p || !team_isactive(pl->team)) return false;
+    if(OUTBORD(pl->o.x, pl->o.y)) return false;
+    int pl_baseteam = team_base(pl->team);
+    if(p->team < TEAM_SPECT && ((m_teammode && !isteam(p_baseteam, pl_baseteam)) || (!m_teammode && !(spect3rd && d == pl)))) return false;
+    if(p->team == TEAM_SPECT && !(spect3rd && (isteam(p_baseteam, pl_baseteam) || d == pl))) return false;
+    return true;
+}
+
+bool ac3ds_radar_shows_thief(playerent *p, int p_baseteam, int flag)
+{
+    const flaginfo &f = flaginfos[flag];
+    if(f.state != CTFF_STOLEN || !f.actor) return false;
+    if(m_teammode && !m_ktf && player1->team == TEAM_SPECT && (p->spectatemode == SM_DEATHCAM || p->spectatemode > SM_FOLLOW3RD_TRANSPARENT)) return false;
+    bool tm = flag != p_baseteam;
+    if(m_htf) tm = !tm;
+    else if(m_ktf) tm = true;
+    return tm;
+}
+#endif
+
 void drawradar_vicinity(playerent *p, int w, int h)
 {
     bool spect3rd = p->spectatemode > SM_FOLLOW1ST && p->spectatemode <= SM_FOLLOW3RD_TRANSPARENT;
@@ -1029,7 +1070,17 @@ void gl_drawhud(int w, int h, int curfps, int nquads, int curvert, bool underwat
 
         if(curvote && curvote->millis >= totalmillis && !(hidevote == 1 && curvote->localplayervoted && curvote->result == VOTE_NEUTRAL))
         {
+#ifdef __3DS__
+            // Readable on the 400x240 screen: the same panel at the HUD text scale.
+            extern int hudtextscale;
+            const float votescale = hudtextscale / 100.0f;
+            glPushMatrix();
+            glScalef(votescale, votescale, 1);
+            struct PopScale { ~PopScale() { glPopMatrix(); } } popscale;
+            const int left = int(2 * HUDPOS_X_BOTTOMLEFT / votescale), top = int(VIRTH / votescale);
+#else
             const int left = 2 * HUDPOS_X_BOTTOMLEFT, top = VIRTH;
+#endif
             defformatstring(str)("%s called a vote:", curvote->owner ? colorname(curvote->owner) : "");
             draw_text(str, left, top + 240, 255, 255, 255, votealpha);
             draw_text(curvote->desc, left, top + 320, 255, 255, 255, votealpha);
@@ -1042,7 +1093,11 @@ void gl_drawhud(int w, int h, int curfps, int nquads, int curvert, bool underwat
                 case VOTE_NEUTRAL:
                     drawvoteicon(left, top, 0, 0, false);
                     if(!curvote->localplayervoted)
+#ifdef __3DS__
+                        draw_text("\f3tap VOTE YES or VOTE NO below", left, top+560, 255, 255, 255, votealpha);
+#else
                         draw_text("\f3press F1/F2 to vote yes or no", left, top+560, 255, 255, 255, votealpha);
+#endif
                     break;
                 default:
                     drawvoteicon(left, top, (curvote->result-1)&1, 1, false);

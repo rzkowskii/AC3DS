@@ -5091,12 +5091,15 @@ void initserver(bool dedicated)
         }
         server_workers_active = true;
         ac3ds_draw_server_controls();
+        // A suspended host stops serving its players: keep it awake and in front.
+        ac3ds_set_hosting(true);
         while(!interceptkey(SDLK_ESCAPE))
         {
             server_clock_reset = ac3ds_take_clock_reset();
             if(server_clock_reset) ac3ds_draw_server_controls();
             serverslice(5);
         }
+        ac3ds_set_hosting(false);
         // This filename belongs to the readmaps thread until it is joined.
         cleanupserver();
 #else

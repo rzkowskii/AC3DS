@@ -1347,6 +1347,17 @@ struct vertmodel : model
     }
 
 #ifdef __3DS__
+    // Queues the decode of skins evicted at the last map change.
+    void queueskins()
+    {
+        extern void ac3ds_prefetch_texture(const char *name, float scale);
+        loopv(parts) loopvj(parts[i]->meshes)
+        {
+            Texture *skin = parts[i]->meshes[j]->skin;
+            if(skin && skin != notexture && !skin->id && skin->name) ac3ds_prefetch_texture(skin->name, skin->scale);
+        }
+    }
+
     bool restoreskins()
     {
         bool ready = true;

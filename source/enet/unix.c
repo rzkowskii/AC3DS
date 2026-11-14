@@ -407,7 +407,10 @@ typedef struct
     int abandoned;
 } Enet3dsConnect;
 
-static char enet_3ds_diag [96] = "none";
+static __thread char enet_3ds_diag [96] = "none";
+/* Helpers still blocked in connect(), including abandoned ones. Bounded so a
+   string of unreachable hosts cannot accumulate threads and sockets. */
+static volatile int enet_3ds_helpers = 0;
 
 const char *
 enet_3ds_connect_diag (void)
@@ -427,6 +430,7 @@ enet_3ds_connect_main (void * arg)
     c -> state = result == 0 ? 1 : -1;
     abandoned = c -> abandoned;
     LightLock_Unlock (& c -> lock);
+    __atomic_sub_fetch (& enet_3ds_helpers, 1, __ATOMIC_ACQ_REL);
     if (abandoned)
     {
         close (c -> socket);
@@ -439,6 +443,11 @@ enet_3ds_connect_begin (ENetSocket socket, const ENetAddress * address)
 {
     Enet3dsConnect * c;
     s32 priority = 0x30;
+    if (__atomic_load_n (& enet_3ds_helpers, __ATOMIC_ACQUIRE) >= 4)
+    {
+        snprintf (enet_3ds_diag, sizeof (enet_3ds_diag), "too many connects still pending");
+        return NULL;
+    }
     if (fcntl (socket, F_SETFL, 0) != 0)
     {
         snprintf (enet_3ds_diag, sizeof (enet_3ds_diag), "blocking mode failed, errno %d", errno);
@@ -454,8 +463,10 @@ enet_3ds_connect_begin (ENetSocket socket, const ENetAddress * address)
     LightLock_Init (& c -> lock);
     svcGetThreadPriority (& priority, CUR_THREAD_HANDLE);
     /* Detached: libctru frees the thread object when it returns. */
+    __atomic_add_fetch (& enet_3ds_helpers, 1, __ATOMIC_ACQ_REL);
     if (threadCreate (enet_3ds_connect_main, c, 16 * 1024, priority, -2, true) == NULL)
     {
+        __atomic_sub_fetch (& enet_3ds_helpers, 1, __ATOMIC_ACQ_REL);
         snprintf (enet_3ds_diag, sizeof (enet_3ds_diag), "connect thread did not start");
         free (c);
         return NULL;

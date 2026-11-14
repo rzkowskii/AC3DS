@@ -8,6 +8,7 @@
 // still does every format conversion, resize and upload as before.
 
 #include "texprefetch_3ds.h"
+#include "crash_3ds.h"
 
 #include <SDL.h>
 #include <SDL_image.h>
@@ -21,9 +22,41 @@ extern "C" {
 }
 
 #include <cstdio>
+#include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
+
+// Reads the whole file with one fread, then decodes from memory. stdio would
+// otherwise refill a small buffer with one FS IPC round trip per refill. The
+// type hint from the extension keeps IMG_Load's behavior (and pixels) exact.
+SDL_Surface *ac3ds_load_image_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if(!f) return nullptr;
+    SDL_Surface *surface = nullptr;
+    if(fseek(f, 0, SEEK_END) == 0)
+    {
+        const long size = ftell(f);
+        if(size > 0 && size < 64 * 1024 * 1024 && fseek(f, 0, SEEK_SET) == 0)
+        {
+            if(void *data = malloc(size_t(size)))
+            {
+                if(fread(data, 1, size_t(size), f) == size_t(size))
+                {
+                    const char *ext = strrchr(path, '.');
+                    SDL_RWops *rw = SDL_RWFromConstMem(data, int(size));
+                    if(rw) surface = IMG_LoadTyped_RW(rw, 1, ext ? ext + 1 : NULL);
+                }
+                free(data);
+            }
+        }
+    }
+    fclose(f);
+    if(!surface) surface = IMG_Load(path); // anything unusual: the original path
+    return surface;
+}
 
 namespace
 {
@@ -68,6 +101,8 @@ Job *nextJob()
 
 void workerMain(void *)
 {
+    ac3ds_crash_install("texture prefetch");
+    struct Uninstall { ~Uninstall() { ac3ds_crash_uninstall(); } } uninstall;
     for(;;)
     {
         LightLock_Lock(&lock);
@@ -81,7 +116,7 @@ void workerMain(void *)
             LightEvent_WaitTimeout(&workerWake, 50000000LL);
             continue;
         }
-        SDL_Surface *surface = IMG_Load(job->path.c_str());
+        SDL_Surface *surface = ac3ds_load_image_file(job->path.c_str());
         LightLock_Lock(&lock);
         job->surface = surface;
         job->state = JobState::Done;
@@ -145,6 +180,20 @@ SDL_Surface *ac3ds_texprefetch_take(const char *resolvedpath, bool &prefetched)
             LightLock_Unlock(&lock);
             return nullptr;
         }
+        // Jobs queued before this one that finished but were never taken (the
+        // texture turned out to be resident, or loaded another way) would pin
+        // the ready window; free them. Later jobs are still wanted.
+        for(size_t i = 0; i < index;)
+        {
+            if(jobs[i]->state == JobState::Done)
+            {
+                if(jobs[i]->surface) SDL_FreeSurface(jobs[i]->surface);
+                --ready;
+                jobs.erase(jobs.begin() + i);
+                --index;
+            }
+            else ++i;
+        }
         Job &job = *jobs[index];
         if(job.state == JobState::Queued || job.state == JobState::Claimed)
         {
@@ -168,14 +217,14 @@ SDL_Surface *ac3ds_texprefetch_take(const char *resolvedpath, bool &prefetched)
         // The worker is still decoding the one we need. Rather than idle,
         // decode a later queued texture here so both cores decode at once.
         Job *help = nullptr;
-        if(ready < maxReady + 2)
+        if(ready < maxReady)
             for(size_t i = index + 1; i < jobs.size(); ++i)
                 if(jobs[i]->state == JobState::Queued) { help = jobs[i].get(); break; }
         if(help)
         {
             help->state = JobState::Decoding;
             LightLock_Unlock(&lock);
-            SDL_Surface *surface = IMG_Load(help->path.c_str());
+            SDL_Surface *surface = ac3ds_load_image_file(help->path.c_str());
             LightLock_Lock(&lock);
             help->surface = surface;
             help->state = JobState::Done;
