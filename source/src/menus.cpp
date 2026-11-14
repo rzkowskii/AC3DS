@@ -731,7 +731,14 @@ struct mitemkeyinput : mitem
     virtual void init()
     {
         keynames[0] = 0;
-        for(keym **km = findbinda(bindcmd, bindtype); *km; km++) concatformatstring(keynames, " or %s", (*km)->name);
+        for(keym **km = findbinda(bindcmd, bindtype); *km; km++)
+        {
+#ifdef __3DS__
+            // Lower-screen touch keys are fixed match-screen buttons, not rebindable buttons.
+            if(!ac3ds_is_physical_button((*km)->code)) continue;
+#endif
+            concatformatstring(keynames, " or %s", (*km)->name);
+        }
         keyname = *keynames ? keynames + 4 : unknown;
         capture = false;
         menuheader(parent, NULL, NULL);
@@ -764,7 +771,11 @@ struct mitemkeyinput : mitem
             {
                 if(km->actions[bindtype][0] && strcmp(km->actions[bindtype], bindcmd))
                 {
+#ifdef __3DS__
+                    static defformatstring(keybound)("\f3Warning: \"%s\" is already in use. Press START to cancel.", km->name);
+#else
                     static defformatstring(keybound)("\f3Warning: \"%s\" key is already in use. You can press ESC to cancel.", km->name);
+#endif
                     menuheader(parent, NULL, keybound);
                 }
                 newkeys.add(code);
@@ -776,7 +787,14 @@ struct mitemkeyinput : mitem
         {
             if(known && ++isup == newkeys.length())
             {
-                for(keym **km = findbinda(bindcmd, bindtype); *km; km++) bindkey(*km, "", bindtype);  // clear existing binds to this cmd
+                for(keym **km = findbinda(bindcmd, bindtype); *km; km++)  // clear existing binds to this cmd
+                {
+#ifdef __3DS__
+                    // Keep the lower-screen touch buttons bound to their actions.
+                    if(!ac3ds_is_physical_button((*km)->code)) continue;
+#endif
+                    bindkey(*km, "", bindtype);
+                }
                 bool bindfailed = false;
                 loopv(newkeys) bindfailed = !bindc(newkeys[i], bindcmd, bindtype) || bindfailed;
                 if(bindfailed) conoutf("\f3could not bind key");
@@ -1378,7 +1396,7 @@ void ac3ds_install_handheld_menus()
         menuinit []
         menuinitselection 0
         menuheader "" "Set your nickname and screen brightness before playing."
-        menuitemtextinput "Nickname" [ result $curname ] [ name $arg1 ]
+        menuitemtextinput "Nickname" [ if (strcmp $curname "unarmed") [ result "" ] [ result $curname ] ] [ name $arg1 ]
         menuitemslider "Brightness" 70 130 "$gamma" 1 [ gamma $arg1 ]
         menuitem "Continue" [ closecurmenu; showmenu [auth setup] ]
 
@@ -1389,7 +1407,7 @@ void ac3ds_install_handheld_menus()
         menuitem "Voice commands" [ key_showmenuvoicecom ]
         menuitem "Vote yes" [ closecurmenu; key_voteyes ]
         menuitem "Vote no" [ closecurmenu; key_voteno ]
-        menuitem "Toggle full map" [ closecurmenu; key_showmap ]
+        menuitem "Toggle full map" [ closecurmenu; showscores 0; showmap (! $showmap) ]
         menuitem "Drop flag" [ closecurmenu; dropflag ]
         menuitem "Weapons" [ showmenu Weapons ]
         menuitem "Handheld controls" [ showmenu [Handheld controls] ]
@@ -1398,6 +1416,25 @@ void ac3ds_install_handheld_menus()
         menuitem "Command line" [ closecurmenu; key_commandline ]
         menuitem "Edit map" [ closecurmenu; edittoggle ]
         menuitem "Main menu" [ showmenu main ]
+
+        // Online play never pauses; this menu only runs ordinary client commands.
+        newmenu "Match menu online"
+        menuitem "Resume" [ closecurmenu ]
+        menuitem "Chat" [ closecurmenu; saycommand ]
+        menuitem "Team chat" [ closecurmenu; key_teamchat ]
+        menuitem "Voice commands" [ key_showmenuvoicecom ]
+        menuitem "Vote yes" [ closecurmenu; key_voteyes ]
+        menuitem "Vote no" [ closecurmenu; key_voteno ]
+        menuitem "Toggle full map" [ closecurmenu; showscores 0; showmap (! $showmap) ]
+        menuitem "Drop flag" [ closecurmenu; dropflag ]
+        menuitem "Weapons" [ showmenu Weapons ]
+        menuitem "Scores" [ closecurmenu; showscores 1 ]
+        menuitem "Server / team menu" [ ingamemenu ]
+        menuitem "Handheld controls" [ showmenu [Handheld controls] ]
+        menuitem "Settings" [ showmenu Settings ]
+        menuitem "Screenshot" [ closecurmenu; sleep 100 [ screenshot ] ]
+        menuitem "Command line" [ closecurmenu; key_commandline ]
+        menuitem "Disconnect" [ closecurmenu; disconnect ]
 
         delmenu "\fsVideo"
         newmenu "\fsVideo"
@@ -1427,6 +1464,7 @@ void ac3ds_install_handheld_menus()
         menuitemkeyinput "Reload" reload
         menuitemkeyinput "Last weapon" key_prevweapon
         menuitemkeyinput "Scores" key_showscores
+        menuitemkeyinput "Full map (hold)" key_showmap
         menuitem "All binding menus" [ showmenu Keyboard ]
     )CFG");
     gmenu *main = menus.access("main");
@@ -1439,9 +1477,15 @@ void ac3ds_install_handheld_menus()
 
 static void ac3ds_pause_menu()
 {
-    if(watchingdemo || multiplayer(NULL) || !*getclientmap())
+    if(watchingdemo || !*getclientmap())
     {
         execute("key_escape");
+        return;
+    }
+    if(multiplayer(NULL))
+    {
+        // Online matches keep running; never touch `paused` here.
+        showmenu("Match menu online");
         return;
     }
     extern int paused;
@@ -1935,6 +1979,7 @@ static void renderhandheldmenu(gmenu &menu)
 
     const char *heading = row && row->label[0] ? row->label : view.title;
     if(!strcmp(menu.name, "Match menu")) heading = "Match paused";
+    else if(!strcmp(menu.name, "Match menu online")) heading = "Match menu";
     if(menu.previewtexturetitle && *menu.previewtexturetitle) heading = menu.previewtexturetitle;
     if(view.binding) detail = "Press and release a button. START cancels.";
     else if(!detail && row && !row->disabled)
@@ -1985,14 +2030,13 @@ void gmenu::render()
 {
 #ifdef __3DS__
     // Information menus (the scoreboard) drawn over play on the top screen
-    // get the handheld text scale; layout runs in the scaled space.
+    // get the handheld text scale; layout runs in the scaled space. The
+    // scoreboard shrinks toward a readable floor when its rows would not fit.
     extern int hudtextscale;
     extern void *scoremenu;
-    const float uiscale = this == scoremenu ? hudtextscale / 100.0f : 1.0f;
-    const int VW2 = int(2 * VIRTW / uiscale), VH2 = int(2 * VIRTH / uiscale);
-    glPushMatrix();
-    glScalef(uiscale, uiscale, 1);
-    struct PopScale { ~PopScale() { glPopMatrix(); } } popscale;
+    const bool scaledmenu = this == scoremenu;
+    float uiscale = scaledmenu ? hudtextscale / 100.0f : 1.0f;
+    int VW2 = int(2 * VIRTW / uiscale), VH2 = int(2 * VIRTH / uiscale);
 #else
     const int VW2 = 2 * VIRTW, VH2 = 2 * VIRTH;
 #endif
@@ -2021,6 +2065,32 @@ void gmenu::render()
         mdisp = min(items.length(), pagesize),
         cdisp = min(items.length()-offset, pagesize),
         pages = (items.length() - 1) / pagesize;
+#ifdef __3DS__
+    if(scaledmenu)
+    {
+        // Height in font units: header, title, rows and footer, plus the
+        // 3*FONTH margins the vertical clamp below keeps on each side.
+        const int rowstep = (FONTH*5)/4, fixedh = (hitems+2)*rowstep + 6*FONTH;
+        const float ceiling = uiscale, minscale = min(1.35f, ceiling);
+        uiscale = clamp(2.0f * VIRTH / (mdisp*rowstep + fixedh), minscale, ceiling);
+        // Round so a scale chosen to fit exactly is not truncated one unit short.
+        VW2 = int(2 * VIRTW / uiscale + 0.5f);
+        VH2 = int(2 * VIRTH / uiscale + 0.5f);
+        // Still too tall at the floor: page the rows so the header and footer stay on screen.
+        const int fitrows = max(1, (VH2 - fixedh) / rowstep);
+        if(fitrows < pagesize && fitrows < items.length())
+        {
+            pagesize = fitrows;
+            offset = menusel - (menusel%pagesize);
+            mdisp = min(items.length(), pagesize);
+            cdisp = min(items.length()-offset, pagesize);
+            pages = (items.length() - 1) / pagesize;
+        }
+    }
+    glPushMatrix();
+    glScalef(uiscale, uiscale, 1);
+    struct PopScale { ~PopScale() { glPopMatrix(); } } popscale;
+#endif
     mitem::whitepulse.alpha = (sinf(lastmillis/200.0f)+1.0f)/2.0f;
     defformatstring(menupages)("%d/%d", (offset / pagesize) + 1, pages + 1);
     int menupageswidth = pages ? text_width(menupages) : 0; // adds to topmost line, either menu title or header

@@ -19,9 +19,22 @@ VAR(numconlines, 0, 0, 1);
 struct console : consolebuffer<cline>
 {
     int conskip;
+
+    // Usable console height in text units; render() and setconskip() must agree.
+    static int textheight()
+    {
+#ifdef __3DS__
+        extern int hudtextscale;
+        return int(VIRTH*2 / (hudtextscale / 100.0f)) - 2*CONSPAD - 2*FONTH/3;
+#else
+        return VIRTH*2 - 2*CONSPAD - 2*FONTH/3;
+#endif
+    }
+
     void setconskip(int n)
     {
-        int visible_lines = (int)(min(fullconsole ? ((VIRTH*2 - 2*CONSPAD - 2*FONTH/3)*(fullconsole==1 ? altconsize : fullconsize))/100 : FONTH*consize, (VIRTH*2 - 2*CONSPAD - 2*FONTH/3))/ (CONSPAD + 2*FONTH/3)) - 1;
+        const int h = textheight();
+        int visible_lines = (int)(min(fullconsole ? (h*(fullconsole==1 ? altconsize : fullconsize))/100 : FONTH*consize, h)/ (CONSPAD + 2*FONTH/3)) - 1;
         conskip = clamp(conskip + n, 0, clamp(conlines.length()-visible_lines, 0, conlines.length()));
     }
 
@@ -46,12 +59,11 @@ struct console : consolebuffer<cline>
         glPushMatrix();
         glScalef(s, s, 1);
         int conwidth = int(((fullconsole ? VIRTW : int(floor(getradarpos().x)))*2) / s) - 2*CONSPAD - 2*FONTH/3;
-        int h = int(VIRTH*2 / s) - 2*CONSPAD - 2*FONTH/3;
         struct PopScale { ~PopScale() { glPopMatrix(); } } popscale;
 #else
         int conwidth = (fullconsole ? VIRTW : int(floor(getradarpos().x)))*2 - 2*CONSPAD - 2*FONTH/3;
-        int h = VIRTH*2 - 2*CONSPAD - 2*FONTH/3;
 #endif
+        int h = textheight();
         int conheight = min(fullconsole ? (h*(fullconsole==1 ? altconsize : fullconsize))/100 : FONTH*consize, h);
 
         if(fullconsole) blendbox(CONSPAD, CONSPAD, conwidth+CONSPAD+2*FONTH/3, conheight+CONSPAD+2*FONTH/3, true);
