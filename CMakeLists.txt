@@ -117,7 +117,7 @@ if(AC3DS_EMBED_ASSETS)
     set(stock_icon "${romfs}/packages/misc/icon.png")
     add_custom_command(OUTPUT "${romfs}/.assaultcube-assets"
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/stage-assets.py"
-            "${AC3DS_ASSET_ARCHIVE}" "${romfs}"
+            "${AC3DS_ASSET_ARCHIVE}" "${romfs}" --stb-image "${sdl2_image_SOURCE_DIR}/src/stb_image.h"
         DEPENDS "${AC3DS_ASSET_ARCHIVE}" scripts/stage-assets.py VERBATIM)
     set(romfs_args "--romfs=${romfs}")
     set(romfs_deps "${romfs}/.assaultcube-assets")
