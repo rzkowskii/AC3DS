@@ -14,7 +14,7 @@
 #include <vector>
 
 void ac3dsRecordGpu(float drawingMs, float processingMs); // rendergl.cpp profiler
-unsigned ac3dsCommandDumps = 0;
+unsigned ac3dsCommandDumps = 0, ac3dsCommandDumpIndex = 0;
 const u32 *ac3dsLastList = nullptr;
 u32 ac3dsLastListBytes = 0;
 // High half: GX commands handed to GSP. Low half: the last command id.
@@ -42,7 +42,7 @@ Result __wrap_GX_ProcessCommandList(u32 *buffer, u32 bytes, u8 flags)
     if(ac3dsCommandDumps)
     {
         char path[96];
-        std::snprintf(path,sizeof(path),"sdmc:/3ds/assaultcube/profile/gpu-list-%u.bin",6-ac3dsCommandDumps);
+        std::snprintf(path,sizeof(path),"sdmc:/3ds/assaultcube/profile/gpu-list-%u.bin",ac3dsCommandDumpIndex++);
         if(FILE *f = std::fopen(path,"wb"))
         {
             std::fwrite(buffer,1,bytes,f);
@@ -96,6 +96,8 @@ struct Vertex
 };
 static_assert(sizeof(Vertex) == 44, "PICA vertex layout");
 constexpr size_t vertexArenaBytes = sizeof(Vertex)*vertexCapacity;
+constexpr size_t pixelsBytes = 256*256*4 + screenW*screenH*4; // readback staging buffer
+constexpr size_t worldCacheReserveBytes = 2*1024*1024; // linear memory world caches leave free
 constexpr size_t projectedVertexStride = 28;
 constexpr size_t worldVertexStride = 24;
 constexpr size_t modelVertexStride = 20;
@@ -271,6 +273,7 @@ VertexLayout appliedLayout = VertexLayout::Count;
 const void *appliedBuffer = nullptr;
 bool vertexBufferValid = false;
 bool fastVertexOffsets = false;
+bool shareWorldVertices = false;
 bool joinedWaterCommands = false;
 float appliedUV1[3]{};
 bool fixedUV1Valid = false;
@@ -301,17 +304,33 @@ struct FogTable
     int kind = 0; // 0 ortho, 1 hyperbolic Z-buffer, 2 linear W-buffer
     bool valid = false;
 };
-// Perspective draws use the PICA W-buffer, so stored depth falls linearly
-// with eye distance e: depth = top - slope*e. The world spans 0.96 at the eye
-// to 0 at the far plane, and the hud gun gets the 0.96-1 band in front of it
-// (desktop Cube squeezes the gun's depth range for the same reason). The fog
-// LUT is indexed by this depth, so its 128 entries cover distance evenly and
-// reproduce desktop GL's linear fog. With the hyperbolic Z-buffer one entry
-// spanned everything from about 19 units to the far plane, which fogged
-// mid-distance walls and sky nearly flat grey. Ortho, oblique (water clip)
-// and other projections keep the Z-buffer, as before.
+// Optional (ac3dslineardepth 1): perspective draws use the PICA W-buffer, so
+// stored depth falls linearly with eye distance e: depth = top - slope*e. The
+// world spans 0.96 at the eye to 0 at the far plane, and the hud gun gets the
+// 0.96-1 band in front of it. Build 11 used it to give the GPU fog table even
+// resolution. A see-through-walls report on the New 2DS XL followed; whether
+// the W-buffer caused it was never isolated, but per-pixel fog (pixelFog
+// below) no longer needs it, so the default is the Z-buffer builds 1-10 used.
+// Ortho, oblique (water clip) and other projections always use the Z-buffer.
 constexpr float worldDepthTop = .96f, gunDepthSpan = 32.f;
-bool linearDepth = true, hudGunDepth = false;
+bool linearDepth = false, hudGunDepth = false;
+// Per-pixel fog that does not read the depth buffer. The vertex shader writes
+// u = .5 + .5*(e - start)/(end - start) to texcoord2, e = eye distance (exact
+// under perspective-correct interpolation). The procedural texture unit maps
+// u through a fixed table, 0 up to .5 then a straight ramp to 1, into a grey
+// colour ramp, so its output is GL's linear fog amount; a combiner stage
+// after the texture stages mixes in the fog colour. Fog start and end live in
+// the per-draw uniform, so the tables are uploaded once. Depth testing can
+// then stay on the ordinary Z-buffer.
+bool pixelFog = true;
+int locFogCoord = -1;
+C3D_ProcTex fogProcTex{};
+C3D_ProcTexLut fogCurveLut{};
+C3D_ProcTexColorLut fogColorLut{};
+constexpr float fogCurveKnee = .5f;
+bool fogCurveReady = false;
+bool fogProcBound = false;
+bool pixelFogActive() { return fogOn && pixelFog; }
 struct DepthMap
 {
     bool w = false, gun = false;
@@ -412,6 +431,10 @@ u32 waitTopVblank()
 bool startFrame(bool sync)
 {
     if(!ready || frame) return frame;
+    // After HOME -> Close libctru neither reacquires the GPU right nor runs
+    // the restore hooks. A list submitted now would never complete, and the
+    // next wait for the queue would hang the exit.
+    if(!gspHasGpuRight()) return false;
     if(sync) waitTopVblank();
     Ac3dsPhaseTimer queue(Ac3dsPhase::QueueStart);
     const bool started = C3D_FrameBegin(0);
@@ -672,6 +695,28 @@ void applyTex()
         C3D_TexEnvColor(env, tevColor(u.color));
         ++stage;
     }
+    const bool fogStage = pixelFogActive() && stage < int(next.size());
+    if(fogStage)
+    {
+        // colour = fog*f + previous*(1-f), f = procedural texture alpha.
+        C3D_TexEnv *env = &next[stage];
+        C3D_TexEnvInit(env);
+        const GPU_TEVSRC previous = stage ? GPU_PREVIOUS : GPU_PRIMARY_COLOR;
+        C3D_TexEnvSrc(env, C3D_RGB, GPU_CONSTANT, previous, GPU_TEXTURE3);
+        C3D_TexEnvOpRgb(env, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_ALPHA);
+        C3D_TexEnvFunc(env, C3D_RGB, GPU_INTERPOLATE);
+        C3D_TexEnvSrc(env, C3D_Alpha, previous, previous, previous);
+        C3D_TexEnvFunc(env, C3D_Alpha, GPU_REPLACE);
+        C3D_TexEnvColor(env, fogColor|0xff000000u);
+        ++stage;
+    }
+    // Bound once and left on: the stage alone decides whether it is read, and
+    // the tables are not re-sent on every fog toggle.
+    if(fogStage && !fogProcBound)
+    {
+        C3D_ProcTexBind(2, &fogProcTex);
+        fogProcBound = true;
+    }
     for(int i = stage; i < int(next.size()); ++i)
     {
         C3D_TexEnv *env = &next[i];
@@ -829,7 +874,7 @@ void applyRaster(bool clip)
                            u32(alphaOn)|(u32(alpha)<<1)|(u32(alphaThreshold)<<4),
                            u32(stencilOn)|(u32(test)<<1)|(stencilRef<<4)|(stencilReadMask<<12),
                            u32(fail)|(u32(zfail)<<3)|(u32(pass)<<6), u32(src)|(u32(dst)<<4),
-                           fogColor|(u32(fogOn)<<24)};
+                           fogColor|(u32(fogOn && !pixelFog)<<24)};
     if(!rasterStateValid || next.cull != appliedRaster.cull) C3D_CullFace(cull);
     if(!rasterStateValid || next.depth != appliedRaster.depth) C3D_DepthTest(depthOn,depth,mask);
     if(!rasterStateValid || next.alpha != appliedRaster.alpha) C3D_AlphaTest(alphaOn,alpha,alphaThreshold);
@@ -838,15 +883,25 @@ void applyRaster(bool clip)
     if(!rasterStateValid || next.blend != appliedRaster.blend) C3D_AlphaBlend(GPU_BLEND_ADD,GPU_BLEND_ADD,src,dst,src,dst);
     if(!rasterStateValid || next.fog != appliedRaster.fog)
     {
-        C3D_FogGasMode(fogOn ? GPU_FOG : GPU_NO_FOG, GPU_PLAIN_DENSITY, false);
+        C3D_FogGasMode(fogOn && !pixelFog ? GPU_FOG : GPU_NO_FOG, GPU_PLAIN_DENSITY, false);
         C3D_FogColor(fogColor);
     }
     appliedRaster = next;
     rasterStateValid = true;
 }
+void applyPixelFogTable()
+{
+    if(fogCurveReady) return;
+    float in[129];
+    for(int i = 0; i <= 128; ++i) in[i] = sat((i/128.f-fogCurveKnee)/(1.f-fogCurveKnee));
+    ProcTexLut_FromArray(&fogCurveLut,in);
+    C3D_ProcTexLutBind(GPU_LUT_RGBMAP,&fogCurveLut);
+    fogCurveReady = true;
+}
 void applyFog()
 {
     if(!fogOn) return;
+    if(pixelFog) { applyPixelFogTable(); return; }
     const Mat &p = projection.current;
     int kind;
     float near, far;
@@ -921,6 +976,22 @@ void apply(bool clip)
     }
     if(uvDirty) applyTextureMatrices();
     if(fogDirty) { applyFog(); fogDirty = false; }
+    if(pixelFogActive())
+    {
+        // u = knee + k*(e - start), e = -z_eye, k = (1-knee)/(end-start).
+        // If start exceeds end-start, u goes negative near the eye and the
+        // unit mirrors it; that stays under the knee (no fog) while
+        // start < 2*(end-start), which AssaultCube's (fog+64)/8 to fog meets
+        // for any fog above 15. Clip-space draws (lines; identity transform)
+        // carry clip w in the position, not 1, and have no eye space: a zero
+        // row gives them u = 0, no fog.
+        const float k = (1.f-fogCurveKnee)/std::max(fogFar-fogNear,.0001f);
+        float row[4] = {0,0,0,clip ? 0.f : fogCurveKnee-k*fogNear};
+        if(!clip) for(int i = 0; i < 4; ++i) row[i] -= model.current.at(2,i)*k;
+        const C3D_FVec &value = C3D_FVUnif[GPU_VERTEX_SHADER][locFogCoord];
+        if(value.x != row[0] || value.y != row[1] || value.z != row[2] || value.w != row[3])
+            C3D_FVUnifSet(GPU_VERTEX_SHADER,locFogCoord,row[0],row[1],row[2],row[3]);
+    }
 }
 void useBuffer(const void *v, VertexLayout layout = VertexLayout::Full, const float *fixedUV1 = current.uv[1],
                bool fixedColor = true)
@@ -1321,7 +1392,7 @@ void enable(GLenum key,bool on)
     else
     {
         dirtyRaster();
-        if(key == GL_FOG) fogDirty = true;
+        if(key == GL_FOG) { fogDirty = true; tevDirty = true; }
         if(v == &offsetOn) transformDirty = true;
     }
     *v = on;
@@ -1385,8 +1456,12 @@ WorldStripPlan planWorldStrips(const Ac3dsWorldStrips &strips, int begin)
         ++end;
     }
     while(end < strips.draws && nv+strips.count[end] <= multiBatchVertices);
-    // Azahar streams the whole min-to-max range per indexed draw.
-    return {end,nv,ni,high-low <= 2*nv};
+    // A dense batch draws straight from one shared upload of the world array;
+    // a sparse one is repacked strip by strip, because Azahar streams the
+    // whole min-to-max range per indexed draw. The PICA fetches vertices by
+    // index, so on the handheld sharing every batch (ac3dssharedworldverts 1)
+    // saves the repacking and a second copy of the same vertices.
+    return {end,nv,ni,shareWorldVertices || high-low <= 2*nv};
 }
 void writeWorldStrips(const Ac3dsWorldStrips &strips, int begin, int end, u8 *packed, u16 *out)
 {
@@ -1552,9 +1627,13 @@ void outputPixel(u8 *p,GLenum f,u32 c)
 }
 bool readTarget(C3D_RenderTarget *source)
 {
+    // A tiled-to-linear transfer under 64x16 is not valid on hardware (the
+    // emulator copies it anyway), and the staging buffer has a fixed size.
+    if(!source || !pixels || source->frameBuf.width < 64 || source->frameBuf.height < 16 ||
+       size_t(source->frameBuf.width)*source->frameBuf.height*4 > pixelsBytes) return false;
     const bool wasOpen = frame;
     submitPending();
-    if(!source || !pixels || !startFrame(false)) return false;
+    if(!startFrame(false)) return false;
     reserveCommands();
     // PICA color target and DMA destination are both RGBA8; this untwiddles
     // the GPU framebuffer. Keep this outside the normal gameplay hot path.
@@ -1594,7 +1673,7 @@ bool ac3ds_gl_init()
             fontIndices = nullptr;
         }
     }
-    pixels = static_cast<u32 *>(linearAlloc(256*256*4 + screenW*screenH*4));
+    pixels = static_cast<u32 *>(linearAlloc(pixelsBytes));
     shader = DVLB_ParseFile(reinterpret_cast<u32 *>(const_cast<unsigned char *>(cube_vertex_shbin)),cube_vertex_shbin_size);
     if(!top || !vertices || !indices || !pixels || !aimTile || !shader || !C3D_TexInit(&dummyUnit1,8,8,GPU_RGBA8))
     {
@@ -1625,6 +1704,7 @@ bool ac3ds_gl_init()
     locTex[0] = shaderInstanceGetUniformLocation(vsh,"tex0");
     locTex[1] = shaderInstanceGetUniformLocation(vsh,"tex1");
     locColorScale = shaderInstanceGetUniformLocation(vsh,"colorScale");
+    locFogCoord = shaderInstanceGetUniformLocation(vsh,"fogCoord");
     locColor = shaderInstanceGetUniformLocation(vsh,"flatColor");
     locProbeTransform = shaderInstanceGetUniformLocation(programs[ProbeProgram].vertexShader,"transform");
     if(locTransform < 0 || locTex[0] < 0 || locTex[1] < 0 || locColorScale < 0 || locColor < 0 || locProbeTransform < 0 ||
@@ -1632,6 +1712,7 @@ bool ac3ds_gl_init()
        locTex[0] != shaderInstanceGetUniformLocation(projective,"tex0") ||
        locTex[1] != shaderInstanceGetUniformLocation(projective,"tex1") ||
        locColorScale != shaderInstanceGetUniformLocation(projective,"colorScale") ||
+       locFogCoord < 0 || locFogCoord != shaderInstanceGetUniformLocation(projective,"fogCoord") ||
        locColor != shaderInstanceGetUniformLocation(projective,"flatColor"))
     {
         ac3ds_gl_shutdown();
@@ -1639,6 +1720,7 @@ bool ac3ds_gl_init()
     }
     flatColorActive = true;
     useVertexColor();
+    C3D_FVUnifSet(GPU_VERTEX_SHADER,locFogCoord,0,0,0,0);
     auto &full = attributes[size_t(VertexLayout::Full)];
     AttrInfo_Init(&full);
     AttrInfo_AddLoader(&full,0,GPU_FLOAT,4);
@@ -1695,6 +1777,24 @@ bool ac3ds_gl_init()
     C3D_DepthMap(true,-1.f,0.f);
     depthMapValid = false;
     C3D_EarlyDepthTest(false,GPU_EARLYDEPTH_GREATER,0);
+    // Fog procedural texture: u from texcoord2, clamped to [0,1], mapped by
+    // the fog curve (applyPixelFogTable) into a 128-entry grey ramp, so every
+    // channel of the result is the fog amount. Bound on first fog use.
+    C3D_ProcTexInit(&fogProcTex,0,128);
+    C3D_ProcTexClamp(&fogProcTex,GPU_PT_CLAMP_TO_EDGE,GPU_PT_CLAMP_TO_EDGE);
+    C3D_ProcTexCombiner(&fogProcTex,false,GPU_PT_U,GPU_PT_U);
+    C3D_ProcTexNoiseEnable(&fogProcTex,false);
+    C3D_ProcTexShift(&fogProcTex,GPU_PT_NONE,GPU_PT_NONE);
+    C3D_ProcTexFilter(&fogProcTex,GPU_PT_LINEAR);
+    {
+        u32 colors[128];
+        for(int i = 0; i < 128; ++i) { const u32 c = u32(i*255/127); colors[i] = c|(c<<8)|(c<<16)|(c<<24); }
+        ProcTexColorLut_Write(&fogColorLut,colors,0,128);
+    }
+    C3D_ProcTexColorLutBind(&fogColorLut);
+    fogCurveReady = false;
+    fogProcBound = false;
+    C3D_ProcTexBind(2,nullptr);
     C3D_FrameRate(60.f);
     pending.reserve(8192);
     pendingFont.reserve(fontQuadCapacity*4);
@@ -1745,6 +1845,8 @@ void ac3ds_gl_shutdown()
     depthOn = blendOn = stencilOn = cullOn = alphaOn = fogOn = scissorOn = false;
     writeDepth = true; colorMask = 15; wireframe = offsetOn = false;
     boundFogTable = nullptr;
+    fogCurveReady = false;
+    fogProcBound = false;
     depthMapValid = hudGunDepth = false;
     tevInitialized = false;
     viewportValid = false;
@@ -1758,6 +1860,7 @@ void ac3ds_gl_set_late_vblank(bool enabled)
 {
     lateVblankRequested = enabled;
 }
+void ac3ds_gl_set_shared_world_vertices(bool enabled) { shareWorldVertices = enabled; }
 void ac3ds_gl_set_fast_vertex_offsets(bool enabled)
 {
     if(fastVertexOffsets == enabled) return;
@@ -1795,7 +1898,8 @@ void ac3ds_gl_startup_clear()
 
 void ac3ds_gl_set_command_dumps(unsigned count)
 {
-    ac3dsCommandDumps = std::min(count,6u);
+    ac3dsCommandDumps = std::min(count,8u);
+    ac3dsCommandDumpIndex = 0;
 }
 
 void ac3ds_gl_set_projective(bool allowed)
@@ -1864,6 +1968,7 @@ void ac3ds_gl_probe_projective()
     ac3ds_gl_startup_draw();
     forceProjective = false;
 }
+void ac3ds_gl_probe_fog() { ac3ds_gl_startup_draw(true); }
 
 void ac3ds_gl_startup_state(uint32_t out[6])
 {
@@ -1877,13 +1982,15 @@ void ac3ds_gl_startup_state(uint32_t out[6])
     out[5] = osGetMemRegionFree(MEMREGION_APPLICATION);
 }
 
-void ac3ds_gl_startup_draw()
+void ac3ds_gl_startup_draw(bool fog)
 {
     // Exercise the normal vertex input and shader before binding a texture.
+    // With fog, the same list also binds the procedural texture unit, uploads
+    // its tables and adds the fog combiner stage (the triangle reads fog 0).
     glDisable(GL_TEXTURE_2D);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
-    glDisable(GL_FOG);
+    if(fog) glEnable(GL_FOG); else glDisable(GL_FOG);
     glColor4ub(0, 0, 0, 255);
     Vertex triangle[3];
     triangle[0].p[0] = triangle[0].p[1] = -.5f;
@@ -1971,6 +2078,15 @@ void ac3ds_gl_end_frame()
     frame = false;
     frameHasVblank = false;
     target = top;
+    // Under memory pressure give the world caches back. They are freed by
+    // retire() at the next frame start, once this frame's queue has drained;
+    // the views they served draw through the frame arena like a moving one.
+    if(linearSpaceFree() < worldCacheReserveBytes)
+    {
+        activeWorldGeometry = nullptr;
+        for(size_t i = 0; i < worldGeometryCaches.size(); ++i)
+            if(worldGeometryCaches[i].data) ac3ds_gl_discard_world_cache(int(i));
+    }
     // Deleting a render target drains the preceding queue. Only do it on
     // actual resource disposal, never at the normal frame boundary.
     for(auto i = retiredTextures.begin(); i != retiredTextures.end();)
@@ -2118,6 +2234,10 @@ void ac3ds_gl_build_world_cache(int slot, const Ac3dsWorldStrips *batches, int c
     constexpr size_t maxWorldCacheBytes = 1024*1024;
     const size_t bytes = vertexBytes+indexBytes;
     if(!bytes || bytes > maxWorldCacheBytes) return;
+    // A cache only saves time for a still view. Textures and skins loaded
+    // later in the match need the memory more; attempted stays set, so a
+    // refused slot is not planned again every frame.
+    if(linearSpaceFree() < bytes+worldCacheReserveBytes) return;
     u8 *data = static_cast<u8 *>(linearAlloc(bytes));
     if(!data) return;
     if(shared) std::memcpy(data,worldSource,worldBytes);
@@ -2457,7 +2577,7 @@ void glFogfv(GLenum key,const GLfloat *f)
 {
     if(key != GL_FOG_COLOR) return;
     const u32 c = tevColor(rgba(f[0],f[1],f[2],f[3]))&0xffffff;
-    if(fogColor != c) { dirtyRaster(); fogColor = c; }
+    if(fogColor != c) { dirtyRaster(); tevDirty = true; fogColor = c; }
 }
 void glViewport(GLint x,GLint y,GLsizei w,GLsizei h)
 {
@@ -3214,6 +3334,12 @@ void ac3ds_gl_set_linear_depth(bool enabled)
     if(ready) dirtyTransform();
     linearDepth = enabled;
 }
+void ac3ds_gl_set_pixel_fog(bool enabled)
+{
+    if(pixelFog == enabled) return;
+    if(ready) { submitPending(); rasterDirty = fogDirty = tevDirty = true; }
+    pixelFog = enabled;
+}
 void ac3ds_gl_set_hud_gun_depth(bool on)
 {
     if(hudGunDepth == on) return;
@@ -3266,6 +3392,13 @@ void ac3ds_gl_profile_start(unsigned intervals)
     profile.ticks = 0;
     profile.haveBaseline = profile.report = false;
     profile.requested = std::min<unsigned>(intervals, profile.intervals.size());
+}
+// Close a profile that is still collecting: report the intervals it has.
+void ac3ds_gl_profile_finish()
+{
+    if(!profile.requested || profile.report) return;
+    if(profile.count) { profile.requested = profile.count; profile.report = true; }
+    else profile.requested = 0;
 }
 bool ac3ds_gl_profile_take(unsigned &intervals, unsigned long long &ticks,
                            unsigned long long &p99Ticks, unsigned long long &maxTicks,

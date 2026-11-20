@@ -174,11 +174,12 @@ void ac3ds_gl_shutdown();
 void ac3ds_gl_begin_frame();
 void ac3ds_gl_end_frame();
 void ac3ds_gl_startup_clear();
-void ac3ds_gl_startup_draw();
+void ac3ds_gl_startup_draw(bool fog = false);
 void ac3ds_gl_end_startup_frame();
 void ac3ds_gl_probe_empty();
 void ac3ds_gl_probe_minimal();
 void ac3ds_gl_probe_projective();
+void ac3ds_gl_probe_fog();
 void ac3ds_gl_set_command_dumps(unsigned count);
 void ac3ds_gl_set_projective(bool allowed);
 void ac3ds_gl_startup_state(uint32_t out[6]);
@@ -186,6 +187,7 @@ bool ac3ds_gl_queue_readback_565(GLuint id, uint16_t **out, int *outw, int *outh
 bool ac3ds_gl_drain_startup_frame(uint32_t &gpuStatus, int32_t &readResult);
 void ac3ds_gl_set_late_vblank(bool enabled);
 void ac3ds_gl_set_fast_vertex_offsets(bool enabled);
+void ac3ds_gl_set_shared_world_vertices(bool enabled);
 void ac3ds_gl_set_joined_water_commands(bool enabled);
 void ac3ds_gl_collect_retired();
 void *ac3ds_gl_proc(const char *);
@@ -193,6 +195,7 @@ bool ac3ds_gl_texture_ready(GLuint);
 bool ac3ds_gl_read_ok();
 void ac3ds_gl_stats(char *, unsigned);
 void ac3ds_gl_profile_start(unsigned intervals);
+void ac3ds_gl_profile_finish();
 bool ac3ds_gl_profile_take(unsigned &intervals, unsigned long long &ticks,
                            unsigned long long &p99Ticks, unsigned long long &maxTicks,
                            unsigned &over20ms, unsigned &vblanks, unsigned &missedVblanks);
@@ -296,9 +299,11 @@ void glVertex3fv(const GLfloat *);
 void glVertexPointer(GLint, GLenum, GLsizei, const GLvoid *);
 void glViewport(GLint, GLint, GLsizei, GLsizei);
 
-// Perspective draws store linear (W-buffer) depth so fog matches desktop GL.
+// Diagnostic: store linear (W-buffer) depth for perspective draws, as build 11 did.
 void ac3ds_gl_set_linear_depth(bool enabled);
-// The hud gun draws in a depth band in front of the world.
+// Fog per pixel through the procedural texture unit (default), or the GPU fog table.
+void ac3ds_gl_set_pixel_fog(bool enabled);
+// With linear depth, the hud gun draws in a depth band in front of the world.
 void ac3ds_gl_set_hud_gun_depth(bool on);
 bool ac3ds_gl_queue_aim_depth();
 bool ac3ds_gl_take_aim_depth(float &depth);

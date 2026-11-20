@@ -371,8 +371,9 @@ struct mitemmapload : mitemmanual
 {
     const char *filename, *mapmessage;
     Texture *image;
+    bool ownpreview; // image is this map's own preview, not the shared placeholder
 
-    mitemmapload(gmenu *parent, const char *filename, char *text, char *action, char *hoveraction, const char *desc) : mitemmanual(parent, text, action, hoveraction, NULL, desc), filename(filename), mapmessage(NULL), image(NULL) {}
+    mitemmapload(gmenu *parent, const char *filename, char *text, char *action, char *hoveraction, const char *desc) : mitemmanual(parent, text, action, hoveraction, NULL, desc), filename(filename), mapmessage(NULL), image(NULL), ownpreview(false) {}
 
     virtual ~mitemmapload()
     {
@@ -392,18 +393,52 @@ struct mitemmapload : mitemmanual
 
     void loadpreview()
     {
-        if(image || mapmessage) return;
-        silent_texture_load = true;
-        const char *cgzpath = "packages" PATHDIVS "maps";
-        if(browsefiledesc)
+        if(!image && !mapmessage)
         {
-            mapmessage = getfiledesc(cgzpath, behindpath(filename), "cgz");
-            if(!mapmessage) mapmessage = getfiledesc((cgzpath = "packages" PATHDIVS "maps" PATHDIVS "official"), behindpath(filename), "cgz");
+            silent_texture_load = true;
+            const char *cgzpath = "packages" PATHDIVS "maps";
+            if(browsefiledesc)
+            {
+                mapmessage = getfiledesc(cgzpath, behindpath(filename), "cgz");
+                if(!mapmessage) mapmessage = getfiledesc((cgzpath = "packages" PATHDIVS "maps" PATHDIVS "official"), behindpath(filename), "cgz");
+            }
+            defformatstring(p2p)("%s/preview/%s.jpg", cgzpath, filename);
+            if(!hidebigmenuimages) image = textureload(p2p, 3);
+            ownpreview = image && image != notexture;
+            if(!image || image == notexture) image = textureload("packages/misc/nopreview.jpg", 3);
+            silent_texture_load = false;
         }
-        defformatstring(p2p)("%s/preview/%s.jpg", cgzpath, filename);
-        if(!hidebigmenuimages) image = textureload(p2p, 3);
-        if(!image || image == notexture) image = textureload("packages/misc/nopreview.jpg", 3);
-        silent_texture_load = false;
+#ifdef __3DS__
+        // Every preview is 256 KiB of GPU memory and the texture table never
+        // lets go of one, so browsing the map lists used to pin up to 11 MiB.
+        // Keep only the preview on show; an evicted one reloads when its row
+        // is selected again.
+        static Texture *resident = NULL;
+        if(ownpreview && image)
+        {
+            if(resident != image)
+            {
+                if(resident && resident->id)
+                {
+                    glDeleteTextures(1, &resident->id);
+                    resident->id = 0;
+                    resident->evicted = true;
+                }
+                resident = image;
+            }
+            if(!image->id)
+            {
+                silent_texture_load = true;
+                if(!reloadtexture(*image))
+                {
+                    resident = NULL;
+                    ownpreview = false;
+                    image = textureload("packages/misc/nopreview.jpg", 3);
+                }
+                silent_texture_load = false;
+            }
+        }
+#endif
     }
 
     virtual void render(int x, int y, int w)

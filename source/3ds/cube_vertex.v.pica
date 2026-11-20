@@ -1,17 +1,23 @@
 ; Default program. Each texture coordinate is stored as (u, v, z, 1).
-; Every output register is written in full, exactly once, by the last four
+; texcoord2 carries the fog coordinate for the procedural-texture fog stage:
+; .5 + .5*(eye distance - fog start)/(fog end - fog start), from the fogCoord
+; uniform, and 0 for clip-space draws.
+; Every output register is written in full, exactly once, by the last five
 ; instructions. Projection textures use cube_projective.v.pica.
-.fvec transform[4], tex0[3], tex1[3], flatColor, colorScale
+.fvec transform[4], tex0[3], tex1[3], flatColor, colorScale, fogCoord
 .constf constants(0.0, 1.0, 0.0, 0.0)
 .out outpos position
 .out outclr color
 .out uv0 texcoord0
 .out uv1 texcoord1
+.out fog texcoord2
 .proc main
     dp4 r2.x, transform[0], v0
     dp4 r2.y, transform[1], v0
     dp4 r2.z, transform[2], v0
     dp4 r2.w, transform[3], v0
+    mov r7, constants.xxxy
+    dp4 r7.x, fogCoord, v0
     mul r3, colorScale.xxxx, v1
     add r3, flatColor, r3
     mov r0.xyz, v2
@@ -30,5 +36,6 @@
     mov outclr, r3
     mov uv0, r4
     mov uv1, r5
+    mov fog, r7
     end
 .end

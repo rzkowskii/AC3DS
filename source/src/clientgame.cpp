@@ -661,7 +661,14 @@ void resetsleep(bool force)
     sleepssemaphore->post();
 }
 
-COMMANDF(resetsleeps, "", (void) { resetsleep(true); });
+COMMANDF(resetsleeps, "", (void)
+{
+    resetsleep(true);
+#ifdef __3DS__
+    extern void ac3dsbenchend(const char *how); // the benchmark's queued steps are gone: put its settings back
+    ac3dsbenchend("cancelled");
+#endif
+});
 
 void updateworld(int curtime, int lastmillis)        // main game update loop
 {
@@ -1169,6 +1176,10 @@ void startmap(const char *name, bool reset, bool norespawn)   // called just aft
     extern bool canceldownloads;
     canceldownloads = false;
     copystring(clientmap, name);
+#ifdef __3DS__
+    extern void ac3ds_crash_set_map(const char *name);
+    ac3ds_crash_set_map(name); // also covers newmap and xmap_restore
+#endif
 
     if(norespawn) return;
 

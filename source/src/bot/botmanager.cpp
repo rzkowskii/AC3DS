@@ -450,12 +450,14 @@ void CBotManager::AddWaypoint(node_s *pNode)
         {
             if (!bots[i] || !bots[i]->pBot) continue;
 
+#ifdef __3DS__
+            (void)x; (void)y; (void)pWP;
+            bots[i]->pBot->AddWaypointRecord(pNode);
+#else
             pWP = new waypoint_s;
             pWP->pNode = pNode;
             WaypointClass.GetNodeIndexes(pNode->v_origin, &x, &y);
             bots[i]->pBot->m_WaypointList[x][y].AddNode(pWP);
-#ifdef __3DS__
-            bots[i]->pBot->m_WaypointByNode.access(uint(size_t(pNode)), pWP);
 #endif
 
 #ifndef RELEASE_BUILD
@@ -479,6 +481,10 @@ void CBotManager::DelWaypoint(node_s *pNode)
         {
             if (!bots[i] || !bots[i]->pBot) continue;
 
+#ifdef __3DS__
+            (void)x; (void)y; (void)p;
+            bots[i]->pBot->DelWaypointRecord(pNode);
+#else
             WaypointClass.GetNodeIndexes(pNode->v_origin, &x, &y);
             p = bots[i]->pBot->m_WaypointList[x][y].GetFirst();
 
@@ -486,15 +492,13 @@ void CBotManager::DelWaypoint(node_s *pNode)
             {
                 if (p->Entry->pNode == pNode)
                 {
-#ifdef __3DS__
-                    bots[i]->pBot->m_WaypointByNode.remove(uint(size_t(pNode)));
-#endif
                     delete p->Entry;
                     bots[i]->pBot->m_WaypointList[x][y].DeleteNode(p);
                     break;
                 }
                 p = p->next;
             }
+#endif
         }
     }
 

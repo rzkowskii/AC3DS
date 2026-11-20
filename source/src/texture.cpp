@@ -476,8 +476,27 @@ GLuint loadsurface(const char *texname, int &xs, int &ys, int &bpp, int clamp = 
     const bool maptexture = canreduce ||
         !strncmp(file, "packages/models/mapmodels/", sizeof("packages/models/mapmodels/") - 1) ||
         !strncmp(file, "packages/textures/skymaps/", sizeof("packages/textures/skymaps/") - 1);
+    // The font and digit atlases are grey with alpha but decode as RGBA.
+    // Stored as luminance-alpha they sample identically and take half the GPU
+    // memory (2 MiB less for the three fonts). bpp stays 32 for the caller:
+    // text rendering picks its blend mode from it.
+    uchar *grey = NULL;
+    if(atlas && format == GL_RGBA)
+    {
+        const size_t count = size_t(xs)*ys;
+        bool isgrey = true;
+        for(size_t i = 0; i < count && isgrey; ++i)
+            isgrey = pixels[i*4] == pixels[i*4+1] && pixels[i*4+1] == pixels[i*4+2];
+        if(isgrey && (grey = (uchar *)SDL_malloc(count*2)) != NULL)
+        {
+            for(size_t i = 0; i < count; ++i) { grey[i*2] = pixels[i*4]; grey[i*2+1] = pixels[i*4+3]; }
+            pixels = grey;
+            format = GL_LUMINANCE_ALPHA;
+        }
+    }
     const GLenum internal = maptexture && format == GL_RGB ? GL_RGB565 : format;
     createtexturewithatlas(tnum, xs, ys, pixels, clamp, mipmap, canreduce, format, atlas, internal);
+    SDL_free(grey);
 #else
     createtexture(tnum, xs, ys, pixels, clamp, mipmap, canreduce, format);
 #endif
@@ -512,7 +531,7 @@ Texture *textureload(const char *name, int clamp, bool mipmap, bool canreduce, f
     if(t)
     {
 #ifdef __3DS__
-        if(!t->id && !reloadtexture(*t)) return notexture;
+        if(!t->id && (t->loadfailed || !reloadtexture(*t))) return notexture;
 #endif
         return t;
     }
@@ -531,6 +550,7 @@ Texture *textureload(const char *name, int clamp, bool mipmap, bool canreduce, f
     t->id = id;
 #ifdef __3DS__
     t->evicted = false;
+    t->loadfailed = false;
 #endif
     t->scale = scale;
     return t;
@@ -695,6 +715,7 @@ void ac3ds_release_world_textures()
     constexpr char mapmodels[] = "packages/models/mapmodels/";
     constexpr char skymaps[] = "packages/textures/skymaps/";
     enumerate(textures, Texture, t,
+        t.loadfailed = false;
         if(t.id && &t != notexture && (t.canreduce || &t == noworldtexture ||
            !strncmp(t.name, mapmodels, sizeof(mapmodels)-1) || !strncmp(t.name, skymaps, sizeof(skymaps)-1)))
         {
@@ -725,9 +746,13 @@ bool reloadtexture(Texture &t)
     int xs = 1, ys = 1, bpp = 0;
     GLuint id = loadsurface(t.name, xs, ys, bpp, t.clamp, t.mipmap, t.canreduce, t.scale);
 #ifdef __3DS__
-    if(!id) return false;
+    // A failed reload (out of GPU memory, unreadable file) would otherwise be
+    // repeated, file read and decode included, by every draw that wants the
+    // texture. The flag is cleared at the next map load.
+    if(!id) { t.loadfailed = true; return false; }
     if(t.id) glDeleteTextures(1, &t.id);
     t.evicted = false;
+    t.loadfailed = false;
     if(t.xs != xs || t.ys != ys) ++worldTextureGeneration;
 #endif
     t.id = id;

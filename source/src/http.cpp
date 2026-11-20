@@ -31,7 +31,7 @@ void httpget::reset(int keep) // keep == 0: delete all, keep == 1: keep connecti
     datarec.setsize(0);
 }
 
-bool httpget::set_host(const char *newhostname) // set and resolve host
+bool httpget::set_host(const char *newhostname, enet_uint32 knownip) // set host; resolve it unless the caller already has its address
 {
     if(!hostname || strcmp(hostname, newhostname))
     {
@@ -39,7 +39,8 @@ bool httpget::set_host(const char *newhostname) // set and resolve host
         disconnect(); // new or different host name -> close connection (if still open)
 
         ENetAddress newhost;
-        if(enet_address_set_host(&newhost, newhostname) < 0)
+        if(knownip) newhost.host = knownip;
+        else if(enet_address_set_host(&newhost, newhostname) < 0)
         {
             err = "failed to resolve hostname";
             return false;

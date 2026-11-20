@@ -41,11 +41,19 @@ bool changemapserv(char *name, int mode, int download, int revision)        // f
     if(m_demo) return true;
     if(m_coop)
     {
-        if(!name[0] || load_world(name) < 0) empty_world(0, true);
+        const int coopload = name[0] ? load_world(name) : -1;
+        if(coopload == -8 && multiplayer(NULL))
+        {   // the others hold a map larger than fits here; a blank world in its place would misplace every edit
+            conoutf("\f3this map is too large for this console (size %d at most): leaving the session", CLIENTMAXMAPFACTOR);
+            trydisconnect();
+            return true;
+        }
+        if(coopload < 0) empty_world(0, true);
         return true;
     }
     else if(player1->state==CS_EDITING) { /*conoutf("SANITY drop from EDITING");*/ toggleedit(true); } // fix stuck-in-editmode bug
-    bool loaded = load_world(name) >= 0;
+    const int loadresult = load_world(name);
+    bool loaded = loadresult >= 0;
     if(disconnectonmaperror && incompatiblemap && multiplayer(NULL)) trydisconnect();
     if(download > 0)
     {
@@ -60,7 +68,11 @@ bool changemapserv(char *name, int mode, int download, int revision)        // f
             bool sizematch = maploaded == download || download < 10;
             if(loaded && sizematch && revmatch) return true;
             bool getnewrev = autogetnewmaprevisions && revision > hdr.maprevision;
-            if(autogetmap || getnewrev)
+            if(loadresult == -8)
+            {   // the file is fine but too large to load here: fetching it again would only repeat this
+                conoutf("\f3this map cannot be played on this console; wait for the next map or pick another server");
+            }
+            else if(autogetmap || getnewrev)
             {
                 if(!loaded || getnewrev) getmap(); // no need to ask
                 else
@@ -877,6 +889,15 @@ void parsemessages(int cn, playerent *d, ucharbuf &p, bool demo = false)
                 int size = getint(p);
                 if(!m_coop) break;
                 if(size < 0 && sfactor > 9) break; // don't enlarge over 10 in MP
+#ifdef __3DS__
+                if(size > CLIENTMAXMAPFACTOR || (size == -1 && sfactor >= CLIENTMAXMAPFACTOR))
+                {   // the others now hold a larger map than fits here; staying would misplace every edit
+                    conoutf("\f3%s made the map size %d, this console holds size %d at most: leaving the session",
+                            d ? colorname(d) : "a player", size == -1 ? sfactor + 1 : min(size, LARGEST_FACTOR), CLIENTMAXMAPFACTOR);
+                    trydisconnect();
+                    break;
+                }
+#endif
                 empty_world(size, true);
                 if(d && d!=player1)
                     conoutf(size>=0 ? "%s started a new map of size %d" : "%s enlarged the map to size %d", colorname(d), sfactor);

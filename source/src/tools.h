@@ -920,7 +920,7 @@ extern bool havehomedir();
 extern void addpackagedir(const char *dir);
 #ifdef __3DS__
 extern thread_local int findfilelocation;
-extern bool installfile3ds(const char *name, stream *source, int maxsize);
+extern bool installfile3ds(const char *name, stream *source, int maxsize, bool replaceable = false);
 #else
 extern int findfilelocation;
 #endif

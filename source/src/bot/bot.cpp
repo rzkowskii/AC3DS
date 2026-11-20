@@ -25,6 +25,9 @@ const vec g_vecZero(0, 0, 0);
 CBot::~CBot()
 {
      // Delete all waypoints
+#ifdef __3DS__
+     FreeWaypoints();
+#endif
      loopi(MAX_MAP_GRIDS)
      {
           loopj(MAX_MAP_GRIDS)

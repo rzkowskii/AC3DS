@@ -2,6 +2,9 @@
 
 #include "cube.h"
 #ifdef __3DS__
+#include "crash_3ds.h"
+#endif
+#ifdef __3DS__
 #include "system.h"
 static bool console_keyboard_requested = false;
 #endif
@@ -136,6 +139,9 @@ void clientlogf(const char *s, ...)
     { // break into single lines first
         if((p = strchr(l, '\n'))) *p = '\0';
         printf("%s%s\n", ts, l);
+#ifdef __3DS__
+        ac3ds_crash_note_log(l); // the last lines go into any crash report
+#endif
         if(clientlogfile)
         {
             clientlogfile->printf("%s%s\n", ts, l);

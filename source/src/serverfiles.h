@@ -41,7 +41,14 @@ struct configsetvalues
 
 // map management
 
+#ifdef __3DS__
+// The built-in server keeps a scratch buffer of this map size for the life of
+// the process: 1 MB at 9, 4 MB at 10. Every official map is 9 or smaller, and
+// a size 10 map's client data alone would not fit the handheld's heap.
+#define SERVERMAXMAPFACTOR 9
+#else
 #define SERVERMAXMAPFACTOR 10       // 10 is huge... if you're running low on RAM, consider 9 as maximum (don't go higher than 10, or players will name their ugly dog after you)
+#endif
 
 #define SERVERMAP_PATH_BUILTIN  "packages" PATHDIVS "maps" PATHDIVS "official" PATHDIVS
 #define SERVERMAP_PATH_LOCAL    "packages" PATHDIVS "maps" PATHDIVS
@@ -330,6 +337,11 @@ struct servermap  // in-memory version of a map file on a server
 
                     case 255:
                         n = f->getchar();
+#ifdef __3DS__
+                        // The scratch buffer is exactly layoutlen cubes for a size 9
+                        // map here, so a run must not extend past the map.
+                        if(n > int(ee - ss)) n = int(ee - ss);
+#endif
                         loopi(n) memcpy(ss++, tt, sizeof(servsqr));
                         ss--;
                         break;

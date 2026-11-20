@@ -31,8 +31,10 @@ namespace
 constexpr int dspChannel = 0;
 constexpr int outputChannels = 2;
 constexpr int blockFrames = 640;
-constexpr int waveCount = 3;
-constexpr int bufferedWaves = 2;
+// The output is refilled once per game frame, so the queued depth has to
+// outlast the longest frame. libctru hands the DSP at most five buffers.
+constexpr int waveCount = 5;
+constexpr int minBufferedWaves = 3;
 constexpr float outputRate = NDSP_SAMPLE_RATE;
 constexpr unsigned int phaseBits = 16;
 constexpr unsigned int phaseUnit = 1u << phaseBits;
@@ -452,6 +454,21 @@ void serviceAudio()
         paused = shouldPause;
     }
     if(paused || !context.current || context.batching) return;
+
+    // Queue enough 19.6 ms blocks to cover the recent frame time plus two
+    // blocks of margin: three at 60 fps, four at 30, five at 20. With a fixed
+    // two, any frame over 19.6 ms ran the channel dry (an audible hole). A
+    // gap over 100 ms is a stall (map load, resume), not a frame time.
+    static u64 lastService = 0;
+    static u32 slowMs = 0;
+    const u64 now = svcGetSystemTick();
+    if(lastService)
+    {
+        const u32 ms = u32((now-lastService)*1000/SYSCLOCK_ARM11);
+        if(ms <= 100) slowMs = std::max(ms, slowMs-slowMs/8);
+    }
+    lastService = now;
+    const int bufferedWaves = std::clamp(2+int((slowMs*1000+19554)/19555), minBufferedWaves, waveCount);
 
     int pending = 0;
     for(const ndspWaveBuf &wave : waves)

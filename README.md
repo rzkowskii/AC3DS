@@ -24,7 +24,7 @@
   - the map editor and demo playback;
   - water reflection and refraction, and stencil shadows;
   - fog that follows the PC game's.
-- **Feels like a 3DS game.** The Nintendo software keyboard for chat. The online connection stays serviced while the HOME menu or the keyboard is open. Offline matches pause on START. You can rebind every button, and the menus and server browser are laid out for the small screens.
+- **Feels like a 3DS game.** The Nintendo software keyboard for chat. The online connection stays serviced for up to three minutes while the HOME menu or the keyboard is open. Offline matches pause on START. You can rebind every button, and the menus and server browser are laid out for the small screens.
 
 ## Screenshots
 
@@ -53,7 +53,7 @@ You need a New Nintendo 3DS, New 3DS XL or New 2DS XL running the Homebrew Launc
 
 AssaultCube's game content (maps, textures, models and sounds) may only be shared inside the unmodified official package, unless a file carries its own license. So the release here is the game engine for the 3DS, and you add the game files from the official download. It takes a couple of minutes:
 
-1. Download `AC-3DS0v1.0.zip` from [Releases](https://github.com/rzkowskii/AC3DS/releases) and unzip it. It contains `assaultcube.3dsx` and `stage-assets.py`.
+1. Download the latest `AC-3DS0v….zip` from [Releases](https://github.com/rzkowskii/AC3DS/releases) and unzip it. It contains `assaultcube.3dsx` and `stage-assets.py`.
 2. Download the official [AssaultCube v1.3.0.2 Lockdown Edition RC1 (tar.bz2)](https://github.com/assaultcube/AC/releases/download/v1.3.0.2/AssaultCube_v1.3.0.2_LockdownEdition_RC1.tar.bz2). Keep the archive as it is.
 3. Stage the game files with Python 3 on Windows, macOS or Linux (on Windows, run `py` instead of `python3`). The script checks the archive's SHA-256 and copies only the game's data folders (`config`, `packages`, `bot` and so on), leaving out the PC programs and source.
 
@@ -62,7 +62,7 @@ AssaultCube's game content (maps, textures, models and sounds) may only be share
    ```
 
 4. Copy the contents of `sd-assets/` and the release's `assaultcube.3dsx` into `/3ds/assaultcube/` on the SD card. You end up with `/3ds/assaultcube/assaultcube.3dsx`, `/3ds/assaultcube/config/`, `/3ds/assaultcube/packages/` and so on.
-5. Open **AC-3DS0v1.0** in the Homebrew Launcher. Pick **Singleplayer** for a bot match, or **Multiplayer** to browse servers.
+5. Open **AC-3DS0** (the title carries the version, for example AC-3DS0v1.0) in the Homebrew Launcher. Pick **Singleplayer** for a bot match, or **Multiplayer** to browse servers.
 
 Settings, screenshots, demos and logs go to `/3ds/assaultcube/profile/`. To update, replace `assaultcube.3dsx` and keep everything else.
 
@@ -77,14 +77,14 @@ AssaultCube targets desktop OpenGL and a mouse. The 3DS has a PICA200 GPU with n
 - World geometry is drawn in large batches, and reused across frames while the view holds still.
 - Water uses render-to-texture reflection and refraction. The refraction reuses the main view's world geometry, and the reflection reuses its visibility pass.
 - Characters cast stencil shadows.
-- The main view stores linear depth (the PICA's W-buffer), so fog follows the PC game's linear falloff.
+- Fog is computed per pixel from eye distance (the PICA's procedural texture unit plus one combiner stage), so it follows the PC game's linear falloff.
 
 **Speed**
 - New 3DS 804 MHz mode with the extra cache enabled.
 - While a map loads, its textures are decoded on two cores at once: the second application core and the main thread.
 - Game sounds are decoded in the background at startup.
 - With `jpegtran` installed, progressive JPEGs are converted to baseline as the files are staged.
-- Bots also use the 11 stock waypoint files the PC game rejects for a blank map name, instead of rebuilding waypoints at match start.
+- Bots also use the 11 stock waypoint files the PC game rejects for a blank map name, instead of rebuilding waypoints at match start. Eight of them state a wrong waypoint count; the loader takes the count from the file's records.
 
 **Two screens**
 - A dedicated match screen, built from the map's own GPU-drawn overview.
@@ -94,11 +94,12 @@ AssaultCube targets desktop OpenGL and a mouse. The 3DS has a PICA200 GPU with n
 **Network**
 - ENet runs over the 3DS socket service.
 - Connections to the master and package servers make their TCP connect on a helper thread with a timeout, which the 3DS socket service needs. The server list then loads behind a progress bar you can cancel.
-- A helper thread keeps the server connection serviced while the keyboard or HOME menu is open.
+- Content a custom map needs is fetched from the package server during the map change, for at most 30 seconds while online (`ac3dsdownloadwait`). The server connection stays serviced meanwhile, and START skips the download.
+- A helper thread keeps the server connection serviced for up to three minutes while the keyboard or HOME menu is open; after that the server times the console out.
 - The 3DS can also run AssaultCube's dedicated server. So far it has been tested in Azahar, where it answers server-browser queries. [Network play](docs/network-storage.md)
 
 **Robustness**
-- A crash handler and a stall watchdog write `crash.txt` or `stall.txt` to the SD card.
+- A crash handler and a stall watchdog write `crash.txt` or `stall.txt` to the SD card, keep the five before it, and record the map, memory and last log lines.
 - Settings are written to a temporary file and swapped in, with a backup kept, so an interrupted save shouldn't lose them.
 
 ## Feature parity
@@ -122,10 +123,11 @@ AssaultCube targets desktop OpenGL and a mouse. The 3DS has a PICA200 GPU with n
 | New 2DS XL | Map load | `ac_douze` 1.1 s, `ac_dusk` 2.3 s, `ac_arctic2` 2.8 s, `ac_alcove` 3.3 s |
 | New 2DS XL | Online on `ac_douze` | Five single-frame samples during play: 14, 16, 17, 17 and 21 ms |
 | New 2DS XL | Texture loading on `ac_alcove` | All 61 queued textures were ready before use, decoded ahead on both cores (36 on the second core) |
-| Azahar, New 3DS mode | `ac_arctic2`, six bots | 59.8 FPS mean, 20.5 ms 99th percentile, no missed refreshes |
-| Azahar, New 3DS mode | `ac_venison`, eight bots, water reflection and refraction | 54.2 FPS mean, 24.3 ms 99th percentile |
+| Azahar, New 3DS mode | `ac_arctic2`, six bots, standing still | 59.8 FPS mean, 20.5 ms 99th percentile, no missed refreshes |
+| Azahar, New 3DS mode | `ac_douze`, six bots, camera turning | 59.8 FPS mean, 19.1 ms 99th percentile |
+| Azahar, New 3DS mode | `ac_venison`, eight bots, camera turning | 59.8 FPS mean, 17.5 ms 99th percentile |
 
-Emulator figures are from Azahar at its stock CPU clock. Bot matches hold 60 FPS there, and Venison's water scene runs in the low-to-mid 50s, but these are not handheld measurements. [Detailed status](docs/port-status.md) · [Emulator test fixtures](docs/emulator-qa.md) · [3DS hardware notes](docs/3ds-hardware.md)
+Emulator figures are from Azahar at its stock CPU clock, which does not model GPU time, so they are not handheld measurements. `ac3dsbench` in the console runs the same turning-camera benchmark on the handheld and writes the results to the log. [Detailed status](docs/port-status.md) · [Emulator test fixtures](docs/emulator-qa.md) · [3DS hardware notes](docs/3ds-hardware.md)
 
 ## Controls
 

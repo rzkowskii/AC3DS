@@ -19,6 +19,11 @@ void ac3ds_crash_stop_watchdog();
 void ac3ds_crash_tick();
 // One line of heap and linear-heap usage for the client log.
 void ac3ds_memory_line(char *out, size_t size);
+// Context a crash or stall report repeats: the map being played, and the last
+// lines written to the client log (the log file itself is flushed rarely).
+void ac3ds_crash_set_map(const char *name);
+size_t ac3ds_heap_unclaimed();
+void ac3ds_crash_note_log(const char *line);
 
 // The last main-loop phase entered. Must point at a string literal.
 extern const char *volatile ac3ds_crash_phase;

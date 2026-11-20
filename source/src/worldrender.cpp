@@ -21,6 +21,10 @@ VAR(ac3dsmainworldclip, 0, 0, 1);
 VAR(ac3dssharedreflection, 0, 1, 1);
 VAR(ac3dswallrecipes, 0, 1, 1);
 VAR(ac3dsnativereflectionclip, 0, 1, 1);
+// Diagnostic: 0 runs the upstream world traversal with none of the port's
+// caches (ray-table reuse, occlusion memo, wall candidates, world batches), to
+// tell CPU world selection apart from the GPU path on the handheld.
+VAR(ac3dsworldcache, 0, 1, 1);
 
 namespace
 {
@@ -423,7 +427,7 @@ namespace
 
 void ac3ds_begin_world_pass(float x0, float y0, float x1, float y1)
 {
-    worldClipActive = reflecting && (refracting || !ac3dsnativereflectionclip) &&
+    worldClipActive = ac3dsworldcache && reflecting && (refracting || !ac3dsnativereflectionclip) &&
                       !minimap && !editmode && !m_coop && cancacheworldheights();
     if(!worldClipActive) return;
     prepareworldheights();
@@ -443,6 +447,34 @@ void ac3ds_begin_world_pass(float x0, float y0, float x1, float y1)
 }
 
 void ac3ds_end_world_pass() { worldClipActive = false; }
+
+// Map change: free the per-map tables. resize() and assign() keep the
+// capacity of the largest map visited.
+void ac3ds_release_world_tables()
+{
+    for(auto &heights : worldHeights) std::vector<WorldHeights>().swap(heights);
+    worldHeightsGeneration = 0;
+    for(auto &cache : worldClipCaches)
+    {
+        std::vector<uchar>().swap(cache.cells);
+        cache.generation = 0;
+        cache.populated = false;
+    }
+    worldClipCache = nullptr;
+    std::vector<uchar>().swap(cubeOcclusion);
+    cubeOcclusionWorld = nullptr;
+    cubeOcclusionGeneration = 0;
+    std::vector<uchar>().swap(cubeWallCandidates);
+    for(auto &prefix : cubeSurfacePrefix) std::vector<uchar>().swap(prefix);
+    cubeWallGeneration = 0;
+    std::vector<unsigned>().swap(cubeWallRecipe);
+    wallRecipeGeneration = 0;
+    { vector<WallRecipe> empty; wallRecipes.setsize(0); wallRecipes.swapstorage(empty); }
+    { vector<WallFace> empty; wallFaces.setsize(0); wallFaces.swapstorage(empty); }
+    { vector<WorldSelectionRegion> empty; worldSelectionRegions.setsize(0); worldSelectionRegions.swapstorage(empty); }
+    { vector<WorldSelectionCell> empty; worldSelectionCells.setsize(0); worldSelectionCells.swapstorage(empty); }
+    worldSelectionValid = recordWorldSelection = false;
+}
 
 unsigned ac3ds_shared_reflection_replays()
 {
@@ -960,7 +992,7 @@ void distlod(int &low, int &high, int angle, float widef)
 void render_world(float vx, float vy, float vh, float changelod, int yaw, int pitch, float fov, float fovy, int w, int h)
 {
 #ifdef __3DS__
-    worldOcclusionActive = !minimap && !editmode && !m_coop;
+    worldOcclusionActive = ac3dsworldcache && !minimap && !editmode && !m_coop;
     if(worldOcclusionActive) prepareworldocclusion();
     mainWorldClipActive = ac3dsmainworldclip && !reflecting && worldOcclusionActive;
     if(mainWorldClipActive) preparemainworldclip();
@@ -975,8 +1007,18 @@ void render_world(float vx, float vy, float vh, float changelod, int yaw, int pi
         min_lod = max(min_lod, (int)(MIN_LOD+(10-cdist)/1.0f*widef)); // less if lod worked better
         widef = 1.0f;
     }
+#ifdef __3DS__
+    // Desktop grows the detail range while fps is above the fpsrange target
+    // and sits at MAX_LOD in practice. At the handheld's 60 fps cap that
+    // feedback only ever ratchets down to minlod (or, with the 30-40 preset,
+    // up to MAX_LOD), and the emulator and the handheld ended up drawing
+    // different worlds. The detail range is the minlod setting, nothing else.
+    (void)changelod;
+    lod = minlod;
+#else
     lod = (int)(lod*changelod);
     if(lod<minlod) lod = minlod;
+#endif
     if(lod>MAX_LOD) lod = MAX_LOD;
     lodtop = lodbot = lodleft = lodright = min_lod;
     if(yaw>45 && yaw<=135)
@@ -1011,7 +1053,13 @@ void render_world(float vx, float vy, float vh, float changelod, int yaw, int pi
     extern int mergestrips;
     extern bool showmipstats;
     const bool cache = worldOcclusionActive && !showmipstats;
-    const bool sharedSelection = ac3dssharedreflection && cache && ssize <= 1024;
+    // The main pass records its cell selection so the reflection pass can
+    // replay it. That is only worth paying for when a reflection pass can
+    // happen: water reflection on, and a map that has a water level.
+    extern int waterreflect;
+    extern float waterlevel;
+    const bool sharedSelection = ac3dssharedreflection && cache && ssize <= 1024 &&
+                                 waterreflect && waterlevel > -10000;
     const WorldSelectionKey selectionKey = {vx, vy, ac3ds_world_geometry_generation(),
                                             ac3ds_raytable_generation(), ac3ds_static_world_lighting_generation(),
                                             lodleft, lodright, lodtop, lodbot};

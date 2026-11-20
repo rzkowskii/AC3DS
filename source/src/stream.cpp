@@ -37,11 +37,25 @@ bool homeindexlockready = false;
 bool homeindexready = false;
 string homeindexdir = "";
 std::unordered_set<std::string> homeindex;
+// Directories seen on the card or made since. Unlike homeindex this never
+// holds a folder that is only about to be created.
+std::unordered_set<std::string> homedirs;
 
 std::string homekey(const char *rel)
 {
     std::string key(rel);
     for(char &c : key) c = (c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : (c == '\\' ? '/' : c);
+    while(!key.empty() && key.back() == '/') key.pop_back();
+    return key;
+}
+
+// homedirs is keyed by the exact spelling: a hit skips mkdir, so on a
+// case-sensitive emulator host "Foo" must not match "foo". On the card a
+// second spelling costs one stat and is then noted.
+std::string homedirkey(const char *rel)
+{
+    std::string key(rel);
+    for(char &c : key) if(c == '\\') c = '/';
     while(!key.empty() && key.back() == '/') key.pop_back();
     return key;
 }
@@ -56,7 +70,11 @@ void scanhomedir(const std::string &abs, const std::string &rel, int depth)
         if(!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
         const std::string childrel = rel.empty() ? std::string(e->d_name) : rel + "/" + e->d_name;
         homeindex.insert(homekey(childrel.c_str()));
-        if(e->d_type == DT_DIR) scanhomedir(abs + e->d_name + "/", childrel, depth + 1);
+        if(e->d_type == DT_DIR)
+        {
+            homedirs.insert(homedirkey(childrel.c_str()));
+            scanhomedir(abs + e->d_name + "/", childrel, depth + 1);
+        }
     }
     closedir(d);
 }
@@ -67,20 +85,42 @@ void lockhomeindex()
     LightLock_Lock(&homeindexlock);
 }
 
+// With the lock held: list the profile folder if that has not been done yet.
+void readyhomeindex()
+{
+    if(homeindexready && !strcmp(homeindexdir, homedir)) return;
+    homeindex.clear();
+    homedirs.clear();
+    copystring(homeindexdir, homedir);
+    scanhomedir(homedir, "", 0);
+    homeindexready = true;
+}
+
 // Returns false only when the file is known not to be in the profile folder.
 bool homemayexist(const char *rel)
 {
     lockhomeindex();
-    if(!homeindexready || strcmp(homeindexdir, homedir))
-    {
-        homeindex.clear();
-        copystring(homeindexdir, homedir);
-        scanhomedir(homedir, "", 0);
-        homeindexready = true;
-    }
+    readyhomeindex();
     const bool found = homeindex.count(homekey(rel)) != 0;
     LightLock_Unlock(&homeindexlock);
     return found;
+}
+
+// True for a directory under the profile folder that is known to be on the card.
+bool homedirknown(const char *rel)
+{
+    lockhomeindex();
+    readyhomeindex();
+    const bool found = homedirs.count(homedirkey(rel)) != 0;
+    LightLock_Unlock(&homeindexlock);
+    return found;
+}
+
+void notehomedir(const char *rel)
+{
+    lockhomeindex();
+    if(homeindexready) homedirs.insert(homedirkey(rel));
+    LightLock_Unlock(&homeindexlock);
 }
 
 void notehomewrite(const char *rel)
@@ -262,12 +302,23 @@ static bool createpath(const char *path)
     char *p = strchr(directory, ':');
     p = p ? p + 1 : directory;
     if(*p == PATHDIV) ++p;
+    // Inside the profile folder, directories already seen on the card are not
+    // checked again. A stat of a directory is two FS round trips (about
+    // 100 ms on the handheld), and a file eight folders deep paid for eight
+    // of them on every write: 0.8 s per file of an installed package.
+    const size_t homelen = strlen(homedir);
+    const bool inhome = homelen && homedir[homelen-1] == PATHDIV && !strncmp(directory, homedir, homelen) && directory[homelen];
+    if(inhome) p = directory + homelen; // the profile folder itself was made at startup
     for(char *end = strchr(p, PATHDIV); end; end = strchr(end + 1, PATHDIV))
     {
         *end = '\0';
-        struct stat st;
-        if(stat(directory, &st) == 0 ? !S_ISDIR(st.st_mode) : !createdir(directory) && errno != EEXIST)
-            return false;
+        if(!inhome || !homedirknown(directory + homelen))
+        {
+            struct stat st;
+            if(stat(directory, &st) == 0 ? !S_ISDIR(st.st_mode) : !createdir(directory) && errno != EEXIST)
+                return false;
+            if(inhome) notehomedir(directory + homelen);
+        }
         *end = PATHDIV;
     }
     return true;
@@ -1368,13 +1419,53 @@ int streamcopy(stream *dest, stream *source, int maxlen)
 }
 
 #ifdef __3DS__
-bool installfile3ds(const char *name, stream *source, int maxsize)
+// Writes a file under the profile folder so that an interruption leaves
+// either the old contents or the new: staged beside the target, synced, then
+// renamed over it. "replaceable" is for downloaded media that is not on the
+// card yet: with no old file or backup to look after it is written beside the
+// target and renamed when complete, four SD operations instead of eight.
+bool installfile3ds(const char *name, stream *source, int maxsize, bool replaceable)
 {
     long length = source->size();
     if(length < 0 || length > maxsize || !source->seek(0, SEEK_SET)) return false;
 
+    // A name the profile index has never held has no old file and no backup
+    // from an interrupted write, so the two stats below can be skipped (a stat
+    // of a missing path is two FS round trips). Asked before findfile(),
+    // which enters the name.
+    bool mayhaveold = true;
+    if(homedir[0] && strncmp(name, "sdmc:/", 6) && strncmp(name, "romfs:/", 7))
+    {
+        const char *rel = name;
+        while(rel[0] == PATHDIV) rel++;
+        while(!strncmp(".." PATHDIVS, rel, 3)) rel += 3;
+        mayhaveold = homemayexist(rel) || homemayexist((std::string(rel) + ".ac-prev").c_str());
+    }
+
     string target, previous, staged;
     copystring(target, findfile(name, "wb"));
+    if(replaceable && !mayhaveold)
+    {
+        // No stats and no sync, but still never under the final name until
+        // complete: a cut-short JPEG, md2 or md3 loads without complaint and
+        // would never be fetched again.
+        int n = snprintf(staged, sizeof(staged), "%s.part", target);
+        if(n < 0 || (size_t)n >= sizeof(staged)) return false;
+        filestream direct;
+        direct.file = fopen(staged, "wb");
+        if(!direct.file) return false;
+        setvbuf(direct.file, NULL, _IOFBF, 32 * 1024);
+        bool written = streamcopy(&direct, source, (int)length) == length;
+        if(fclose(direct.file) != 0) written = false;
+        direct.file = NULL;
+        if(written && rename(staged, target) != 0)
+        {
+            remove(target); // on the card after all, though never indexed
+            written = rename(staged, target) == 0;
+        }
+        if(!written) remove(staged);
+        return written;
+    }
     int n = snprintf(previous, sizeof(previous), "%s.ac-prev", target);
     if(n < 0 || (size_t)n >= sizeof(previous)) return false;
     n = snprintf(staged, sizeof(staged), "%s.XXXXXX", target);
@@ -1390,6 +1481,8 @@ bool installfile3ds(const char *name, stream *source, int maxsize)
         remove(staged);
         return false;
     }
+    // The default 1 KiB stdio buffer makes every kilobyte one SD write call.
+    setvbuf(out.file, NULL, _IOFBF, 32 * 1024);
 
     bool complete = streamcopy(&out, source, (int)length) == length &&
                     ::fflush(out.file) == 0 && fsync(fd) == 0;
@@ -1400,9 +1493,9 @@ bool installfile3ds(const char *name, stream *source, int maxsize)
     // SD renames over an existing file first delete it. Keep the old data until
     // the new file is in place, and restore any backup left by an interrupted write.
     struct stat st;
-    bool hasold = stat(target, &st) == 0;
+    bool hasold = mayhaveold && stat(target, &st) == 0;
     if(hasold && !S_ISREG(st.st_mode)) { remove(staged); return false; }
-    if(stat(previous, &st) == 0)
+    if(mayhaveold && stat(previous, &st) == 0)
     {
         if(!S_ISREG(st.st_mode) || (hasold ? remove(previous) : rename(previous, target)) != 0)
         {

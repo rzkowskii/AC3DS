@@ -42,6 +42,13 @@ namespace
     LightEvent netkeep_wake;
     Thread netkeep_thread = NULL;
     std::atomic<bool> netkeep_active{false};
+    u64 netkeep_started = 0; // written before netkeep_active is set, read after it is seen
+    // ENet queues every packet that arrives while nobody dispatches events, with
+    // no cap. Past this long in the HOME menu or the software keyboard the
+    // keepalive stops and the server times the client out as it would a
+    // closed lid, instead of the game replaying minutes of backlog (or
+    // running out of heap) on return.
+    constexpr u64 netkeep_budget_ms = 3 * 60 * 1000;
 
     void netkeep_main(void *)
     {
@@ -49,6 +56,11 @@ namespace
         {
             LightEvent_WaitTimeout(&netkeep_wake, 50000000LL); // 50 ms
             if(!netkeep_active.load(std::memory_order_acquire)) continue;
+            if(osGetTime() - netkeep_started > netkeep_budget_ms)
+            {
+                netkeep_active.store(false, std::memory_order_release);
+                continue;
+            }
             LightLock_Lock(&netkeep_lock);
             if(netkeep_active.load(std::memory_order_acquire)) c2skeepalive();
             LightLock_Unlock(&netkeep_lock);
@@ -68,6 +80,7 @@ namespace
             if(!netkeep_thread) netkeep_thread = threadCreate(netkeep_main, NULL, 16 * 1024, lower, 0, true);
             if(!netkeep_thread) return;
         }
+        netkeep_started = osGetTime();
         netkeep_active.store(true, std::memory_order_release);
         LightEvent_Signal(&netkeep_wake);
     }
@@ -663,6 +676,7 @@ const char *ac3ds_system_init()
 
 void ac3ds_system_shutdown()
 {
+    netkeep_end(); // nothing may use the sockets past this point
     if(apt_hooked)
     {
         aptUnhook(&apt_cookie);
@@ -723,6 +737,10 @@ bool ac3ds_main_loop()
         clock_reset = true;
         gspWaitForVBlank();
     }
+    // HOME -> Close wakes the app with APTCMD_WAKEUP_CANCEL, for which libctru
+    // runs no restore hook: stop the keepalive thread here, before the caller
+    // tears ENet down.
+    netkeep_end();
     active = false;
     ac3ds_audio_lifecycle_event(true);
     ac3ds_audio_service();
@@ -1920,7 +1938,39 @@ bool ac3ds_install_config(const char *basename, stream *config)
 {
     long size = config->size();
     if(size <= 0 || size > max_config_size) return false;
-    filerotate(basename, "cfg", CONFIGROTATEMAX, NULL, true);
     defformatstring(path)("%s.cfg", basename);
-    return installfile3ds(path, config, max_config_size);
+
+    // Settings are saved on every HOME press, lid close and exit. Rotating the
+    // five backups and rewriting the file costs about twenty SD directory
+    // operations per file, so skip all of it when the text is unchanged. The
+    // first save of a session compares against the file on the card.
+    struct Written { const char *name; bool known; long size; uLong crc; };
+    static Written written[] = { { "config/init", false, 0, 0 }, { "config/saved", false, 0, 0 } };
+    Written *slot = NULL;
+    for(Written &w : written) if(!strcmp(w.name, basename)) slot = &w;
+    uchar chunk[1024];
+    uLong crc = crc32(0, Z_NULL, 0);
+    if(slot && config->seek(0, SEEK_SET))
+    {
+        for(int n; (n = config->read(chunk, sizeof(chunk))) > 0;) crc = crc32(crc, chunk, n);
+        if(!slot->known)
+        {
+            if(FILE *current = fopen(findfile(path, "wb"), "rb"))
+            {
+                uLong disk = crc32(0, Z_NULL, 0);
+                long length = 0;
+                for(size_t n; (n = fread(chunk, 1, sizeof(chunk), current)) > 0; length += long(n))
+                    disk = crc32(disk, chunk, uInt(n));
+                const bool complete = !ferror(current);
+                fclose(current);
+                if(complete) { slot->known = true; slot->size = length; slot->crc = disk; }
+            }
+        }
+        if(slot->known && slot->size == size && slot->crc == crc) return true;
+    }
+
+    filerotate(basename, "cfg", CONFIGROTATEMAX, NULL, true);
+    const bool installed = installfile3ds(path, config, max_config_size);
+    if(slot) { slot->known = installed; slot->size = size; slot->crc = crc; }
+    return installed;
 }

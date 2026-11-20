@@ -26,6 +26,9 @@ static inline unsigned ac3ds_ms(u64 ticks) { return unsigned(ticks * 1000 / SYSC
 // Network keepalive inside long load loops, throttled to every 100 ms. Same
 // call upstream makes between load stages; it only services ENet so a long
 // stage cannot time out the connection to a server.
+// Milliseconds since the map load in progress began.
+int ac3ds_load_elapsed() { return int(ac3ds_ms(svcGetSystemTick() - ac3ds_load_start)); }
+
 void ac3ds_load_keepalive()
 {
     static u64 last = 0;
@@ -968,6 +971,7 @@ int load_world(char *mname)        // still supports all map formats that have e
     ac3ds_load_profile_reset();
     ac3ds_load_start = ac3ds_stage_start = svcGetSystemTick();
     clientlogf("loading map %s", mname);
+    ac3ds_crash_set_map(mname); // a crash while loading names the map being loaded
     if(clientlogfile) clientlogfile->fflush();
     struct RestorePhase
     {
@@ -975,10 +979,11 @@ int load_world(char *mname)        // still supports all map formats that have e
         ~RestorePhase()
         {
             ac3ds_crash_phase = p;
+            ac3ds_crash_set_map(getclientmap()); // a refused load leaves the old map in play
             ac3ds_loading_done();
             const u64 now = svcGetSystemTick();
             clientlogf("load map: done (last stage +%u ms, %u ms total)", ac3ds_ms(now - ac3ds_stage_start), ac3ds_ms(now - ac3ds_load_start));
-            char memory[128];
+            char memory[224];
             ac3ds_memory_line(memory, sizeof(memory));
             clientlogf("memory after load: %s", memory);
             extern int ac3ds_load_generation;
@@ -1021,7 +1026,15 @@ int load_world(char *mname)        // still supports all map formats that have e
        (strncmp(tmp.head, "CUBE", 4)!=0 && strncmp(tmp.head, "ACMP",4)!=0)) { conoutf("\f3while reading map: header malformatted (1)"); delete f; return -3; }
     lilswap(&tmp.version, 4); // version, headersize, sfactor, numents
     if(tmp.version > MAPVERSION) { conoutf("\f3this map requires a newer version of AssaultCube"); delete f; return -4; }
-    if(tmp.sfactor<SMALLEST_FACTOR || tmp.sfactor>LARGEST_FACTOR || tmp.numents > MAXENTITIES) { conoutf("\f3illegal map size"); delete f; return -5; }
+#ifdef __3DS__
+    if(tmp.sfactor > CLIENTMAXMAPFACTOR && tmp.sfactor <= LARGEST_FACTOR && tmp.numents <= MAXENTITIES)
+    {   // a sound map, but larger than this console has room for
+        conoutf("\f3map size %d is not supported on 3DS (the largest is %d)", tmp.sfactor, CLIENTMAXMAPFACTOR);
+        delete f;
+        return -8;
+    }
+#endif
+    if(tmp.sfactor<SMALLEST_FACTOR || tmp.sfactor>CLIENTMAXMAPFACTOR || tmp.numents > MAXENTITIES) { conoutf("\f3illegal map size"); delete f; return -5; }
     tmp.headersize = fixmapheadersize(tmp.version, tmp.headersize);
     int restofhead = min(tmp.headersize, sizeof_header) - sizeof_baseheader;
     if(f->read(&tmp.waterlevel, restofhead) != restofhead) { conoutf("\f3while reading map: header malformatted (2)"); delete f; return -6; }
@@ -1051,6 +1064,10 @@ int load_world(char *mname)        // still supports all map formats that have e
     loadingscreen("%s", hdr.maptitle);
 #ifdef __3DS__
     ac3ds_gl_collect_retired();
+    extern void ac3ds_release_world_batches();
+    extern void ac3ds_release_world_tables();
+    ac3ds_release_world_batches();
+    ac3ds_release_world_tables();
 #endif
     resetmap();
     int res = 0;
@@ -1125,7 +1142,9 @@ int load_world(char *mname)        // still supports all map formats that have e
     delete[] tempents;
 
     // read world geometry
-    delete[] world;
+#ifndef __3DS__
+    delete[] world; // on 3DS setupworld() owns one persistent buffer
+#endif
     setupworld(hdr.sfactor);
     if(!mapinfo.numelems || (mapinfo.access(mname) && !cmpf(cgzname, mapinfo[mname]))) world = (sqr *)ents.getbuf();
     c2skeepalive();
@@ -1243,7 +1262,15 @@ int load_world(char *mname)        // still supports all map formats that have e
 #endif
 
     watch.start();
-    loopi(256) if(texuse[i] && lookuptexture(i, notexture, false) == notexture && (!_ignoreillegalpaths || gettextureslot(i))) res |= LWW_MISSINGMEDIA * 2;
+    loopi(256) if(texuse[i])
+    {
+#ifdef __3DS__
+        // Textures that waited for a download are read from the card and
+        // decoded here, on this thread alone.
+        ac3ds_load_keepalive();
+#endif
+        if(lookuptexture(i, notexture, false) == notexture && (!_ignoreillegalpaths || gettextureslot(i))) res |= LWW_MISSINGMEDIA * 2;
+    }
     clientlogf("loaded textures (%d milliseconds)", texloadtime+watch.elapsed());
     c2skeepalive();
     watch.start();
@@ -1408,7 +1435,8 @@ struct xmap
     string mcfname;
     short position[5];
 
-    xmap() : world(NULL), ssize(0), cubicsize(0), numundo(0) { *nick = *name = *mcfname = '\0'; }
+    xmap() : world(NULL), ssize(0), cubicsize(0), numundo(0) { *nick = *name = *mcfname = '\0'; memset(&hdr, 0, sizeof(hdr)); }
+    bool legalsize() const { return hdr.sfactor >= SMALLEST_FACTOR && hdr.sfactor <= CLIENTMAXMAPFACTOR && ssize == 1 << hdr.sfactor && cubicsize == ssize * ssize; }
 
     xmap(const char *nnick)    // take the current map and store it in an xmap
     {
@@ -1460,7 +1488,9 @@ struct xmap
         loopv(ents) restoreent(i);
         deleted_ents.setsize(0);
         loopv(delents) deleted_ents.add(delents[i]);
-        delete[] ::world;
+#ifndef __3DS__
+        delete[] ::world; // on 3DS setupworld() owns one persistent buffer
+#endif
         setupworld(hdr.sfactor);
         memcpy(::world, world, cubicsize * sizeof(sqr));
         calclight();  // includes full remip()
@@ -1669,18 +1699,24 @@ void restorexmap(char **args, int numargs)   // read an xmap from a cubescript f
             copystring(xmjigsaw->mcfname, args[2]);
             break;
         case 2:     // sizes
+            if(xmjigsaw->world) { abort = true; break; } // the world buffer is already sized
             xmjigsaw->ssize = ATOI(args[1]);
             xmjigsaw->cubicsize = ATOI(args[2]);
             xmjigsaw->numundo = ATOI(args[3]);
             break;
         case 3:     // header
-            if(hexbin.length() == sizeof(header)) memcpy(&xmjigsaw->hdr, hexbin.getbuf(), sizeof(header));
+            if(!xmjigsaw->world && hexbin.length() == sizeof(header)) memcpy(&xmjigsaw->hdr, hexbin.getbuf(), sizeof(header));
             else abort = true;
             break;
         case 4:     // world
         {
             int rawworldsize = xmjigsaw->cubicsize * sizeof(sqr);
-            xmjigsaw->world = new sqr[rawworldsize];
+            // One sqr per cube. Upstream passes the byte count here and
+            // allocates sixteen times the map (16 MB for a 256-square one),
+            // for every stored xmap, at every start.
+            if(!xmjigsaw->legalsize()) { conoutf("\f3xmap \"%s\" skipped: illegal map size", xmjigsaw->nick); abort = true; break; }
+            delete[] xmjigsaw->world; // a second "world" line
+            xmjigsaw->world = new sqr[xmjigsaw->cubicsize];
             uLongf rawsize = rawworldsize;
             if(uncompress((uchar *)xmjigsaw->world, &rawsize, hexbin.getbuf(), hexbin.length()) != Z_OK || rawsize - rawworldsize != 0) abort = true;
             break;
@@ -1709,7 +1745,7 @@ void restorexmap(char **args, int numargs)   // read an xmap from a cubescript f
             loopi(5) xmjigsaw->position[i] = ATOI(args[i + 1]);
             int i;
             if(getxmapbynick(xmjigsaw->nick, &i, false)) { xmap *xm = xmaps.remove(i); xmapdelete(xm); }   // overwrite existing same nick
-            if(!xmjigsaw->world) abort = true;
+            if(!xmjigsaw->world || !xmjigsaw->legalsize()) abort = true;
             else
             {
                 if(xmjigsaw->mapconfig.length()) xmjigsaw->mapconfig.add('\0');

@@ -13,7 +13,7 @@ Base assets are read from the 3DSX RomFS when present. An SD asset layout uses `
 | `demos/`, `screenshots/` | Demo files, screenshots and map shots. |
 | `logs/` | Dedicated server logs by default. The client uses `clientlog.txt` in the profile root. |
 
-Native initialization and saved settings retain the original rotated backups. The port stages each replacement on SD and flushes its data before renaming it into place. If an interrupted replacement leaves the target missing, reads can fall back to its `.ac-prev` copy. The same staged write is used for individual downloaded media files and incoming map files. A multi-file upload or media archive is written one file at a time.
+Native initialization and saved settings retain the original rotated backups. The port stages each replacement on SD and flushes its data before renaming it into place. If an interrupted replacement leaves the target missing, reads can fall back to its `.ac-prev` copy. Incoming map files use the same staged write. A downloaded media file that is not on the card yet is written beside its target and renamed when complete, without the flush: nothing is replaced, and each extra SD operation is felt on a map change. A multi-file upload or media archive is written one file at a time.
 
 ## Hosting a dedicated server
 

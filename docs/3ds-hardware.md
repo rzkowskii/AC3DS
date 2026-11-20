@@ -61,12 +61,13 @@ An application gets the larger New-model regions only when its exheader asks for
 | Virtual address | What |
 | --- | --- |
 | `0x00100000` | `.text`, `.rodata`, `.data`, `.bss` |
-| `0x08000000` | Normal heap (`malloc`/`new`) |
-| `0x10000000 - stack` | Main-thread stack. AC3DS sets `__stacksize__ = 1 MB`. |
+| `0x08000000` - `0x08100000` | Main-thread stack: libctru places it in the first `__stacksize__` bytes of the heap mapping (AC3DS sets 1 MB), growing down from `0x08100000`. Crash reports show `sp` just below that. |
+| `0x08100000` upward | Normal heap (`malloc`/`new`), after the main-thread stack. `malloc` returns 32-byte aligned blocks from 32 bytes up; AC3DS serves blocks up to 512 bytes from its own pool. |
 | `0x14000000` or `0x30000000` | LINEAR heap: physically contiguous and GPU-addressable. The New kernel maps up to 256 MB at `0x30000000`. |
 | `0x1F000000` | VRAM mapping |
 
 **For AC3DS:**
+- The binary must not be position-independent. A `.3dsx` carries absolute and relative relocations only; GOT-relative references (`-fPIC`/`-fPIE`) are dropped by `3dsxtool`, and the program then only runs when the loader keeps the linked distance between code and data. The build forces this off and checks the ELF.
 - `__ctru_linear_heap_size = 48 MB` (`source/3ds/system.cpp`). Everything the GPU reads must live in the linear heap or VRAM: vertex and index buffers, textures, command lists. Normal heap memory isn't physically contiguous and isn't GPU-addressable.
 - If the takeover title only grants 64 MB, a 48 MB linear heap leaves about 16 MB for code, heap and stacks, and the game won't fit. Check the startup `memory:` line in each handheld log.
 - The GPU addresses memory physically, `>> 3`, in 28 bits. Citro3D's `C3D_BufInfo` base must sit at or below the lowest buffer, and every offset must fit in 28 bits. The port uses `OS_FCRAM_PADDR` as the base.
@@ -77,7 +78,7 @@ An application gets the larger New-model regions only when its exheader asks for
 
 - **Vertex stage:** three programmable vertex processors plus a geometry-shader unit (which can act as a fourth). The shaders use one ISA, assembled by Picasso. Limits: 96 float vec4 uniforms, 4 int and 16 bool uniforms, up to 16 input attributes (12 vertex arrays), and 7 output registers mapped to fixed semantics (position, color, texcoord0–2, texcoord0.w, normquat, view).
 - **Fixed-function fragment stage:** 6 texture-combiner (TEV) stages plus a combiner buffer, per-fragment lighting with lookup tables, fog, alpha/stencil/depth tests and blending. There are no fragment shaders.
-- **Fog:** a 128-entry table (value plus delta) indexed by the stored depth, after the depth map and any W-buffering. With a hyperbolic Z-buffer and a small near plane, almost every distance falls into the first entry, so the port uses the W-buffer (linear depth) for perspective draws.
+- **Fog:** a 128-entry table (value plus delta) indexed by the stored depth, after the depth map and any W-buffering. With a hyperbolic Z-buffer and a small near plane, almost every distance falls into the first entry. Build 11 used the W-buffer (linear depth) to fix that. A see-through-walls report on the New 2DS XL followed; whether the W-buffer caused it was never isolated (Azahar never showed it). From build 12 depth stays on the Z-buffer and fog is per pixel: texcoord2 carries eye distance, the procedural texture unit (unit 3) turns it into the fog amount, and a combiner stage mixes in the fog colour.
 - **Texture units:** units 0–2 are normal. Unit 0 alone can do cube maps, shadow maps and projective lookups. Unit 3 is procedural only.
 - **Textures:** each dimension is a power of two from 8 to 1024. Texels are stored in 8×8 Morton-tiled blocks. Formats: RGBA8, RGB8, RGBA5551, RGB565, RGBA4, IA8, HILO8, I8, A8, IA4, I4, A4, ETC1, and ETC1A4.
 - **Render targets:** color in RGBA8, RGB8, RGB565, RGB5A1 or RGBA4. Depth in D16, D24 or D24S8. Framebuffers are stored rotated 90° (240×400 for the top screen) and tiled. The transfer engine detiles them into the LCD framebuffers.

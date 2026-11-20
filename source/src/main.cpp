@@ -938,10 +938,12 @@ bool interceptkey(int sym)
 {
 #ifdef __3DS__
     if(!ac3ds_main_loop()) return sym == SDLK_ESCAPE;
-    ac3ds_poll_input();
 #endif
     static int lastintercept = SDLK_UNKNOWN;
     int len = lastintercept == sym ? events.length() : 0;
+#ifdef __3DS__
+    ac3ds_poll_input(); // after len: the button events queued here are the ones to scan below
+#endif
     SDL_Event event;
     while(SDL_PollEvent(&event)) switch(event.type)
     {
@@ -1701,7 +1703,7 @@ int main(int argc, char **argv)
         while(aptMainLoop()) svcSleepThread(100000000);
         return false;
     };
-    ac3ds_gl_set_command_dumps(6);
+    ac3ds_gl_set_command_dumps(8);
     ac3ds_gl_startup_clear();
     if(!awaitStartupGpu("clear","Screen clear did not finish.")) return EXIT_FAILURE;
     ac3ds_draw_controls();
@@ -1711,25 +1713,56 @@ int main(int argc, char **argv)
     if(!awaitStartupGpu("minimal draw","A plain triangle does not complete.")) return EXIT_FAILURE;
     ac3ds_gl_startup_draw();
     if(!awaitStartupGpu("game shader draw","The game vertex path stalls.")) return EXIT_FAILURE;
+    // Optional GPU features get a guarded check. The marker file reads
+    // "pending" while the check runs; if a launch stops inside it, the next
+    // launch finds that, records "off" and runs with the fallback. Deleting
+    // the marker retries the check. A pass is recorded with the build number
+    // and only trusted by that build, since a new build can change what the
+    // check draws.
+    auto guardedCheck = [&](const char *marker, void (*probe)(), const char *stage, const char *meaning) -> int
     {
-        // The projection program is only needed for water. If a launch stops
-        // inside its check, the next launch runs without it.
-        const char *marker = "sdmc:/3ds/assaultcube/profile/gpu-projective.txt";
         char previous[16] = "";
         if(FILE *f = fopen(marker,"r")) { if(!fgets(previous,sizeof(previous),f)) previous[0] = 0; fclose(f); }
         auto mark = [marker](const char *state) { if(FILE *f = fopen(marker,"w")) { fputs(state,f); fclose(f); } };
         if(!strncmp(previous,"pending",7) || !strncmp(previous,"off",3))
         {
             if(previous[0] == 'p') mark("off");
+            return 0;
+        }
+        defformatstring(passed)("ok %d", AC3DS_BUILD_NUMBER);
+        const bool known = !strcmp(previous, passed);
+        if(!known) mark("pending");
+        probe();
+        if(!awaitStartupGpu(stage,meaning)) return -1;
+        if(!known) mark(passed);
+        return 1;
+    };
+    // The projection program is only needed for water.
+    switch(guardedCheck("sdmc:/3ds/assaultcube/profile/gpu-projective.txt", ac3ds_gl_probe_projective,
+                        "projection draw", "Restart: water will use the fallback."))
+    {
+        case -1: return EXIT_FAILURE;
+        case 0:
             ac3ds_gl_set_projective(false);
             clientlogf("init: projection textures disabled after an earlier stalled check");
-        }
-        else
+            break;
+    }
+    // Per-pixel fog uses the procedural texture unit, which nothing else in
+    // the port touches. The fallback is build 11's rendering: the GPU fog
+    // table over linear depth.
+    switch(guardedCheck("sdmc:/3ds/assaultcube/profile/gpu-pixelfog.txt", ac3ds_gl_probe_fog,
+                        "fog draw", "Restart: fog will use the GPU table."))
+    {
+        case -1: return EXIT_FAILURE;
+        case 0:
         {
-            if(strncmp(previous,"ok",2)) mark("pending");
-            ac3ds_gl_probe_projective();
-            if(!awaitStartupGpu("projection draw","Restart: water will use the fallback.")) return EXIT_FAILURE;
-            if(strncmp(previous,"ok",2)) mark("ok");
+            extern int ac3dspixelfog, ac3dslineardepth;
+            ac3dspixelfog = 0;
+            ac3dslineardepth = 1;
+            ac3ds_gl_set_pixel_fog(false);
+            ac3ds_gl_set_linear_depth(true);
+            clientlogf("init: per-pixel fog disabled after an earlier stalled check (delete profile/gpu-pixelfog.txt to retry)");
+            break;
         }
     }
 #endif
@@ -1956,6 +1989,26 @@ int main(int argc, char **argv)
         audioPhase.stop();
         Ac3dsPhaseTimer rayPhase(Ac3dsPhase::Rays);
         AC3DS_PHASE("ray table");
+        {
+            // A benchmark never runs on a server: put its settings back at once.
+            extern bool ac3dsbenchleft();
+            extern void ac3dsbenchend(const char *how);
+            if(ac3dsbenchleft()) ac3dsbenchend("cancelled");
+            // Benchmark aid: turn the view by a fixed step every frame.
+            extern float ac3dsautoturn;
+            if(ac3dsautoturn && !multiplayer(NULL) && player1->state == CS_ALIVE)
+            {
+                player1->yaw += ac3dsautoturn;
+                while(player1->yaw >= 360) player1->yaw -= 360;
+            }
+        }
+        // Pick this frame's camera before tracing occlusion rays from it.
+        // gl_drawframe() only switches to the death, follow or fly camera
+        // later, so the table used to describe the previous viewpoint: one
+        // frame without the facing walls on every death and respawn, and a
+        // band of missing world while a followed player turns.
+        extern void recomputecamera();
+        recomputecamera();
 #endif
         computeraytable(camera1->o.x, camera1->o.y, dynfov());
 #ifdef __3DS__
@@ -2005,6 +2058,10 @@ int main(int argc, char **argv)
 #endif
 #ifdef __3DS__
         AC3DS_PHASE("frame end");
+        {
+            extern void ac3ds_world_batches_frame_end();
+            ac3ds_world_batches_frame_end();
+        }
         if(frames <= 6)
         {
             // Progress marks for handheld runs, flushed so a hang leaves a trace.
@@ -2015,7 +2072,7 @@ int main(int argc, char **argv)
         {
             // The first seconds of a match (bot spawn, waypoint flood, first
             // draws): flushed, so a crash there is pinned down.
-            char memory[128];
+            char memory[224];
             ac3ds_memory_line(memory, sizeof(memory));
             clientlogf("frame %d done (%d ms) after load: %s", frames, elapsed, memory);
             if(clientlogfile) clientlogfile->fflush();
@@ -2024,7 +2081,7 @@ int main(int argc, char **argv)
         {
             // Every 30 s: progress and memory, flushed so a crash mid-match
             // leaves the last state on the SD card (one small write).
-            char memory[128];
+            char memory[224];
             ac3ds_memory_line(memory, sizeof(memory));
             clientlogf("frame %d done (%d ms) %s %s", frames, elapsed, getclientmap(), memory);
             if(clientlogfile) clientlogfile->fflush();
@@ -2052,8 +2109,9 @@ COMMANDF(ac3dstap, "ii", (int *x, int *y) { extern void ac3ds_qa_tap(int, int); 
 // QA: put the player at x y z (a negative x keeps the position) facing yaw pitch.
 COMMANDF(ac3dspose, "fffff", (float *x, float *y, float *z, float *yaw, float *pitch)
 {
+    if(multiplayer("ac3dspose")) return; // QA teleports never run on a server
     if(*x >= 0) { player1->o = vec(*x, *y, *z); player1->vel = vec(0, 0, 0); player1->resetinterp(); }
-    player1->yaw = *yaw;
+    player1->yaw = *yaw - 360*floorf(*yaw/360); // the world LOD rectangle assumes 0..360
     player1->pitch = *pitch;
     clientlogf("qa: pose %.1f %.1f %.1f yaw %.0f pitch %.0f", player1->o.x, player1->o.y, player1->o.z, player1->yaw, player1->pitch);
 });

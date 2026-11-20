@@ -344,7 +344,7 @@ struct httpget
     httpget() { memset(&hostname, 0, sizeof(struct httpget)); tcp = ENET_SOCKET_NULL; reset(); }
     ~httpget() { reset(); DELSTRING(useragent); DELSTRING(referrer); DELETEP(outvec); DELETEP(outstream); }
     void reset(int keep = 0);                          // cleanup
-    bool set_host(const char *newhostname);            // set and resolve host
+    bool set_host(const char *newhostname, enet_uint32 knownip = 0); // set host; resolve it unless the caller already has its address
     void set_port(int port);                           // set port (disconnect, if different to previous)
     bool execcallback(float progress);
     void disconnect();
@@ -419,6 +419,7 @@ struct Texture
     bool mipmap, canreduce;
 #ifdef __3DS__
     bool evicted;
+    bool loadfailed; // the last reload failed; do not retry on every draw
 #endif
     GLuint id;
 };
