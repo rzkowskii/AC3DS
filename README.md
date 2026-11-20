@@ -178,6 +178,17 @@ To build the engine-only `.3dsx` used for releases, add `-DAC3DS_EMBED_ASSETS=OF
 - [Upstream release provenance](docs/release-evidence.md)
 - [Third-party notices](docs/third-party-notices.md)
 
+## Licensing and what is distributed
+
+I deliberately do not distribute a packaged build: no `.cia`, no `.3ds`, and no `.3dsx` with the game data inside. As I read AssaultCube's [license](docs/upstream/license.html), its media may only be redistributed inside the unmodified official package, and a 3DS package would be a modified one.
+
+- **What is here.** The source: the 1.3.0.2 code under its zlib-style license, with the notices kept and the changes marked as a port. The release adds an engine-only `.3dsx` with no maps, textures, models, sounds or configs in it.
+- **Where the game files come from.** You download the official v1.3.0.2 archive from [assaultcube/AC](https://github.com/assaultcube/AC) yourself. A small script checks its SHA-256 and copies the data folders to the SD card.
+- **Same game.** It is the stock 1.3.0.2 game: same rules, physics, netcode and protocol. The changes are platform ones only: OpenGL translated to the 3DS GPU through Citro3D, NDSP audio, button and touch input, and memory and loading work to fit the console. There is no aim assist or anything else gameplay-side, in line with the fair-play note in [source/README.txt](source/README.txt).
+- **Free and unofficial.** It is free and non-commercial, credits Rabid Viper Productions and the Cube authors, and is not an official port.
+
+If you are from the AssaultCube team and read any of this differently, or want something changed (the name, the screenshots, anything), open an issue and I will fix it.
+
 ## Credits and licensing
 
 AC-3DS is a port by [rzkowskii](https://github.com/rzkowskii). AssaultCube was created by Rabid Viper Productions and its contributors, building on the Cube engine by Wouter van Oortmerssen. This port is not affiliated with or endorsed by the AssaultCube team or Nintendo.
