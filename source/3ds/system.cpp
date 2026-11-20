@@ -178,8 +178,8 @@ namespace
         KEYCODE_FLAG, KEYCODE_SCREENSHOT, KEYCODE_WEAPONS, KEYCODE_NEXT,
         KEYCODE_PREV, KEYCODE_UNDO, KEYCODE_REDO, KEYCODE_DELETE, KEYCODE_EDITMENU,
         KEYCODE_RELOAD, KEYCODE_GRENADE, KEYCODE_SCOPE, KEYCODE_NEXTWEAPON,
-        KEYCODE_MATCHMENU, KEYCODE_SCORES, KEYCODE_JUMP,
-        KEYCODE_LAST = KEYCODE_JUMP
+        KEYCODE_MATCHMENU, KEYCODE_SCORES, KEYCODE_JUMP, KEYCODE_RESPAWN,
+        KEYCODE_LAST = KEYCODE_RESPAWN
     };
 
     struct Control
@@ -230,7 +230,8 @@ namespace
         {KEYCODE_NEXTWEAPON, "3DS_TOUCH_WEAPON", "shiftweapon 1", "", ""},
         {KEYCODE_MATCHMENU, "3DS_TOUCH_MENU", "ac3ds_pause_menu", "", ""},
         {KEYCODE_SCORES, "3DS_TOUCH_SCORES", "key_showscores", "", ""},
-        {KEYCODE_JUMP, "3DS_TOUCH_JUMP", "jump", "", ""} // double-tap on the match screen
+        {KEYCODE_JUMP, "3DS_TOUCH_JUMP", "jump", "", ""}, // double-tap on the match screen
+        {KEYCODE_RESPAWN, "3DS_TOUCH_RESPAWN", "attack", "", ""} // RESPAWN on the match screen while dead
     };
     static_assert(sizeof(controls) / sizeof(controls[0]) == KEYCODE_LAST - KEYCODE_A + 1,
                   "The default control table follows the native key code order.");
@@ -395,6 +396,9 @@ namespace
         bool active = false;
     } qa_touch;
 
+    // QA: a physical button held down by script until a deadline.
+    struct { u32 mask = 0; Uint32 until = 0; } qa_button;
+
     void reset_physical_input()
     {
         // Physical edges queued for the old menu cannot act in the new one.
@@ -482,6 +486,67 @@ namespace
             u16 *column = screen + x * touch_height;
             for(int y = y0; y < y1; ++y) column[touch_height - 1 - y] = color;
         }
+    }
+
+    // Lower-screen presentation. The screen is drawn on the CPU into libctru's
+    // two RGB565 buffers. A picture is always drawn into the buffer that is
+    // not on the LCD and then swapped in, which GSP does at the next VBlank,
+    // so the panel never scans out a half-drawn picture. Citro3D swaps only
+    // screens that have a render target linked to them, which is the top one;
+    // nothing here touches the top screen.
+    //
+    // The two buffers alternate, so the one bottom_begin() returns holds the
+    // picture from two presents ago, not the one on screen. Every caller
+    // therefore paints all 320x240 pixels before bottom_present(): menus, the
+    // loading screen and the reports start with a full fill, and the match
+    // screen starts with draw_radar(), which writes every pixel. There are no
+    // partial updates.
+    constexpr size_t bottom_bytes = touch_width * touch_height * sizeof(u16);
+    const u16 *bottom_shown = NULL; // the last picture handed to the LCD
+    u64 bottom_swap_tick = 0;
+    unsigned bottom_presents = 0;
+    // QA: fill each buffer with magenta, flushed, before it is drawn. Magenta
+    // in a capture means a path left pixels unpainted; a magenta flash on the
+    // console means a buffer was on the LCD while it was being drawn.
+    VAR(ac3dsbottomcheck, 0, 0, 1);
+
+    // The buffer to draw the next picture into, or NULL when it cannot be
+    // drawn yet. Until GSP has applied the last swap, the buffer libctru calls
+    // the back buffer is still the one on the LCD, so it is not handed out
+    // while that swap is pending. Per-frame callers leave their dirty state
+    // alone on NULL and try again next frame; callers that block anyway pass
+    // wait. A swap still pending after 100 ms is taken as lost (GSP applies
+    // none while the app is suspended) and drawing goes ahead.
+    u16 *bottom_begin(bool wait = false)
+    {
+        if(!gfx_ready) return NULL;
+        constexpr u64 patience = SYSCLOCK_ARM11 / 10;
+        while(gspIsPresentPending(GSP_SCREEN_BOTTOM) && svcGetSystemTick() - bottom_swap_tick < patience)
+        {
+            if(!wait) return NULL;
+            svcSleepThread(1000000LL);
+        }
+        u16 *screen = reinterpret_cast<u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
+        if(screen && ac3dsbottomcheck)
+        {
+            fill_rect(screen, 0, 0, touch_width, touch_height, RGB565(31, 0, 31));
+            GSPGPU_FlushDataCache(screen, bottom_bytes);
+        }
+        return screen;
+    }
+
+    // Hands a finished picture to the LCD. False if it could not be flushed
+    // out of the CPU cache: nothing is swapped then, and the caller redraws.
+    // A caller with no later frame to redraw in passes unflushed to swap anyway.
+    bool bottom_present(u16 *screen, bool unflushed = false)
+    {
+        const bool flushed = R_SUCCEEDED(GSPGPU_FlushDataCache(screen, bottom_bytes));
+        if(!flushed && !unflushed) return false;
+        gfxScreenSwapBuffers(GFX_BOTTOM, false);
+        bottom_shown = screen;
+        bottom_swap_tick = svcGetSystemTick();
+        ++bottom_presents;
+        return flushed;
     }
 
     void draw_label(u16 *screen, int x, int y, const char *label, u16 color,
@@ -660,10 +725,11 @@ const char *ac3ds_system_init()
     if(!(romfs_ready && select_assets("romfs:/")) && !select_assets(game_dir))
         return "AssaultCube assets were not found. Install the Lockdown Edition config and packages directories under /3ds/assaultcube.";
 
+    // Both screens stay double buffered (the gfxInit default). Citro3D presents
+    // the top one; the lower one is drawn and swapped by bottom_begin() and
+    // bottom_present() below.
     gfxInit(GSP_BGR8_OES, GSP_RGB565_OES, false);
     gfx_ready = true;
-    gfxSetDoubleBuffering(GFX_BOTTOM, false);
-    gfxScreenSwapBuffers(GFX_BOTTOM, false);
     if(R_SUCCEEDED(gspLcdInit()))
     {
         lcd_ready = R_SUCCEEDED(GSPLCD_GetBrightness(GSPLCD_SCREEN_TOP, &original_brightness));
@@ -805,6 +871,40 @@ void ac3ds_default_binds()
         bindc(control.code, control.spectator, keym::ACTION_SPECTATOR);
     }
     _defaultbinds = previous;
+}
+
+namespace
+{
+    // A physical button as the player knows it.
+    const char *button_label(int code)
+    {
+        switch(code)
+        {
+            case KEYCODE_UP: return "D-Pad Up";
+            case KEYCODE_DOWN: return "D-Pad Down";
+            case KEYCODE_LEFT: return "D-Pad Left";
+            case KEYCODE_RIGHT: return "D-Pad Right";
+            case KEYCODE_CPAD_UP: return "Circle Pad Up";
+            case KEYCODE_CPAD_DOWN: return "Circle Pad Down";
+            case KEYCODE_CPAD_LEFT: return "Circle Pad Left";
+            case KEYCODE_CPAD_RIGHT: return "Circle Pad Right";
+            default: return controls[code - KEYCODE_A].name + 4; // "3DS_L" -> "L"
+        }
+    }
+}
+
+const char *ac3ds_spectator_button(const char *action)
+{
+    for(const auto &button : buttons)
+    {
+        const keym *binding = findbindc(button.code);
+        if(!binding) continue;
+        // The binding execbind() runs for a dead or spectating player.
+        const char *bound = binding->actions[keym::ACTION_SPECTATOR][0] ? binding->actions[keym::ACTION_SPECTATOR] :
+                                                                           binding->actions[keym::ACTION_DEFAULT];
+        if(!strcmp(bound, action)) return button_label(button.code);
+    }
+    return NULL;
 }
 
 int ac3ds_menu_key(int code)
@@ -966,6 +1066,18 @@ namespace
     };
     u64 vote_shown_tick = 0;
     const void *vote_shown_for = NULL;
+
+    // RESPAWN, across the middle of the map while the player is dead or
+    // spectating. It presses a key bound to the fire action, so a tap does
+    // exactly what the fire button does and the game's own rules (the wait,
+    // arena rounds, one request a second) decide the outcome.
+    const HudButton respawn_button = {16, 92, 304, 148, KEYCODE_RESPAWN, "", true};
+
+    int respawn_state()
+    {
+        int secs;
+        return player1 ? respawnstatus(secs) : RS_NONE;
+    }
 
     bool vote_pending()
     {
@@ -1243,7 +1355,58 @@ namespace
         }
     }
 
-    // The whole match screen: map, then the overlays.
+    void draw_respawn(u16 *screen)
+    {
+        int secs = 0;
+        const int state = player1 ? respawnstatus(secs) : RS_NONE;
+        if(state == RS_NONE) return;
+        const bool ready = state == RS_READY || state == RS_JOIN; // a tap does something now
+        string title, hint = "";
+        switch(state)
+        {
+            case RS_WAIT: formatstring(title)("RESPAWN IN %d", secs); break;
+            case RS_READY:
+            case RS_JOIN:
+            {
+                copystring(title, state == RS_JOIN ? "TAP TO JOIN" : "TAP TO RESPAWN");
+                const char *fire = ac3ds_spectator_button("attack");
+                if(fire) formatstring(hint)("or press %s", fire);
+                break;
+            }
+            case RS_SENT: copystring(title, "RESPAWNING"); break;
+            case RS_ROUND:
+                copystring(title, "ROUND IN PROGRESS");
+                copystring(hint, "You respawn next round");
+                break;
+            case RS_NEXTROUND: formatstring(title)("NEXT ROUND IN %d", secs); break;
+            default:
+                copystring(title, "PLEASE WAIT");
+                copystring(hint, spawnpermission == SP_WRONGMAP ? "Waiting for the map" : "Waiting for the server");
+                break;
+        }
+        const HudButton &b = respawn_button;
+        if(ready)
+        {
+            // Lit and solid, so it cannot be mistaken for the dim countdown.
+            fill_rect(screen, b.x0, b.y0, b.x1, b.y1, accent);
+            fill_rect(screen, b.x0 + 3, b.y0 + 3, b.x1 - 3, b.y1 - 3,
+                      pressed_hud_code == b.code ? RGB565(13, 33, 11) : RGB565(6, 17, 8));
+        }
+        else
+        {
+            shade_rect(screen, b.x0 + 2, b.y0 + 2, b.x1 - 2, b.y1 - 2, RGB565(1, 4, 2));
+            shade_rect(screen, b.x0 + 2, b.y0 + 2, b.x1 - 2, b.y1 - 2, RGB565(1, 4, 2));
+            frame_rect(screen, b.x0, b.y0, b.x1, b.y1, surface);
+        }
+        const u16 color = ready ? text : muted;
+        const int cx = (b.x0 + b.x1) / 2;
+        draw_label_large(screen, cx - 8 * int(strlen(title)), b.y0 + (hint[0] ? 12 : 20), title, color);
+        if(hint[0]) draw_label(screen, cx - 4 * int(strlen(hint)), b.y0 + 36, hint, color, b.x1);
+    }
+
+    // The whole match screen: map, then the overlays. draw_radar() writes
+    // every pixel, which is what lets this draw into either buffer without a
+    // fill first.
     void draw_match_screen(u16 *screen)
     {
         draw_radar(screen);
@@ -1255,17 +1418,21 @@ namespace
             const bool armed = vote_armed();
             for(const HudButton &b : vote_buttons) draw_hud_button(screen, b, armed, false);
         }
+        draw_respawn(screen);
         draw_drawer(screen);
     }
 
-    // Advances the drawer slide; true while it is still moving.
-    bool animate_drawer()
+    bool drawer_moving()
+    {
+        return drawer_offset != (drawer_open ? 0 : -drawer_width);
+    }
+
+    // Advances the drawer slide by one drawn frame.
+    void animate_drawer()
     {
         const int target = drawer_open ? 0 : -drawer_width;
-        if(drawer_offset == target) return false;
         const int step = 31; // about 4 frames end to end
         drawer_offset = drawer_offset < target ? min(target, drawer_offset + step) : max(target, drawer_offset - step);
-        return true;
     }
 
     // Handles a new touch on the match screen. Returns the key code to press
@@ -1287,6 +1454,9 @@ namespace
         }
         if(tab_hit(t)) { drawer_open = true; return 0; }
         if(vote_armed()) for(const HudButton &b : vote_buttons) if(hit(b, t)) return b.code;
+        // Too early or in an arena round, the tap still goes to the game, which
+        // answers as it does for the fire button.
+        if(respawn_state() != RS_NONE && hit(respawn_button, t)) return KEYCODE_RESPAWN;
         for(const HudButton &b : hud_buttons)
         {
             if(!hit(b, t)) continue;
@@ -1428,6 +1598,21 @@ void ac3ds_qa_touch(int x, int y, int presses, int hold_ms, int gap_ms)
     qa_touch.active = true;
 }
 
+// QA: hold the named physical button (3DS_L, ...) for hold_ms, through the
+// same edge detection, input context and menu handling as a real press.
+void ac3ds_qa_button(const char *name, int hold_ms)
+{
+    for(const auto &button : buttons)
+    {
+        if(strcmp(controls[button.code - KEYCODE_A].name, name)) continue;
+        qa_button.mask = button.mask;
+        qa_button.until = SDL_GetTicks() + Uint32(max(1, hold_ms));
+        return;
+    }
+    conoutf("no button named %s", name);
+}
+COMMANDF(ac3dsqabutton, "si", (char *name, int *hold) { ac3ds_qa_button(name, *hold); });
+
 bool ac3ds_minimap_info(unsigned &tex, float &x0, float &y0, float &span);
 
 void ac3ds_minimap_updated()
@@ -1509,6 +1694,11 @@ void ac3ds_poll_input()
         }
     }
     if(qa_pressed) held |= KEY_TOUCH;
+    if(qa_button.mask)
+    {
+        if(Sint32(SDL_GetTicks() - qa_button.until) < 0) held |= qa_button.mask;
+        else qa_button.mask = 0;
+    }
     if(dedicated_display)
     {
         if((held & KEY_B) && !(held_buttons & KEY_B)) push_key(KEYCODE_B, true);
@@ -1558,7 +1748,6 @@ void ac3ds_poll_input()
                 bool aim = false;
                 touch_key = match_touch(touch, aim);
                 touch_aim = aim && touchaim;
-                controls_dirty = true;
                 if(touch_key)
                 {
                     touch_key_context = button_context;
@@ -1677,66 +1866,44 @@ void ac3ds_draw_controls()
                           player1 && player1->isspectating() ? keym::ACTION_SPECTATOR : keym::ACTION_DEFAULT;
     Ac3dsMenuView menu;
     if(panel == MENU_PANEL) ac3ds_menu_view(menu);
+    // Change key: what the picture depends on besides the moving map. The
+    // match screen shows no weapon or ammo text, so neither is in it and a
+    // shot does not force a redraw.
     string status = "";
-    if(panel == GAME_PANEL && player1)
-    {
-        extern int paused;
-        if(watchingdemo) copystring(status, "Demo playback");
-        else if(paused) copystring(status, "Match paused");
-        else if(player1->isspectating()) copystring(status, "Spectating");
-        else if(player1->state == CS_ALIVE && player1->weaponsel)
-        {
-            const weapon &gun = *player1->weaponsel;
-            const bool reloading = gun.reloading && lastmillis < gun.reloading + gun.info.reloadtime;
-            if(reloadable_gun(gun.type))
-                formatstring(status)("%s  %s%d/%d", gun.info.title, reloading ? "Reloading  " : "", gun.mag, gun.ammo);
-            else if(gun.type == GUN_GRENADE) formatstring(status)("%s  %d", gun.info.title, gun.mag);
-            else copystring(status, gun.info.title);
-        }
-        else copystring(status, "Match");
-    }
-
     if(panel == SERVER_PANEL) server_panel_status(status, sizeof(status));
-    // Button enable states are part of the match screen's look.
     if(panel == GAME_PANEL)
     {
-        concatstring(status, "|");
         for(const HudButton &b : hud_buttons)
             concatstring(status, hud_button_enabled(b.code) ? (pressed_hud_code == b.code ? "P" : "1") : "0");
         concatstring(status, reloading_now() ? "R" : "");
         concatstring(status, vote_pending() ? (vote_armed() ? "V" : "v") : "");
         concatstring(status, map_overview ? "M" : "");
-        defformatstring(drawer)("D%d%d", drawer_open ? 1 : 0, pressed_hud_code);
-        concatstring(status, drawer);
+        // The respawn countdown itself rides on the ten-a-second map refresh.
+        defformatstring(state)("D%d%dS%d", drawer_open ? 1 : 0, pressed_hud_code, respawn_state());
+        concatstring(status, state);
     }
     const bool unchanged = !controls_dirty && drawn_panel == panel && drawn_bind_type == bind_type &&
        drawn_touch_aim == touchaim && !strcmp(status, drawn_status) &&
        (panel != MENU_PANEL || same_menu_view(menu, drawn_menu));
     const u64 now_tick = svcGetSystemTick();
-    if(unchanged)
-    {
-        // The map moves: refresh it ten times a second, every frame while the
-        // drawer slides.
-        if(panel != GAME_PANEL) return;
-        const bool sliding = animate_drawer();
-        if(!sliding && now_tick - radar_drawn_tick < SYSCLOCK_ARM11 / 10) return;
-        u16 *screen = reinterpret_cast<u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
-        if(!screen) return;
-        draw_match_screen(screen);
-        radar_drawn_tick = now_tick;
-        GSPGPU_FlushDataCache(screen, touch_width * touch_height * sizeof(*screen));
+    // An unchanged menu keeps its picture. The map moves: refresh it ten times
+    // a second, every frame while the drawer slides.
+    if(unchanged && (panel != GAME_PANEL || (!drawer_moving() && now_tick - radar_drawn_tick < SYSCLOCK_ARM11 / 10)))
         return;
-    }
-    u16 *screen = reinterpret_cast<u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
+    // Nothing is recorded as drawn until the picture is presented, so a frame
+    // skipped here (the last swap has not reached the LCD) is retried on the
+    // next one with the same dirty state.
+    u16 *screen = bottom_begin();
     if(!screen) return;
-    fill_rect(screen, 0, 0, touch_width, touch_height, background);
+
+    // The match screen's map covers every pixel, so it needs no clear.
+    if(panel != GAME_PANEL) fill_rect(screen, 0, 0, touch_width, touch_height, background);
 
     if(panel == MENU_PANEL) draw_handheld_menu(screen, menu);
     else if(panel == GAME_PANEL)
     {
         animate_drawer();
         draw_match_screen(screen);
-        radar_drawn_tick = now_tick;
     }
     else if(panel == SERVER_PANEL) draw_server_panel(screen);
     else
@@ -1795,7 +1962,13 @@ void ac3ds_draw_controls()
                             cell_width - 3, cell_height - 3, label);
             }
     }
-    controls_dirty = R_FAILED(GSPGPU_FlushDataCache(screen, touch_width * touch_height * sizeof(*screen)));
+    if(!bottom_present(screen))
+    {
+        controls_dirty = true;
+        return;
+    }
+    controls_dirty = false;
+    if(panel == GAME_PANEL) radar_drawn_tick = now_tick;
     drawn_panel = panel;
     drawn_bind_type = bind_type;
     drawn_menu = menu;
@@ -1811,14 +1984,14 @@ void ac3ds_controls_changed()
 void ac3ds_draw_server_controls()
 {
     dedicated_display = true;
-    u16 *screen = reinterpret_cast<u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
+    u16 *screen = bottom_begin(true);
     if(!screen) return;
     fill_rect(screen, 0, 0, touch_width, touch_height, RGB565(2, 5, 3));
     fill_rect(screen, 0, 0, touch_width, 26, RGB565(4, 13, 7));
     draw_label(screen, 12, 9, "ASSAULTCUBE", RGB565(25, 60, 19));
     draw_label(screen, 12, 51, "Dedicated server", RGB565(29, 58, 29));
     draw_label(screen, 12, 79, "Press B or START to stop.", RGB565(20, 42, 21));
-    GSPGPU_FlushDataCache(screen, touch_width * touch_height * sizeof(*screen));
+    bottom_present(screen);
 }
 
 
@@ -1837,11 +2010,15 @@ void ac3ds_loading_screen(const char *title, const char *stage, float progress)
     const u64 now = svcGetSystemTick();
     if(!changed && percent == loading_percent) return;
     if(!changed && now - loading_drawn_tick < SYSCLOCK_ARM11 / 30) return; // at most 30 redraws a second
+    // A new title or stage waits out a swap still on its way to the LCD. A
+    // progress step does not hold up the load: it is dropped, with nothing
+    // recorded, and the next step draws.
+    u16 *screen = bottom_begin(changed);
+    if(!screen && !changed) return;
     if(title) copystring(loading_title, title, sizeof(loading_title));
     if(stage) copystring(loading_stage, stage, sizeof(loading_stage));
     loading_percent = percent;
     loading_drawn_tick = now;
-    u16 *screen = reinterpret_cast<u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
     if(!screen) return;
     fill_rect(screen, 0, 0, touch_width, touch_height, background);
     fill_rect(screen, 0, 0, touch_width, 34, surface);
@@ -1859,7 +2036,7 @@ void ac3ds_loading_screen(const char *title, const char *stage, float progress)
     snprintf(pct, sizeof(pct), "%d%%", percent);
     draw_label(screen, x1 - 8 * int(strlen(pct)), 148, pct, muted);
     draw_label(screen, 16, 212, "The first load of a map takes longest.", muted);
-    GSPGPU_FlushDataCache(screen, touch_width * touch_height * sizeof(*screen));
+    bottom_present(screen);
     // QA: capture one loading frame when sdmc:/3ds/assaultcube/qa-loadshot exists.
     static int qaload = -1;
     if(qaload < 0) { struct stat st; qaload = stat("sdmc:/3ds/assaultcube/qa-loadshot", &st) == 0; }
@@ -1874,10 +2051,13 @@ void ac3ds_loading_screen(const char *title, const char *stage, float progress)
 bool ac3ds_save_bottom_screen(const char *path)
 {
     // The lower framebuffer is RGB565, stored as 320 columns of 240 pixels
-    // bottom-to-top. Writes a 24-bit BMP for QA captures.
-    const u16 *screen = reinterpret_cast<const u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
+    // bottom-to-top. Writes a 24-bit BMP for QA captures. The picture saved is
+    // the one last presented, which is the one on the LCD (or about to be, at
+    // the next VBlank); the other buffer holds the picture before it.
+    const u16 *screen = bottom_shown;
     FILE *f = screen ? fopen(path, "wb") : NULL;
     if(!f) return false;
+    clientlogf("lower screen: capturing buffer %08x, present %u", unsigned(uintptr_t(screen)), bottom_presents);
     const int w = touch_width, h = touch_height, row = w * 3, size = 54 + row * h;
     u8 header[54] = { 'B', 'M' };
     auto put32 = [&](int at, u32 v) { for(int i = 0; i < 4; ++i) header[at + i] = u8(v >> (8 * i)); };
@@ -1908,16 +2088,24 @@ void ac3ds_loading_done()
 
 void ac3ds_show_startup_report(const char *const *lines, int count)
 {
-    // Software-drawn, so it stays readable when the GPU path has stopped.
-    u16 *screen = reinterpret_cast<u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
-    if(!screen) return;
-    fill_rect(screen, 0, 0, touch_width, touch_height, background);
-    fill_rect(screen, 0, 0, touch_width, 29, surface);
-    fill_rect(screen, 0, 28, touch_width, 29, border);
-    draw_label(screen, 10, 10, "AssaultCube startup check", text);
-    for(int i = 0; i < count && i < 16; ++i)
-        draw_label(screen, 6, 38 + i * 12, lines[i], i ? muted : accent);
-    GSPGPU_FlushDataCache(screen, touch_width * touch_height * sizeof(*screen));
+    // Software-drawn, so it stays readable when the GPU path has stopped. It
+    // is shown when something has already gone wrong, so it does not count on
+    // the swap being applied: the report goes into both buffers. The second
+    // copy lands in the one the swap took off the LCD or, if the swap never
+    // happens, in the one still on it.
+    for(int pass = 0; pass < 2; ++pass)
+    {
+        u16 *screen = bottom_begin(true);
+        if(!screen) break;
+        fill_rect(screen, 0, 0, touch_width, touch_height, background);
+        fill_rect(screen, 0, 0, touch_width, 29, surface);
+        fill_rect(screen, 0, 28, touch_width, 29, border);
+        draw_label(screen, 10, 10, "AssaultCube startup check", text);
+        for(int i = 0; i < count && i < 16; ++i)
+            draw_label(screen, 6, 38 + i * 12, lines[i], i ? muted : accent);
+        if(pass) GSPGPU_FlushDataCache(screen, bottom_bytes);
+        else bottom_present(screen, true);
+    }
     controls_dirty = true;
 }
 

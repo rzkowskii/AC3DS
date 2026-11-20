@@ -617,6 +617,11 @@ int lastspawnattempt = 0;
 void showrespawntimer()
 {
     if(intermission || ispaused || spawnpermission > SP_OK_NUM) return;
+#ifdef __3DS__
+    // The respawn prompt (respawnstatus) counts down for a dead player; the
+    // dotted line would only repeat it. Survivors of an arena round keep it.
+    if(player1->state == CS_DEAD || player1->state == CS_SPECTATE) return;
+#endif
     if(m_arena)
     {
         if(!arenaintermission) return;
@@ -852,8 +857,12 @@ bool tryrespawn()
                 player1->attacking = false;
                 if(m_arena)
                 {
+#ifdef __3DS__
+                    lastspawnattempt = lastmillis; // the respawn prompt already says to wait: flash it
+#else
                     if(!arenaintermission) hudeditf(HUDMSG_TIMER, "waiting for new round to start...");
                     else lastspawnattempt = lastmillis;
+#endif
                     return false;
                 }
                 if (lastmillis > waiting_permission)
@@ -869,6 +878,33 @@ bool tryrespawn()
     }
     return false;
 }
+
+#ifdef __3DS__
+// What fire would do for player1 now, for the respawn prompt on both screens.
+// Mirrors the checks in attack() and tryrespawn(); keep the three in step.
+int respawnstatus(int &secs)
+{
+    secs = 0;
+    if(intermission || ispaused || editmode || watchingdemo) return RS_NONE;
+    if(player1->state != CS_DEAD && player1->state != CS_SPECTATE) return RS_NONE;
+    if(spawnpermission > SP_OK_NUM) return RS_BLOCKED;
+    if(team_isspect(player1->team)) return RS_JOIN;
+    if(m_arena)
+    {
+        if(!arenaintermission) return RS_ROUND;
+        secs = clamp((arenaintermission + 5000 - lastmillis + 999) / 1000, 1, 5);
+        return RS_NEXTROUND;
+    }
+    const int left = player1->lastdeath + (m_flags_ ? 5000 : 2000) - lastmillis;
+    if(left >= 0)
+    {
+        secs = max(1, (left + 999) / 1000);
+        return RS_WAIT;
+    }
+    // Only a request that goes to a server can be left waiting for an answer.
+    return m_mp(gamemode) && lastmillis <= waiting_permission ? RS_SENT : RS_READY;
+}
+#endif
 
 VARP(hitsound, 0, 0, 2);
 

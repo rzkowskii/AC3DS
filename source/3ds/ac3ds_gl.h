@@ -186,6 +186,12 @@ void ac3ds_gl_startup_state(uint32_t out[6]);
 bool ac3ds_gl_queue_readback_565(GLuint id, uint16_t **out, int *outw, int *outh);
 bool ac3ds_gl_drain_startup_frame(uint32_t &gpuStatus, int32_t &readResult);
 void ac3ds_gl_set_late_vblank(bool enabled);
+// Hold a frame back until the previous one has reached the screen, so a quick
+// frame after a late one neither tears nor replaces it unseen.
+void ac3ds_gl_set_present_guard(bool enabled);
+// Hud gun pass: whether it takes the per-pixel fog stage, and whether it gets
+// its own depth band in front of the world under the Z-buffer.
+void ac3ds_gl_set_gun_isolation(bool fog, bool band);
 void ac3ds_gl_set_fast_vertex_offsets(bool enabled);
 void ac3ds_gl_set_shared_world_vertices(bool enabled);
 void ac3ds_gl_set_joined_water_commands(bool enabled);
@@ -193,6 +199,13 @@ void ac3ds_gl_collect_retired();
 void *ac3ds_gl_proc(const char *);
 bool ac3ds_gl_texture_ready(GLuint);
 bool ac3ds_gl_read_ok();
+// Diagnostic frame recorder: the right half of the finished top picture for a
+// run of consecutive gameplay frames, in the GPU's own tile order. State: 0
+// idle, 1 recording, 2 finishing, 3 ready. The data stays valid until freed.
+bool ac3ds_gl_burst_start(unsigned frames);
+int ac3ds_gl_burst_state();
+const void *ac3ds_gl_burst_data(unsigned *bytes);
+void ac3ds_gl_burst_free();
 void ac3ds_gl_stats(char *, unsigned);
 void ac3ds_gl_profile_start(unsigned intervals);
 void ac3ds_gl_profile_finish();

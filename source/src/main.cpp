@@ -1994,12 +1994,27 @@ int main(int argc, char **argv)
             extern bool ac3dsbenchleft();
             extern void ac3dsbenchend(const char *how);
             if(ac3dsbenchleft()) ac3dsbenchend("cancelled");
+            extern void ac3dsburstframe();
+            ac3dsburstframe();
             // Benchmark aid: turn the view by a fixed step every frame.
             extern float ac3dsautoturn;
+            extern int ac3dsautomove, ac3dsautostrafe;
             if(ac3dsautoturn && !multiplayer(NULL) && player1->state == CS_ALIVE)
             {
                 player1->yaw += ac3dsautoturn;
                 while(player1->yaw >= 360) player1->yaw -= 360;
+            }
+            static bool automoving = false;
+            if((ac3dsautomove || ac3dsautostrafe) && !multiplayer(NULL) && player1->state == CS_ALIVE)
+            {
+                player1->move = ac3dsautomove;
+                player1->strafe = ac3dsautostrafe;
+                automoving = true;
+            }
+            else if(automoving)
+            {
+                player1->move = player1->strafe = 0;
+                automoving = false;
             }
         }
         // Pick this frame's camera before tracing occlusion rays from it.

@@ -198,9 +198,25 @@ struct FrameProfile
 };
 FrameProfile profile;
 bool gameplayFrame = false;
-bool lateVblankRequested = false, lateVblankFrame = false;
+bool lateVblankRequested = false, lateVblankFrame = false, presentGuard = true;
 bool frameHasVblank = false, lastGameplayLate = false;
 bool readOkay = true, fullFlush = false;
+// Frame recorder (diagnostic): copies the right half of the finished top
+// picture, as the GPU left it, for a run of consecutive frames. The copy is a
+// queued GX command between the last command list and the display transfer,
+// like the aim-depth tile, so recording does not add a CPU/GPU barrier and
+// leaves the frame pacing it is meant to observe alone.
+constexpr unsigned burstTileRows = 25, burstFirstTileRow = 25, burstHeaderBytes = 4096;
+constexpr size_t burstFrameBytes = size_t(burstTileRows)*(screenH/8)*256;
+struct BurstMeta { u32 ms, barriers, presentWaits, vblank; };
+struct Burst
+{
+    u8 *data = nullptr;
+    unsigned frames = 0, captured = 0;
+    int state = 0; // 0 idle, 1 recording, 2 last copy queued, 3 ready
+    u64 startTick = 0;
+};
+Burst burst;
 C3D_Tex dummyUnit1{};
 size_t vused = 0, iused = 0, vflushed = 0, iflushed = 0;
 struct ModelVertexUpload
@@ -313,7 +329,7 @@ struct FogTable
 // below) no longer needs it, so the default is the Z-buffer builds 1-10 used.
 // Ortho, oblique (water clip) and other projections always use the Z-buffer.
 constexpr float worldDepthTop = .96f, gunDepthSpan = 32.f;
-bool linearDepth = false, hudGunDepth = false;
+bool linearDepth = false, hudGunDepth = false, gunBand = true;
 // Per-pixel fog that does not read the depth buffer. The vertex shader writes
 // u = .5 + .5*(e - start)/(end - start) to texcoord2, e = eye distance (exact
 // under perspective-correct interpolation). The procedural texture unit maps
@@ -330,7 +346,11 @@ C3D_ProcTexColorLut fogColorLut{};
 constexpr float fogCurveKnee = .5f;
 bool fogCurveReady = false;
 bool fogProcBound = false;
-bool pixelFogActive() { return fogOn && pixelFog; }
+// The hud gun pass takes no part in it: the gun is nearer than any fog start
+// AssaultCube produces, so the stage could only ever add zero, and leaving it
+// out removes the one thing builds 12-13 added to the gun's pixels.
+bool gunFog = false;
+bool pixelFogActive() { return fogOn && pixelFog && (gunFog || !hudGunDepth); }
 struct DepthMap
 {
     bool w = false, gun = false;
@@ -419,6 +439,7 @@ void retire()
     for(auto *v : retiredGeometry) linearFree(v);
     retiredGeometry.clear();
 }
+unsigned presentWaits = 0;
 u32 waitTopVblank()
 {
     Ac3dsPhaseTimer wait(Ac3dsPhase::VBlankWait);
@@ -427,6 +448,37 @@ u32 waitTopVblank()
     // GSP's event queue. Only the top-screen counter drives gameplay pace.
     while((slot = C3D_FrameCounter(0)) == lastTopVblank) gspWaitForAnyEvent();
     return slot;
+}
+// The display transfer writes to the buffer the last present swapped away
+// from, and GSP only takes a present at a VBlank. If a late frame is followed
+// by a quick one, that buffer is still on screen when the quick frame's
+// transfer lands: the picture tears, and the late frame is never shown because
+// its present is replaced before the VBlank. So a finished frame waits here
+// for the previous one to be taken.
+//
+// A frame held this way is submitted on the VBlank, and the next one starts at
+// once: frames are then paced by this wait instead of the one at frame start.
+// That keeps one new picture per refresh when frames are close to a refresh
+// long, at the price of showing each a little later. Once frames have had time
+// to spare for a while that price buys nothing, so the next frame is put back
+// on the frame-start wait.
+unsigned heldRun = 0;
+void waitTopPresented()
+{
+    if(!presentGuard) return;
+    if(!gspIsPresentPending(GSP_SCREEN_TOP)) { heldRun = 0; return; }
+    Ac3dsPhaseTimer wait(Ac3dsPhase::VBlankWait);
+    const u64 began = svcGetSystemTick();
+    const u32 slot = C3D_FrameCounter(0);
+    while(gspIsPresentPending(GSP_SCREEN_TOP) && C3D_FrameCounter(0) == slot) gspWaitForAnyEvent();
+    ++presentWaits;
+    // Idle for over a third of a refresh, eight frames running.
+    heldRun = svcGetSystemTick()-began > SYSCLOCK_ARM11/180 ? heldRun+1 : 0;
+    if(heldRun >= 8)
+    {
+        lastTopVblank = C3D_FrameCounter(0);
+        heldRun = 0;
+    }
 }
 bool startFrame(bool sync)
 {
@@ -449,6 +501,7 @@ bool startFrame(bool sync)
     if(sync) lastTopVblank = C3D_FrameCounter(0);
     frameHasVblank = sync;
     frame = true;
+    if(burst.state == 2) burst.state = 3; // the queue holding the last copy has drained
     retire();
     // APT restore can dirty Citro3D's saved loader state. Re-establish the
     // complete buffer description before using offset-only updates.
@@ -498,6 +551,30 @@ void splitFrame()
 {
     flushData();
     C3D_FrameSplit(submitFlags);
+}
+void queueBurstFrame()
+{
+    if(burst.state != 1 || !burst.data || target != top) return;
+    u8 *out = burst.data+burstHeaderBytes+burst.captured*burstFrameBytes;
+    const auto *color = static_cast<const u32 *>(top->frameBuf.colorBuf);
+    const size_t offset = size_t(burstFirstTileRow)*(screenH/8)*64;
+    // Close the list first so the copy sees the whole frame.
+    splitFrame();
+    ++queuedGx;
+    if(R_FAILED(GSPGPU_FlushDataCache(out,burstFrameBytes)) ||
+       R_FAILED(GX_TextureCopy(const_cast<u32 *>(color+offset),0,reinterpret_cast<u32 *>(out),0,burstFrameBytes,8)))
+    {
+        burst.frames = burst.captured;
+        burst.state = 2;
+        return;
+    }
+    BurstMeta meta;
+    meta.ms = u32((svcGetSystemTick()-burst.startTick)*1000/SYSCLOCK_ARM11);
+    meta.barriers = currentCounters.barriers;
+    meta.presentWaits = presentWaits;
+    meta.vblank = C3D_FrameCounter(0);
+    std::memcpy(burst.data+64+burst.captured*sizeof(BurstMeta),&meta,sizeof(meta));
+    if(++burst.captured == burst.frames) burst.state = 2;
 }
 void recycleFrame()
 {
@@ -751,8 +828,21 @@ DepthMap depthMapFor(const Mat &p)
     const float *a = p.a;
     // Only a plain glFrustum (optionally with a scaled z row, as the hud gun
     // uses): w = e, and PICA clip z' = alpha*e + beta.
-    if(!linearDepth || a[11] != -1.f || a[3] != 0 || a[7] != 0 || a[15] != 0 ||
+    if(a[11] != -1.f || a[3] != 0 || a[7] != 0 || a[15] != 0 ||
        a[2] != 0 || a[6] != 0 || a[14] == 0) return d;
+    if(!linearDepth)
+    {
+        // Z-buffer: the world keeps the default map. The gun's own depth,
+        // .25 to 1 under that map, is squeezed into the top band so nothing
+        // drawn with the world map can cover it short of the near plane.
+        if(hudGunDepth && gunBand)
+        {
+            d.gun = true;
+            d.scale = -(1.f-worldDepthTop);
+            d.offset = worldDepthTop;
+        }
+        return d;
+    }
     const float alpha = -(a[10]+1.f)*.5f, beta = a[14]*.5f;
     float slope, top;
     if(hudGunDepth)
@@ -1840,6 +1930,8 @@ void ac3ds_gl_shutdown()
     activeProgram = DefaultProgram; forceProjective = false; unit0Binding = 0; unit1Bound = false;
     textureWasActive[0] = textureWasActive[1] = false;
     dummyUnit1 = {}; aimTile = nullptr; aimQueued = false; shadowTargets.fill(nullptr);
+    if(burst.data) linearFree(burst.data);
+    burst = {};
     texUnit[0] = Unit{}; texUnit[1] = Unit{}; active = client = 0;
     model = MatrixStack{}; projection = MatrixStack{}; matrixMode = GL_MODELVIEW;
     depthOn = blendOn = stencilOn = cullOn = alphaOn = fogOn = scissorOn = false;
@@ -2041,7 +2133,9 @@ void ac3ds_gl_end_frame()
     submitPending();
     flushData();
     top->used = true;
+    if(gameplayFrame) queueBurstFrame();
     if(gameplayFrame && lateVblankFrame) lastTopVblank = waitTopVblank();
+    else if(gameplayFrame) waitTopPresented();
     if(gameplayFrame && lateVblankFrame != lastGameplayLate)
     {
         // A profile can be armed before a toggle. Its next frame becomes a
@@ -3343,9 +3437,17 @@ void ac3ds_gl_set_pixel_fog(bool enabled)
 void ac3ds_gl_set_hud_gun_depth(bool on)
 {
     if(hudGunDepth == on) return;
-    if(ready) dirtyTransform();
+    if(ready) { dirtyTransform(); tevDirty = true; }
     hudGunDepth = on;
 }
+void ac3ds_gl_set_gun_isolation(bool fog, bool band)
+{
+    if(gunFog == fog && gunBand == band) return;
+    if(ready) { dirtyTransform(); tevDirty = true; }
+    gunFog = fog;
+    gunBand = band;
+}
+void ac3ds_gl_set_present_guard(bool enabled) { presentGuard = enabled; }
 bool ac3ds_gl_queue_aim_depth()
 {
     aimQueued = false;
@@ -3386,6 +3488,42 @@ bool ac3ds_gl_take_aim_depth(float &depth)
 }
 
 bool ac3ds_gl_read_ok() { return readOkay; }
+bool ac3ds_gl_burst_start(unsigned frames)
+{
+    if(!ready || burst.state) return false;
+    static_assert(64+96*sizeof(BurstMeta) <= burstHeaderBytes, "burst header too small");
+    frames = std::min(frames,96u);
+    // Leave the world caches their reserve and a margin, or recording would
+    // change what is being recorded.
+    while(frames >= 8 && linearSpaceFree() < burstHeaderBytes+frames*burstFrameBytes+2*worldCacheReserveBytes) frames /= 2;
+    if(frames < 8) return false;
+    burst.data = static_cast<u8 *>(linearMemAlign(burstHeaderBytes+frames*burstFrameBytes,0x1000));
+    if(!burst.data) return false;
+    std::memset(burst.data,0,burstHeaderBytes);
+    burst.frames = frames;
+    burst.captured = 0;
+    burst.startTick = svcGetSystemTick();
+    burst.state = 1;
+    return true;
+}
+int ac3ds_gl_burst_state() { return burst.state; }
+const void *ac3ds_gl_burst_data(unsigned *bytes)
+{
+    if(burst.state != 3 || !burst.data) return nullptr;
+    const u32 header[8] = { 0x42473341u /* "A3GB" */, 1, burst.captured, burstTileRows, u32(screenH/8), burstFirstTileRow,
+                            u32(screenH), u32(screenW) };
+    std::memcpy(burst.data,header,sizeof(header));
+    *bytes = unsigned(burstHeaderBytes+burst.captured*burstFrameBytes);
+    GSPGPU_InvalidateDataCache(burst.data+burstHeaderBytes,burst.captured*burstFrameBytes);
+    return burst.data;
+}
+void ac3ds_gl_burst_free()
+{
+    // Only once the queue that wrote into it has drained (state 3), or never started.
+    if(burst.state == 1 || burst.state == 2) return;
+    if(burst.data) linearFree(burst.data);
+    burst = {};
+}
 void ac3ds_gl_profile_start(unsigned intervals)
 {
     profile.count = profile.vblanks = profile.missed = profile.over20ms = 0;

@@ -471,11 +471,22 @@ struct hudmessages : consolebuffer<hudline>
         glLoadIdentity();
         glOrtho(0, VIRTW*0.9f, VIRTH*0.9f, 0, -1, 1);
         int dispmillis = arenaintermission ? 6000 : 3000;
+#ifdef __3DS__
+        // While the respawn prompt shows, the lines stack just above it and
+        // stay there, instead of sliding down through it as they age.
+        int respawnsecs;
+        const bool aboveprompt = !hidespecthud && respawnstatus(respawnsecs) != RS_NONE;
+        const int prompttop = int(AC3DS_RESPAWN_PROMPT_TOP * VIRTH*0.9f / 240);
+#endif
         loopi(min(conlines.length(), 3)) if(totalmillis-conlines[i].millis<dispmillis)
         {
             cline &c = conlines[i];
             int tw = text_width(c.line);
-            draw_text(c.line, int(tw > VIRTW*0.9f ? 0 : (VIRTW*0.9f-tw)/2), int(((VIRTH*0.9f)/4*3)+FONTH*i+pow((totalmillis-c.millis)/(float)dispmillis, 4)*VIRTH*0.9f/4.0f));
+            int top = int(((VIRTH*0.9f)/4*3)+FONTH*i+pow((totalmillis-c.millis)/(float)dispmillis, 4)*VIRTH*0.9f/4.0f);
+#ifdef __3DS__
+            if(aboveprompt) top = prompttop - FONTH*(3 - i);
+#endif
+            draw_text(c.line, int(tw > VIRTW*0.9f ? 0 : (VIRTW*0.9f-tw)/2), top);
         }
         glPopMatrix();
     }
@@ -854,6 +865,82 @@ const char *ghoststrings[] =
   "none", "deathcam", "chase 1st", "chase 3rd [O]", "chase 3rd [A]", "fly", "overview", ""
 };
 
+#ifdef __3DS__
+// The respawn prompt: a centred banner at the bottom of the top screen while
+// player1 is dead or spectating. It says what the fire button would do now
+// (respawnstatus) and names the button fire is bound to. The scoreboard keeps
+// clear of the strip it is drawn in (gmenu::render). The lines are kept short:
+// in team modes the score icons sit just right of it.
+static void drawrespawnprompt()
+{
+    int secs = 0;
+    const int state = respawnstatus(secs);
+    if(state == RS_NONE) return;
+    string title, hint = "";
+    switch(state)
+    {
+        case RS_WAIT: formatstring(title)("Respawn in %d", secs); break;
+        case RS_READY:
+        case RS_JOIN:
+        {
+            const char *what = state == RS_JOIN ? "join" : "respawn";
+            const char *fire = ac3ds_spectator_button("attack");
+            if(fire)
+            {
+                formatstring(title)("Press %s to %s", fire, what);
+                copystring(hint, "or tap the touch screen");
+            }
+            else
+            {
+                formatstring(title)("Tap to %s", what);
+                copystring(hint, "on the touch screen");
+            }
+            break;
+        }
+        case RS_SENT: copystring(title, "Respawning..."); break;
+        case RS_ROUND:
+            copystring(title, "Round in progress");
+            copystring(hint, "You respawn next round");
+            break;
+        case RS_NEXTROUND: formatstring(title)("Next round in %d", secs); break;
+        default: copystring(title, spawnpermission == SP_WRONGMAP ? "Waiting for the map" : "Waiting for the server"); break;
+    }
+    // Sizes in screen pixels; one pixel is VIRTH/240 units of the base HUD space.
+    const float px = VIRTH / 240.0f, titlescale = 0.55f, hintscale = 0.9f;
+    const int titlew = text_width(title), hintw = text_width(hint);
+    const float halfw = max(titlew / titlescale, hintw / hintscale) / 2 + 8 * px;
+    const float top = AC3DS_RESPAWN_PROMPT_TOP * px, bottom = (hint[0] ? 236 : 224) * px;
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0, VIRTW, VIRTH, 0, -1, 1);
+    glDisable(GL_TEXTURE_2D);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glColor4f(0, 0, 0, 0.6f);
+    glBegin(GL_TRIANGLE_STRIP);
+    glVertex2f(VIRTW / 2 - halfw, top);
+    glVertex2f(VIRTW / 2 + halfw, top);
+    glVertex2f(VIRTW / 2 - halfw, bottom);
+    glVertex2f(VIRTW / 2 + halfw, bottom);
+    glEnd();
+    glEnable(GL_TEXTURE_2D);
+
+    // Green once fire will do something; red for a moment after a press that came too early.
+    const bool ready = state == RS_READY || state == RS_JOIN;
+    const bool early = lastspawnattempt && lastmillis - lastspawnattempt < 250;
+    glLoadIdentity();
+    glOrtho(0, VIRTW * titlescale, VIRTH * titlescale, 0, -1, 1);
+    draw_text(title, int((VIRTW * titlescale - titlew) / 2), int((AC3DS_RESPAWN_PROMPT_TOP + 3) * px * titlescale),
+              early ? 255 : ready ? 140 : 255, early ? 60 : 255, early ? 60 : ready ? 120 : 255);
+    if(hint[0])
+    {
+        glLoadIdentity();
+        glOrtho(0, VIRTW * hintscale, VIRTH * hintscale, 0, -1, 1);
+        draw_text(hint, int((VIRTW * hintscale - hintw) / 2), int(224 * px * hintscale), 200, 200, 200);
+    }
+    glPopMatrix();
+}
+#endif
+
 void gl_drawhud(int w, int h, int curfps, int nquads, int curvert, bool underwater, int elapsed)
 {
     if(blankouthud > 0) { blankouthud -= elapsed; return; }
@@ -1131,10 +1218,29 @@ void gl_drawhud(int w, int h, int curfps, int nquads, int curvert, bool underwat
     if(!hidespecthud && !menu && p->state==CS_DEAD && p->spectatemode<=SM_DEATHCAM)
     {
         glLoadIdentity();
+#ifdef __3DS__
+        // The buttons these actions are bound to on the console, at the base
+        // HUD text size, in the free space right of centre above the HUD lines.
+        glOrtho(0, VIRTW, VIRTH, 0, -1, 1);
+        const char *view = ac3ds_spectator_button("jump");
+        const char *prev = ac3ds_spectator_button("key_universaldelta_minus"), *next = ac3ds_spectator_button("key_universaldelta_plus");
+        string viewhint = "", playerhint = "";
+        if(view) formatstring(viewhint)("%s: change view", view);
+        if(multiplayer(NULL) || watchingdemo)
+        {
+            if(prev && next && !strcmp(prev, "D-Pad Left") && !strcmp(next, "D-Pad Right")) copystring(playerhint, "D-Pad Left/Right: change player");
+            else if(prev && next) formatstring(playerhint)("%s / %s: change player", prev, next);
+            else if(prev || next) formatstring(playerhint)("%s: change player", prev ? prev : next);
+        }
+        const int right = VIRTW - FONTH/2, top = VIRTH*2/3;
+        if(viewhint[0]) draw_text(viewhint, right - text_width(viewhint), top);
+        if(playerhint[0]) draw_text(playerhint, right - text_width(playerhint), top + FONTH*5/4);
+#else
         glOrtho(0, VIRTW*3/2, VIRTH*3/2, 0, -1, 1);
         const int left = (VIRTW)*3/2, top = (VIRTH*3/2)*3/4;
         draw_textf("SPACE to change view", left - (text_width("SCROLL to change player") + FONTH/2), top);
         if(multiplayer(NULL) || watchingdemo) draw_textf("SCROLL to change player", left - (text_width("SCROLL to change player") + FONTH/2), top+80);
+#endif
     }
 
     if(editmode)
@@ -1259,6 +1365,10 @@ void gl_drawhud(int w, int h, int curfps, int nquads, int curvert, bool underwat
     }
 
     if(!hidehudmsgs) hudmsgs.render();
+#ifdef __3DS__
+    // Over the scoreboard and the HUD lines; not over a menu or the command line.
+    if(!hidespecthud && !command && (!menu || curmenu == scoremenu)) drawrespawnprompt();
+#endif
 
     glLoadIdentity();
     glOrtho(0, VIRTW, VIRTH, 0, -1, 1);

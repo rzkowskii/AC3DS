@@ -592,6 +592,22 @@ extern void flaginbase(int flag);
 extern void flagidle(int flag);
 extern void flagmsg(int flag, int message, int actor, int flagtime);
 extern bool tryrespawn();
+#ifdef __3DS__
+// What the fire button would do for a dead or spectating player right now.
+enum
+{
+    RS_NONE = 0,    // alive, or nothing to show (intermission, pause, demo, editing)
+    RS_BLOCKED,     // the server has not allowed spawning (see spawnpermission)
+    RS_JOIN,        // on a spectator team: fire joins the match
+    RS_WAIT,        // secs until fire respawns
+    RS_READY,       // fire respawns now
+    RS_SENT,        // spawn request sent, waiting for the server
+    RS_ROUND,       // arena round in progress: no respawn until it ends
+    RS_NEXTROUND    // arena: everyone spawns in secs
+};
+extern int respawnstatus(int &secs);
+extern int lastspawnattempt, spawnpermission;
+#endif
 extern void gotoplayerstart(playerent *d, entity *e);
 extern void findplayerstart(playerent *d, bool mapcenter = false, int arenaspawn = -1);
 extern void refreshsopmenu(void *menu, bool init);

@@ -8,6 +8,10 @@ enum
     AC3DS_HEIGHT = 240
 };
 
+// Top-screen row (of 240) where the respawn prompt starts; the scoreboard is
+// laid out above it while the prompt shows.
+constexpr int AC3DS_RESPAWN_PROMPT_TOP = 200;
+
 enum class Ac3dsMenu { None, Standard, ServerBrowser, ServerInfo };
 
 enum class Ac3dsMenuItem { Empty, ReadOnly, Action, Slider, Toggle, Text, Binding };
@@ -63,6 +67,9 @@ void ac3ds_menu_touch(unsigned revision, int index, Ac3dsMenuTouch action);
 void ac3ds_install_handheld_menus();
 void ac3ds_install_keymap();
 void ac3ds_default_binds();
+// The physical button whose binding for a dead or spectating player is exactly
+// `action`, named as on the console ("L", "D-Pad Left"); NULL if there is none.
+const char *ac3ds_spectator_button(const char *action);
 bool ac3ds_is_physical_button(int code);
 bool ac3ds_accept_button_event(const SDL_KeyboardEvent &event);
 bool ac3ds_gameplay_input_active();

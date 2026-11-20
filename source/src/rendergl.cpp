@@ -139,6 +139,66 @@ COMMAND(ac3dsmark, "");
 // only). 2.713 never lands on the same yaw twice, so no view repeats and gets
 // cached: it measures a camera that keeps turning.
 FVAR(ac3dsautoturn, 0, 0, 45);
+// Test aids, offline only: hold forward/back or strafe for the player, as the
+// circle pad would, so a walking view can be captured without input.
+VAR(ac3dsautomove, -1, 0, 1);
+VAR(ac3dsautostrafe, -1, 0, 1);
+
+// Frame recorder for faults only the handheld shows (the weapon flashing while
+// moving in build 13). "ac3dsgunburst [frames]" counts down three seconds, then
+// keeps the right half of every finished top-screen frame for a short run and
+// writes them to gunburst_N.bin in the profile folder. scripts/decode-gunburst.py
+// turns that into pictures. If the fault shows in them it is in what the GPU
+// drew; if they are clean while the screen flashed, it is in presentation.
+static int ac3dsBurstAt = 0, ac3dsBurstFrames = 0, ac3dsBurstShown = 0;
+void ac3dsgunburst(int *frames)
+{
+    if(ac3dsBurstAt || ac3ds_gl_burst_state()) { conoutf("already recording"); return; }
+    ac3dsBurstFrames = *frames > 0 ? *frames : 24;
+    ac3dsBurstAt = lastmillis + 3000;
+    ac3dsBurstShown = 0;
+}
+COMMAND(ac3dsgunburst, "i");
+void ac3dsburstframe()
+{
+    if(ac3dsBurstAt)
+    {
+        const int left = (ac3dsBurstAt - lastmillis + 999) / 1000;
+        if(left > 0)
+        {
+            if(left != ac3dsBurstShown) hudoutf("\f2recording frames in %d - keep moving", ac3dsBurstShown = left);
+            return;
+        }
+        ac3dsBurstAt = 0;
+        if(!ac3ds_gl_burst_start(ac3dsBurstFrames)) hudoutf("\f3not enough memory to record frames");
+        return;
+    }
+    if(ac3ds_gl_burst_state() != 3) return;
+    unsigned bytes = 0;
+    const void *data = ac3ds_gl_burst_data(&bytes);
+    bool saved = false;
+    string name = "";
+    if(data)
+    {
+        loopi(100)
+        {
+            formatstring(name)("gunburst_%d.bin", i);
+            stream *probe = openfile(name, "rb");
+            if(!probe) break;
+            delete probe;
+        }
+        stream *f = openfile(name, "wb");
+        if(f)
+        {
+            saved = f->write(data, int(bytes)) == int(bytes);
+            delete f;
+        }
+    }
+    ac3ds_gl_burst_free();
+    if(saved) hudoutf("\f0saved %s", name);
+    else hudoutf("\f3could not save the recorded frames");
+    conoutf("AC3DS_BURST %s %d bytes", saved ? name : "failed", int(bytes));
+}
 
 // Handheld benchmark: one command plays a fixed bot match with a turning
 // camera and profiles each renderer option in turn. Results go to the client
@@ -1016,6 +1076,17 @@ VARF(ac3dspixelfog, 0, 1, 1, ac3ds_gl_set_pixel_fog(ac3dspixelfog != 0));
 // before a see-through-walls report on the handheld (cause not isolated), so
 // the default is the Z-buffer that builds 1-10 used.
 VARF(ac3dslineardepth, 0, 0, 1, ac3ds_gl_set_linear_depth(ac3dslineardepth != 0));
+// The weapon in hand flashed and looked see-through while moving on the
+// handheld in build 13; Azahar never showed it. Build 14 takes the gun pass out
+// of the fog stage and gives it the top of the depth range to itself. These
+// two put either back, to tell on the handheld which one mattered.
+extern int ac3dsgunband;
+VARF(ac3dsgunfog, 0, 0, 1, ac3ds_gl_set_gun_isolation(ac3dsgunfog != 0, ac3dsgunband != 0));
+VARF(ac3dsgunband, 0, 1, 1, ac3ds_gl_set_gun_isolation(ac3dsgunfog != 0, ac3dsgunband != 0));
+// 1 holds a finished frame until the previous one is on screen. Without it a
+// quick frame straight after a late one is copied into the buffer still being
+// shown (a tear) and the late frame is never displayed.
+VARF(ac3dspresentguard, 0, 1, 1, ac3ds_gl_set_present_guard(ac3dspresentguard != 0));
 namespace
 {
     struct WaterWorldKey

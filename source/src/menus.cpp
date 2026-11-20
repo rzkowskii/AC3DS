@@ -1560,6 +1560,18 @@ int movemenuselection(int currentmenusel, int direction)
     else return currentmenusel;
 }
 
+#ifdef __3DS__
+// L/ZL and R/ZR arrive as Page Up and Page Down. Over the scoreboard, the one
+// menu that takes no input, they still turn its page, but the key is not
+// consumed: the shoulder buttons keep their match bindings, so fire can respawn
+// the player while the scoreboard that opens on death is up.
+static bool scoreboardpage(int sel)
+{
+    menuselect(curmenu, sel);
+    return false;
+}
+#endif
+
 bool menukey(int code, bool isdown, SDL_Keymod mod)
 {
     if(!curmenu) return false;
@@ -1610,7 +1622,11 @@ bool menukey(int code, bool isdown, SDL_Keymod mod)
                     break;
                 }
 #endif
-                menusel -= pagesize; break;
+                menusel -= pagesize;
+#ifdef __3DS__
+                if(!curmenu->allowinput) return scoreboardpage(menusel);
+#endif
+                break;
             case SDLK_PAGEDOWN:
 #ifdef __3DS__
                 if(ac3ds_menu_panel() == Ac3dsMenu::Standard)
@@ -1621,6 +1637,9 @@ bool menukey(int code, bool isdown, SDL_Keymod mod)
 #endif
                 if(menusel+pagesize>=n && menusel/pagesize!=(n-1)/pagesize) menusel = n-1;
                 else menusel += pagesize;
+#ifdef __3DS__
+                if(!curmenu->allowinput) return scoreboardpage(menusel);
+#endif
                 break;
             case SDLK_ESCAPE:
             case SDL_AC_BUTTON_RIGHT:
@@ -2171,7 +2190,14 @@ void gmenu::render()
     extern void *scoremenu;
     const bool scaledmenu = this == scoremenu;
     float uiscale = scaledmenu ? hudtextscale / 100.0f : 1.0f;
-    int VW2 = int(2 * VIRTW / uiscale), VH2 = int(2 * VIRTH / uiscale);
+    // While the respawn prompt shows at the bottom of the screen, the
+    // scoreboard is laid out in the space above it. The margin the layout
+    // keeps under the box already covers part of the strip.
+    extern int hidespecthud;
+    int respawnsecs;
+    const bool prompt = scaledmenu && !hidespecthud && respawnstatus(respawnsecs) != RS_NONE;
+    const float fullh = 2.0f * VIRTH * (prompt ? (AC3DS_RESPAWN_PROMPT_TOP + 10) / 240.0f : 1.0f);
+    int VW2 = int(2 * VIRTW / uiscale), VH2 = int(fullh / uiscale);
 #else
     const int VW2 = 2 * VIRTW, VH2 = 2 * VIRTH;
 #endif
@@ -2207,10 +2233,10 @@ void gmenu::render()
         // 3*FONTH margins the vertical clamp below keeps on each side.
         const int rowstep = (FONTH*5)/4, fixedh = (hitems+2)*rowstep + 6*FONTH;
         const float ceiling = uiscale, minscale = min(1.35f, ceiling);
-        uiscale = clamp(2.0f * VIRTH / (mdisp*rowstep + fixedh), minscale, ceiling);
+        uiscale = clamp(fullh / (mdisp*rowstep + fixedh), minscale, ceiling);
         // Round so a scale chosen to fit exactly is not truncated one unit short.
         VW2 = int(2 * VIRTW / uiscale + 0.5f);
-        VH2 = int(2 * VIRTH / uiscale + 0.5f);
+        VH2 = int(fullh / uiscale + 0.5f);
         // Still too tall at the floor: page the rows so the header and footer stay on screen.
         const int fitrows = max(1, (VH2 - fixedh) / rowstep);
         if(fitrows < pagesize && fitrows < items.length())
