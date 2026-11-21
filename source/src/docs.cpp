@@ -70,6 +70,7 @@ vector<docsection> sections;
 hashtable<const char *, docident> docidents; // manage globally instead of a section tree to ensure uniqueness
 docsection *lastsection = NULL;
 docident *lastident = NULL;
+static unsigned reference_revision;
 
 void adddocsection(char *name)
 {
@@ -78,6 +79,7 @@ void adddocsection(char *name)
     s.name = newstring(name);
     s.menu = addmenu(s.name, NULL, true, renderdocsection);
     lastsection = &s;
+    ++reference_revision;
 }
 COMMANDN(docsection, adddocsection, "s");
 
@@ -90,6 +92,7 @@ void adddocident(char *name, char *desc)
     c.name = name;
     c.desc = newstring(desc);
     lastident = &c;
+    ++reference_revision;
     DEBUGCODE(if(strlen(desc) > 111) clientlogf("docident: very long description for ident %s (%d)", name, (int)strlen(desc)));
 }
 COMMANDN(docident, adddocident, "ss");
@@ -651,6 +654,9 @@ int msectionsort(const msection *a, const msection *b)
 
 void renderdocsection(void *menu, bool init)
 {
+    static unsigned revision;
+    if(!init && revision == reference_revision) return;
+    revision = reference_revision;
     static vector<msection> msections;
     msections.shrink(0);
     loopv(sections)
@@ -666,22 +672,20 @@ void renderdocsection(void *menu, bool init)
         }
         msections.sort(msectionsort);
         menureset(menu);
-        loopv(msections) { menuitemmanual(menu, msections[i].name, msections[i].cmd, NULL, msections[i].desc); }
+        loopv(msections) menuitemcopy(menu, msections[i].name, msections[i].cmd, msections[i].desc);
         return;
     }
 }
 
-struct maction { string cmd; };
-
 void renderdocmenu(void *menu, bool init)
 {
-    static vector<maction> actions;
-    actions.shrink(0);
+    static unsigned revision;
+    if(!init && revision == reference_revision) return;
+    revision = reference_revision;
     menureset(menu);
     loopv(sections)
     {
-        maction &a = actions.add();
-        formatstring(a.cmd)("showmenu [%s]", sections[i].name);
-        menuitemmanual(menu, sections[i].name, a.cmd);
+        defformatstring(action)("showmenu [%s]", sections[i].name);
+        menuitemcopy(menu, sections[i].name, action);
     }
 }

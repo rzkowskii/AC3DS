@@ -435,6 +435,11 @@ static serverinfo *newserver(const char *name, uint ip = ENET_HOST_ANY, int port
         return NULL;
     }
     si->port = port;
+#ifdef __3DS__
+    static unsigned next_id = 0;
+    if(!++next_id) ++next_id;
+    si->handheld_id = next_id;
+#endif
 
     servers.insert(0, si);
 
@@ -1303,38 +1308,92 @@ void refreshservers(void *menu, bool init)
 // for the top-screen list and the lower-screen card (menus.cpp, system.cpp).
 #include "ac3ds_servers.h"
 
-int ac3ds_server_rows(void *menu, Ac3dsServerRow *rows, int max, int &selected)
+static void handheldserverrow(Ac3dsServerRow &r, const serverinfo &si, const serverinfo *current)
 {
-    selected = -1;
-    if(!menu) return 0;
-    const int sel = ((gmenu *)menu)->menusel;
-    serverinfo *curserver = getconnectedserverinfo();
-    int n = 0;
+    r.item = si.menuline_from;
+    r.id = si.handheld_id;
+    r.responded = si.address.host != ENET_HOST_ANY && si.ping != 9999;
+    r.compatible = si.protocol == PROTOCOL_VERSION;
+    filtertext(r.desc, si.sdesc[0] ? si.sdesc : si.name, FTXT_NOCOLOR, sizeof(r.desc) - 1);
+    copystring(r.map, si.map[0] ? si.map : "", sizeof(r.map));
+    copystring(r.mode, si.map[0] ? modestr(si.mode, true) : "", sizeof(r.mode));
+    snprintf(r.address, sizeof(r.address), "%s:%d", si.name, si.port);
+    r.players = si.numplayers;
+    r.maxclients = si.maxclients;
+    r.ping = si.ping;
+    r.minremain = si.minremain;
+    r.full = si.numplayers >= si.maxclients;
+    r.password = (si.pongflags & (1 << PONGFLAG_PASSWORD)) != 0;
+    r.banned = ((si.pongflags >> PONGFLAG_BANNED) & 1) || ((si.pongflags >> PONGFLAG_BLACKLIST) & 1);
+    r.connected = &si == current;
+}
+
+Ac3dsServerList ac3ds_server_window(const void *menu, Ac3dsServerRow *rows, int capacity, unsigned preferred)
+{
+    Ac3dsServerList list;
+    if(!menu || capacity <= 0) return list;
+    const int focus = static_cast<const gmenu *>(menu)->menusel;
+    const serverinfo *selection = NULL;
+    bool preferred_found = false;
     loopv(servers)
     {
-        serverinfo &si = *servers[i];
-        if(si.menuline_to <= si.menuline_from) continue; // not listed
-        if(n >= max) break;
-        Ac3dsServerRow &r = rows[n];
-        r.item = si.menuline_from;
-        r.responded = si.address.host != ENET_HOST_ANY && si.ping != 9999;
-        r.compatible = si.protocol == PROTOCOL_VERSION;
-        filtertext(r.desc, si.sdesc[0] ? si.sdesc : si.name, FTXT_NOCOLOR, sizeof(r.desc) - 1);
-        copystring(r.map, si.map[0] ? si.map : "", sizeof(r.map));
-        copystring(r.mode, si.map[0] ? modestr(si.mode, true) : "", sizeof(r.mode));
-        snprintf(r.address, sizeof(r.address), "%s:%d", si.name, si.port);
-        r.players = si.numplayers;
-        r.maxclients = si.maxclients;
-        r.ping = si.ping;
-        r.minremain = si.minremain;
-        r.full = si.numplayers >= si.maxclients;
-        r.password = (si.pongflags & (1 << PONGFLAG_PASSWORD)) != 0;
-        r.banned = ((si.pongflags >> PONGFLAG_BANNED) & 1) || ((si.pongflags >> PONGFLAG_BLACKLIST) & 1);
-        r.connected = &si == curserver;
-        if(sel >= si.menuline_from && sel < si.menuline_to) selected = n;
-        ++n;
+        const serverinfo &server = *servers[i];
+        if(server.menuline_to <= server.menuline_from) continue;
+        if(!preferred_found)
+        {
+            preferred_found = preferred && server.handheld_id == preferred;
+            if(preferred_found || (focus >= server.menuline_from && focus < server.menuline_to))
+            {
+                list.selected = list.count;
+                selection = &server;
+            }
+        }
+        ++list.count;
     }
-    return n;
+    if(list.selected >= 0)
+        list.first = clamp(list.selected - capacity / 2, 0, max(0, list.count - capacity));
+
+    const serverinfo *current = getconnectedserverinfo();
+    if(capacity == 1 && selection)
+    {
+        handheldserverrow(rows[0], *selection, current);
+        return list;
+    }
+
+    int row = 0;
+    loopv(servers)
+    {
+        const serverinfo &server = *servers[i];
+        if(server.menuline_to <= server.menuline_from) continue;
+        const int offset = row++ - list.first;
+        if(offset < 0) continue;
+        handheldserverrow(rows[offset], server, current);
+        if(offset + 1 == capacity) break;
+    }
+    return list;
+}
+
+void ac3ds_join_server_from_menu(unsigned id)
+{
+    extern gmenu *curmenu;
+    gmenu *menu = curmenu;
+    if(!id || !menu || (menu != servmenu && menu != searchmenu)) return;
+    loopv(servers)
+    {
+        const serverinfo &server = *servers[i];
+        if(server.handheld_id != id) continue;
+        const int index = server.menuline_from;
+        if(index < server.menuline_to && menu->items.inrange(index))
+        {
+            // The highlighted row may be a nickname. Use the server row's
+            // regular action with the latest password and access flags.
+            mitem &item = *menu->items[index];
+            const char *action = item.getaction();
+            if(!item.greyedout && action && *action && item.select() != -1)
+                audiomgr.playsound(S_MENUENTER, SP_HIGHEST);
+        }
+        return;
+    }
 }
 
 int ac3ds_server_total() { return servers.length(); }

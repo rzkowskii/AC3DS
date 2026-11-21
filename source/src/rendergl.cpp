@@ -3,8 +3,12 @@
 #include "cube.h"
 #include "bot/bot.h"
 #ifdef __3DS__
+#include "crash_3ds.h"
 #include "performance.h"
+#include "system.h"
 #include "world_batch_3ds.h"
+#include <cerrno>
+#include <sys/stat.h>
 #endif
 
 bool hasTE = false, hasMT = false, hasMDA = false, hasDRE = false, hasstencil = false, hasST2 = false, hasSTW = false, hasSTS = false, hasAF;
@@ -148,17 +152,37 @@ VAR(ac3dsautostrafe, -1, 0, 1);
 // moving in build 13). "ac3dsgunburst [frames]" counts down three seconds, then
 // keeps the right half of every finished top-screen frame for a short run and
 // writes them to gunburst_N.bin in the profile folder. scripts/decode-gunburst.py
-// turns that into pictures. If the fault shows in them it is in what the GPU
-// drew; if they are clean while the screen flashed, it is in presentation.
+// turns that into pictures. Compare these pre-transfer pixels with what the
+// LCD showed in the same area during those frames.
 static int ac3dsBurstAt = 0, ac3dsBurstFrames = 0, ac3dsBurstShown = 0;
 void ac3dsgunburst(int *frames)
 {
-    if(ac3dsBurstAt || ac3ds_gl_burst_state()) { conoutf("already recording"); return; }
+    if(ac3dsBurstAt || ac3ds_gl_burst_state() != Ac3dsBurstState::Idle) { conoutf("already recording"); return; }
     ac3dsBurstFrames = *frames > 0 ? *frames : 24;
     ac3dsBurstAt = lastmillis + 3000;
     ac3dsBurstShown = 0;
 }
 COMMAND(ac3dsgunburst, "i");
+
+static const char *savegunburst(const Ac3dsBurstReadout &capture, string &name)
+{
+    Ac3dsPhaseScope phase("gunburst save");
+    loopi(100)
+    {
+        formatstring(name)("gunburst_%d.bin", i);
+        struct stat existing;
+        if(stat(findfile(name, "wb"), &existing) == 0) continue;
+        if(errno != ENOENT) return "file lookup failed";
+        // The frame recorder, not the stream, owns this GPU allocation.
+        int references = 0;
+        stream *data = openmemfile(static_cast<const uchar *>(capture.data), int(capture.bytes), &references);
+        const bool saved = installfile3ds(name, data, int(capture.bytes));
+        delete data;
+        return saved ? NULL : "file write failed";
+    }
+    return "all recording slots are in use";
+}
+
 void ac3dsburstframe()
 {
     if(ac3dsBurstAt)
@@ -170,34 +194,27 @@ void ac3dsburstframe()
             return;
         }
         ac3dsBurstAt = 0;
-        if(!ac3ds_gl_burst_start(ac3dsBurstFrames)) hudoutf("\f3not enough memory to record frames");
+        const unsigned frames = ac3ds_gl_burst_start(ac3dsBurstFrames);
+        if(!frames) hudoutf("\f3could not allocate memory to record frames");
+        else if(frames != unsigned(ac3dsBurstFrames)) conoutf("recording %u frames (requested %d)", frames, ac3dsBurstFrames);
         return;
     }
-    if(ac3ds_gl_burst_state() != 3) return;
-    unsigned bytes = 0;
-    const void *data = ac3ds_gl_burst_data(&bytes);
-    bool saved = false;
+    if(ac3ds_gl_burst_state() != Ac3dsBurstState::Ready) return;
+    const Ac3dsBurstReadout capture = ac3ds_gl_burst_data();
+    if(capture.failure) conoutf("AC3DS_BURST %s failed (0x%08x) after %u/%u frames",
+                                 capture.failure, unsigned(capture.result), capture.captured, capture.planned);
     string name = "";
-    if(data)
-    {
-        loopi(100)
-        {
-            formatstring(name)("gunburst_%d.bin", i);
-            stream *probe = openfile(name, "rb");
-            if(!probe) break;
-            delete probe;
-        }
-        stream *f = openfile(name, "wb");
-        if(f)
-        {
-            saved = f->write(data, int(bytes)) == int(bytes);
-            delete f;
-        }
-    }
+    const char *failure = capture.data ? savegunburst(capture, name) : "no readable frames";
     ac3ds_gl_burst_free();
-    if(saved) hudoutf("\f0saved %s", name);
-    else hudoutf("\f3could not save the recorded frames");
-    conoutf("AC3DS_BURST %s %d bytes", saved ? name : "failed", int(bytes));
+    if(failure)
+    {
+        hudoutf("\f3could not save the recorded frames");
+        conoutf("AC3DS_BURST save failed: %s", failure);
+        return;
+    }
+    if(capture.captured < capture.planned) hudoutf("\f2saved %u/%u frames to %s", capture.captured, capture.planned, name);
+    else hudoutf("\f0saved %s", name);
+    conoutf("AC3DS_BURST %s %u bytes (%u/%u frames)", name, capture.bytes, capture.captured, capture.planned);
 }
 
 // Handheld benchmark: one command plays a fixed bot match with a turning
@@ -1152,6 +1169,22 @@ void drawreflection(float hf, int w, int h, float changelod, bool refract)
         if(refracttex) glDeleteTextures(1, &refracttex);
         reflecttex = refracttex = 0;
     }
+#ifdef __3DS__
+    GLuint &texture = refract ? refracttex : reflecttex;
+    if(!texture)
+    {
+        glGenTextures(1, &texture);
+        createtexture(texture, size, size, NULL, 3, false, false, GL_RGB);
+        if(!ac3ds_gl_texture_ready(texture))
+            clientlogf("PICA: %s render target allocation failed (%dx%d)", refract ? "refraction" : "reflection", size, size);
+        reflectlastsize = size;
+    }
+    if(!ac3ds_gl_render_to_texture(texture))
+    {
+        reflecting = refracting = false;
+        return;
+    }
+#else
     if(!reflecttex || (waterrefract && !refracttex))
     {
         if(!reflecttex)
@@ -1165,13 +1198,6 @@ void drawreflection(float hf, int w, int h, float changelod, bool refract)
             createtexture(refracttex, size, size, NULL, 3, false, false, GL_RGB);
         }
         reflectlastsize = size;
-    }
-
-#ifdef __3DS__
-    if(!ac3ds_gl_render_to_texture(refract ? refracttex : reflecttex))
-    {
-        reflecting = refracting = false;
-        return;
     }
 #endif
     extern float wsx1, wsx2, wsy1, wsy2;
@@ -1410,6 +1436,19 @@ void clearminimap()
 COMMAND(clearminimap, "");
 VARFP(minimapres, 7, 9, 10, clearminimap());
 #ifdef __3DS__
+void ac3ds_reset_map_targets()
+{
+    // Keep failed IDs during a map to avoid retrying allocations every frame.
+    // A new map can have more VRAM available, even at the same target size.
+    GLuint *targets[] = { &minimaptex, &reflecttex, &refracttex };
+    for(GLuint *texture : targets) if(*texture && !ac3ds_gl_texture_ready(*texture))
+    {
+        glDeleteTextures(1, texture);
+        *texture = 0;
+    }
+    ac3ds_minimap_reset();
+}
+
 // World-space square the minimap texture covers, for the lower-screen radar.
 bool ac3ds_minimap_info(unsigned &tex, float &x0, float &y0, float &span)
 {
@@ -1443,6 +1482,10 @@ void drawminimap(int w, int h)
         glGenTextures(1, &minimaptex);
         createtexture(minimaptex, size, size, NULL, 3, false, false, GL_RGB);
         minimaplastsize = size;
+#ifdef __3DS__
+        if(!ac3ds_gl_texture_ready(minimaptex))
+            clientlogf("PICA: minimap render target allocation failed (%dx%d)", size, size);
+#endif
     }
 #ifdef __3DS__
     if(!ac3ds_gl_render_to_texture(minimaptex)) return;
@@ -1524,7 +1567,6 @@ void drawminimap(int w, int h)
     glViewport(0, 0, w, h);
     glClearDepth(1.0);
 #ifdef __3DS__
-    extern void ac3ds_minimap_updated();
     ac3ds_minimap_updated();
 #endif
 }
@@ -1947,7 +1989,7 @@ void gl_drawframe(int w, int h, float changelod, float curfps, int elapsed)
         const float mainSkyFloor = skyfloor;
         resettmu(0);
         drawreflection(hf, w, h, 1.f, false);
-        if(waterrefract) drawreflection(hf, w, h, 1.f, true);
+        if(waterrefract && ac3ds_gl_texture_ready(reflecttex)) drawreflection(hf, w, h, 1.f, true);
         nquads = mainQuads;
         skyfloor = mainSkyFloor;
         glEnable(GL_TEXTURE_2D);
@@ -2017,7 +2059,7 @@ void gl_drawframe(int w, int h, float changelod, float curfps, int elapsed)
     GLuint waterrefraction = !effective_waterreflect || !waterrefract || underwater ? 0 : refracttex;
 #ifdef __3DS__
     if(!projectWater || !ac3ds_gl_texture_ready(waterreflection)) waterreflection = 0;
-    if(!projectWater || !ac3ds_gl_texture_ready(waterrefraction)) waterrefraction = 0;
+    if(!waterreflection || !ac3ds_gl_texture_ready(waterrefraction)) waterrefraction = 0;
 #endif
 #ifdef __3DS__
     Ac3dsPhaseTimer waterPhase(Ac3dsPhase::Water);

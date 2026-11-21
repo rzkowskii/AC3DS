@@ -375,7 +375,7 @@ void saycommand(char *init)                         // turns input to the comman
     saycommandon = (init != NULL);
     textinput(saycommandon, TI_CONSOLE);
     keyrepeat(saycommandon, KR_CONSOLE);
-    setscope(false);
+    clearscope();
     copystring(cmdline.buf, init ? escapestring(init, false, true) : "");
     DELETEA(cmdaction);
     DELETEA(cmdprompt);

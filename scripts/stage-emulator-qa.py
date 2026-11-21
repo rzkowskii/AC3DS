@@ -7,7 +7,8 @@ import re
 import tarfile
 
 QA = pathlib.Path(__file__).resolve().parent / "qa"
-CASES = ("smoke", "performance", "venison", "maps", "modes", "edit", "modes-edit", "network", "dedicated", "demo", "hid", "audio")
+CASES = ("smoke", "performance", "venison", "maps", "modes", "edit", "modes-edit",
+         "network", "dedicated", "demo", "hid", "audio", "weapon-picker", "scope", "ui-review", "server-join")
 MODE_IDS = list(range(22))
 BOT_MODE_IDS = {7, 8, 12, 18, 19, 20, 21}
 BOT_TEAM_MODE_IDS = {7, 20, 21}
@@ -136,7 +137,23 @@ def stage(sd, scenario, archive=None, demo=None, maps=(), modes=()):
                     "network": ["desktop_join", "desktop_disconnect"],
                     "demo": ["demo_start", "demo_stop"],
                     "audio": ["audio_kazemat_load", "audio_kazemat_playback"],
-                    "hid": ["hid_movement", "hid_fire", "hid_reload"]}.get(scenario, [])
+                    "hid": ["hid_movement", "hid_fire", "hid_reload", "hid_touch_reload"],
+                    "scope": ["scope_binding", "scope_waits_for_release", "scope_touch_on", "scope_drag_cancel",
+                              "scope_touch_off", "scope_hold_r", "scope_release_r", "scope_reopened", "scope_shot_fired",
+                              "scope_reload_clears", "scope_after_reload", "scope_switch_clears", "scope_absent_on_pistol",
+                              "scope_latch_on_during_r", "scope_latch_survives_r_release", "scope_latch_off_during_r",
+                              "scope_hold_release_after_unlatch", "scope_drawer_blocks", "scope_works_after_drawer",
+                              "scope_before_script_reload", "scope_after_script_reload", "scope_script_reload_preserves_latch",
+                              "scope_script_reload_touch_off",
+                              "scope_script_latch_ready", "scope_script_clears_latch", "scope_intermission_sniper",
+                              "scope_intermission_latch_ready", "scope_intermission_scores", "scope_intermission_clears",
+                              "scope_intermission_blocks_r"],
+                    "ui-review": ["ui_reference_hold", "ui_reference_release", "ui_admin_stale", "ui_admin_fresh",
+                                  "ui_outcome", "ui_server_browser"],
+                    "server-join": ["join_preserves_target", "join_player_row", "join_removed_target"],
+                    "weapon-picker": ["picker_hud_opens", "picker_waits_for_release", "picker_drag_cancels",
+                                      "picker_saves_on_release", "picker_returns_to_parent", "picker_back_keeps_choice",
+                                      "picker_respawn_equips", "picker_forced_preference", "picker_custom_menu"]}.get(scenario, [])
     if scenario == "demo":
         if not demo or not demo.is_file():
             raise ValueError("The demo scenario needs --demo pointing to a recorded .dmo")
@@ -172,6 +189,16 @@ def stage(sd, scenario, archive=None, demo=None, maps=(), modes=()):
         "demo": ["screenshots/qa_demo.png"],
         "performance": ["screenshots/qa_water.png"],
         "venison": ["screenshots/qa_venison_water.png"],
+        "weapon-picker": [f"screenshots/qa_weapon_{capture}.bmp"
+                          for capture in ("picker", "held", "saved", "focus", "forced", "custom")],
+        "scope": ["screenshots/qa_scope_ready.bmp", "screenshots/qa_scope_active.bmp",
+                  "screenshots/qa_scope_top.png", "screenshots/qa_scope_pistol.bmp", "screenshots/qa_scope_drawer.bmp",
+                  "screenshots/qa_scope_intermission.png"],
+        "ui-review": ["screenshots/qa_reference_section.bmp", "screenshots/qa_score_outcome.png",
+                      "screenshots/qa_servers_first.png", "screenshots/qa_servers_after_256.png",
+                      "screenshots/qa_servers_card.bmp"],
+        "server-join": ["screenshots/qa_join_before_sort.bmp", "screenshots/qa_join_after_sort.bmp",
+                        "screenshots/qa_join_after_removal.bmp"],
     }.get(scenario, [])
     if scenario in ("edit", "modes-edit"):
         required_files = ["screenshots/qa_editor.png", "packages/maps/qa_editor.cgz"]
@@ -190,10 +217,10 @@ def stage(sd, scenario, archive=None, demo=None, maps=(), modes=()):
     if scenario == "network":
         required_log_text.append("AC3DS_QA_LOOPBACK")
     if scenario == "hid":
-        required_files.append("screenshots/qa_hid_ready.png")
+        required_files.extend(["screenshots/qa_hid_ready.png", "screenshots/qa_hid_touch.png"])
         required_log_text.extend(["AC3DS_QA HID_READY ac_desert",
-                                  "AC3DS_QA HID_DOWN 3DS_TOUCH_SCREENSHOT",
-                                  "AC3DS_QA HID_UP 3DS_TOUCH_SCREENSHOT"])
+                                  "AC3DS_QA HID_DOWN 3DS_TOUCH_RELOAD",
+                                  "AC3DS_QA HID_UP 3DS_TOUCH_RELOAD"])
     if scenario == "modes-edit":
         required_log_text.extend(["AC3DS_QA END modes", "AC3DS_QA END edit"])
     if scenario == "dedicated":

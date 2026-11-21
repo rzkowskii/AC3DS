@@ -35,10 +35,32 @@ extern void trydisconnect();
 
 bool localwrongmap = false;
 
+#ifdef __3DS__
+static struct
+{
+    string name;
+    ENetPeer *peer;
+    int session, revision, size;
+    bool refused;
+} announcedmap;
+#endif
+
 bool changemapserv(char *name, int mode, int download, int revision)        // forced map change from the server
 {
     gamemode = mode;
     if(m_demo) return true;
+#ifdef __3DS__
+    if(announcedmap.peer != curpeer || announcedmap.session != sessionid || announcedmap.revision != revision ||
+       announcedmap.size != download || strcmp(announcedmap.name, name))
+    {
+        copystring(announcedmap.name, name);
+        announcedmap.peer = curpeer;
+        announcedmap.session = sessionid;
+        announcedmap.revision = revision;
+        announcedmap.size = download;
+        announcedmap.refused = false;
+    }
+#endif
     if(m_coop)
     {
         const int coopload = name[0] ? load_world(name) : -1;
@@ -67,6 +89,9 @@ bool changemapserv(char *name, int mode, int download, int revision)        // f
             if(securemapcheck(name, false)) return true;
             bool sizematch = maploaded == download || download < 10;
             if(loaded && sizematch && revmatch) return true;
+#ifdef __3DS__
+            if(announcedmap.refused) return false; // server may announce it again after a failed transfer
+#endif
             bool getnewrev = autogetnewmaprevisions && revision > hdr.maprevision;
             if(loadresult == -8)
             {   // the file is fine but too large to load here: fetching it again would only repeat this
@@ -635,7 +660,7 @@ void parsemessages(int cn, playerent *d, ucharbuf &p, bool demo = false)
             {
                 if(editmode) toggleedit(true);
                 showscores(false);
-                setscope(false);
+                clearscope();
                 player1->respawn();
                 player1->lifesequence = getint(p);
                 player1->health = getint(p);
@@ -1464,10 +1489,38 @@ void receivefile(uchar *data, int len)
         {
             getstring(text, p);
             filtertext(text, text, FTXT__MAPNAME, MAXMAPNAMELEN);
+#ifndef __3DS__
             conoutf("received map \"%s\" from server, reloading..", text);
+#endif
             int mapsize = getint(p);
             int cfgsize = getint(p);
             int cfgsizegz = getint(p);
+#ifdef __3DS__
+            const char *name = behindpath(text);
+            if(p.overread() || !validmapname(name) || mapsize <= 0 || mapsize > MAXMAPSENDSIZE ||
+               cfgsize < 0 || cfgsize > MAXCFGFILESIZE || cfgsizegz < 0 || cfgsizegz > MAXMAPSENDSIZE - mapsize ||
+               (cfgsize == 0) != (cfgsizegz == 0) || mapsize + cfgsizegz > p.remaining())
+            {
+                conoutf("\f3could not receive map \"%s\": invalid map transfer", name);
+                break;
+            }
+            if(securemapcheck(name)) break;
+            bool oversized;
+            const bool installed = writeclientmap3ds(name, mapsize, cfgsize, cfgsizegz, p.buf + p.len, oversized);
+            if(announcedmap.peer == curpeer && announcedmap.session == sessionid && !strcmp(announcedmap.name, name))
+                announcedmap.refused = !installed;
+            if(!installed)
+            {
+                if(oversized)
+                {
+                    conoutf("\f3map \"%s\" is too large for this console (size %d at most)", name, CLIENTMAXMAPFACTOR);
+                    if(m_coop && multiplayer(NULL)) trydisconnect();
+                }
+                else conoutf("\f3could not install map \"%s\": invalid map or an SD card error", name);
+                break;
+            }
+            conoutf("received map \"%s\" from server, reloading..", name);
+#else
             int size = mapsize + cfgsizegz;
             if(mapsize <= MAXMAPSENDSIZE && cfgsizegz <= MAXMAPSENDSIZE && size <= MAXMAPSENDSIZE && cfgsize <= MAXCFGFILESIZE && size <= p.remaining() && !securemapcheck(behindpath(text)))
             {
@@ -1476,6 +1529,7 @@ void receivefile(uchar *data, int len)
                 writecfggz(behindpath(text), cfgsize, cfgsizegz, &p.buf[p.len]);
                 p.len += cfgsizegz;
             }
+#endif
             break;
         }
 

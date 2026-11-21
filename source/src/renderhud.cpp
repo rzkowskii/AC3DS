@@ -569,6 +569,9 @@ void drawradar_showmap(playerent *p, int w, int h)
     }
     glTranslatef(centerpos.x - halfviewsize, centerpos.y - halfviewsize , 0);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_COLOR);
+#ifdef __3DS__
+    if(ac3ds_gl_texture_ready(minimaptex))
+#endif
     quad(minimaptex, 0, 0, minimapviewsize, 0.0f, 0.0f, 1.0f);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDisable(GL_BLEND);
@@ -710,6 +713,9 @@ void drawradar_vicinity(playerent *p, int w, int h)
     vec usecenter = vec(d->o).sub(rtr).sub(d4rc);
     glDisable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+#ifdef __3DS__
+    if(ac3ds_gl_texture_ready(minimaptex))
+#endif
     circle(minimaptex, halfviewsize, halfviewsize, halfviewsize, usecenter.x/(float)gdim, usecenter.y/(float)gdim, scaleh, 31); //Draw mimimaptext as radar background
     glTranslatef(halfviewsize, halfviewsize, 0);
 
@@ -905,6 +911,42 @@ static void drawrespawnprompt()
         case RS_NEXTROUND: formatstring(title)("Next round in %d", secs); break;
         default: copystring(title, spawnpermission == SP_WRONGMAP ? "Waiting for the map" : "Waiting for the server"); break;
     }
+    // Green once fire will do something; red after a press that came too early.
+    const bool ready = state == RS_READY || state == RS_JOIN;
+    const bool early = lastspawnattempt && lastmillis - lastspawnattempt < 250;
+    const bvec titleColor(early ? 255 : ready ? 181 : 255, early ? 90 : ready ? 224 : 255,
+                          early ? 84 : ready ? 123 : 255);
+    if(ac3ds_push_pixel_font())
+    {
+        const int titleWidth = text_width(title), hintWidth = text_width(hint);
+        const int width = max(titleWidth, hintWidth) + 16;
+        // Leave room for the team HUD at the right of the strip.
+        const int rightLimit = (m_flags_ || m_teammode) && !hideteamscorehud ? 298 : AC3DS_WIDTH - 4;
+        const int left = max(4, min((AC3DS_WIDTH - width) / 2, rightLimit - width));
+        const int top = AC3DS_RESPAWN_PROMPT_TOP, bottom = hint[0] ? 236 : 224;
+        glPushMatrix();
+        glLoadIdentity();
+        glOrtho(0, AC3DS_WIDTH, AC3DS_HEIGHT, 0, -1, 1);
+        glDisable(GL_TEXTURE_2D);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glColor4ub(19, 36, 26, 249);
+        glBegin(GL_TRIANGLE_STRIP);
+        glVertex2f(left, top);
+        glVertex2f(left + width, top);
+        glVertex2f(left, bottom);
+        glVertex2f(left + width, bottom);
+        glEnd();
+        glEnable(GL_TEXTURE_2D);
+        glPushMatrix();
+        glScalef(1, 2, 1);
+        draw_text(title, left + (width - titleWidth) / 2, (top + 4) / 2, titleColor.x, titleColor.y, titleColor.z);
+        glPopMatrix();
+        if(hint[0]) draw_text(hint, left + (width - hintWidth) / 2, top + 25, 204, 219, 202);
+        glPopMatrix();
+        popfont();
+        return;
+    }
+
     // Sizes in screen pixels; one pixel is VIRTH/240 units of the base HUD space.
     const float px = VIRTH / 240.0f, titlescale = 0.55f, hintscale = 0.9f;
     const int titlew = text_width(title), hintw = text_width(hint);
@@ -924,13 +966,10 @@ static void drawrespawnprompt()
     glEnd();
     glEnable(GL_TEXTURE_2D);
 
-    // Green once fire will do something; red for a moment after a press that came too early.
-    const bool ready = state == RS_READY || state == RS_JOIN;
-    const bool early = lastspawnattempt && lastmillis - lastspawnattempt < 250;
     glLoadIdentity();
     glOrtho(0, VIRTW * titlescale, VIRTH * titlescale, 0, -1, 1);
     draw_text(title, int((VIRTW * titlescale - titlew) / 2), int((AC3DS_RESPAWN_PROMPT_TOP + 3) * px * titlescale),
-              early ? 255 : ready ? 140 : 255, early ? 60 : 255, early ? 60 : ready ? 120 : 255);
+              titleColor.x, titleColor.y, titleColor.z);
     if(hint[0])
     {
         glLoadIdentity();

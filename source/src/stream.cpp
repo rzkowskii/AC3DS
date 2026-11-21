@@ -1419,13 +1419,29 @@ int streamcopy(stream *dest, stream *source, int maxlen)
 }
 
 #ifdef __3DS__
+static bool copystagedfile3ds(stream *out, stream *source, int length, bool (*cancel)())
+{
+    if(!cancel) return streamcopy(out, source, length) == length;
+    uchar buffer[8192];
+    int copied = 0;
+    while(copied < length)
+    {
+        if(cancel()) return false;
+        const int got = source->read(buffer, min(length - copied, int(sizeof(buffer))));
+        if(got <= 0 || cancel() || out->write(buffer, got) != got) return false;
+        copied += got;
+    }
+    return true;
+}
+
 // Writes a file under the profile folder so that an interruption leaves
 // either the old contents or the new: staged beside the target, synced, then
 // renamed over it. "replaceable" is for downloaded media that is not on the
 // card yet: with no old file or backup to look after it is written beside the
 // target and renamed when complete, four SD operations instead of eight.
-bool installfile3ds(const char *name, stream *source, int maxsize, bool replaceable)
+bool installfile3ds(const char *name, stream *source, int maxsize, bool replaceable, bool (*cancel)())
 {
+    if(cancel && cancel()) return false;
     long length = source->size();
     if(length < 0 || length > maxsize || !source->seek(0, SEEK_SET)) return false;
 
@@ -1451,18 +1467,15 @@ bool installfile3ds(const char *name, stream *source, int maxsize, bool replacea
         // would never be fetched again.
         int n = snprintf(staged, sizeof(staged), "%s.part", target);
         if(n < 0 || (size_t)n >= sizeof(staged)) return false;
+        if(cancel && cancel()) return false;
         filestream direct;
         direct.file = fopen(staged, "wb");
         if(!direct.file) return false;
         setvbuf(direct.file, NULL, _IOFBF, 32 * 1024);
-        bool written = streamcopy(&direct, source, (int)length) == length;
+        bool written = copystagedfile3ds(&direct, source, int(length), cancel);
         if(fclose(direct.file) != 0) written = false;
         direct.file = NULL;
-        if(written && rename(staged, target) != 0)
-        {
-            remove(target); // on the card after all, though never indexed
-            written = rename(staged, target) == 0;
-        }
+        if(written) written = (!cancel || !cancel()) && rename(staged, target) == 0;
         if(!written) remove(staged);
         return written;
     }
@@ -1470,6 +1483,7 @@ bool installfile3ds(const char *name, stream *source, int maxsize, bool replacea
     if(n < 0 || (size_t)n >= sizeof(previous)) return false;
     n = snprintf(staged, sizeof(staged), "%s.XXXXXX", target);
     if(n < 0 || (size_t)n >= sizeof(staged)) return false;
+    if(cancel && cancel()) return false;
 
     int fd = mkstemp(staged);
     if(fd < 0) return false;
@@ -1484,11 +1498,11 @@ bool installfile3ds(const char *name, stream *source, int maxsize, bool replacea
     // The default 1 KiB stdio buffer makes every kilobyte one SD write call.
     setvbuf(out.file, NULL, _IOFBF, 32 * 1024);
 
-    bool complete = streamcopy(&out, source, (int)length) == length &&
+    bool complete = copystagedfile3ds(&out, source, int(length), cancel) && (!cancel || !cancel()) &&
                     ::fflush(out.file) == 0 && fsync(fd) == 0;
     if(fclose(out.file) != 0) complete = false;
     out.file = NULL;
-    if(!complete) { remove(staged); return false; }
+    if(!complete || (cancel && cancel())) { remove(staged); return false; }
 
     // SD renames over an existing file first delete it. Keep the old data until
     // the new file is in place, and restore any backup left by an interrupted write.
@@ -1504,8 +1518,8 @@ bool installfile3ds(const char *name, stream *source, int maxsize, bool replacea
         }
         hasold = true;
     }
-    if(hasold && rename(target, previous) != 0) { remove(staged); return false; }
-    if(rename(staged, target) == 0)
+    if((cancel && cancel()) || (hasold && rename(target, previous) != 0)) { remove(staged); return false; }
+    if((!cancel || !cancel()) && rename(staged, target) == 0)
     {
         if(hasold) remove(previous);
         return true;
@@ -1513,6 +1527,150 @@ bool installfile3ds(const char *name, stream *source, int maxsize, bool replacea
     if(hasold) rename(previous, target);
     remove(staged);
     return false;
+}
+
+namespace
+{
+int mapfilepresent(const std::string &path)
+{
+    struct stat info;
+    if(stat(path.c_str(), &info) == 0) return S_ISREG(info.st_mode) ? 1 : -1;
+    return errno == ENOENT ? 0 : -1;
+}
+
+bool removemapfile(const std::string &path)
+{
+    return unlink(path.c_str()) == 0 || errno == ENOENT;
+}
+
+bool stagemapfile(const std::string &path, stream *source, int limit)
+{
+    const long length = source->size();
+    if(length < 0 || length > limit || !source->seek(0, SEEK_SET)) return false;
+    filestream out;
+    out.file = fopen(path.c_str(), "wb");
+    if(!out.file) return false;
+    setvbuf(out.file, NULL, _IOFBF, 32 * 1024);
+    bool complete = streamcopy(&out, source, int(length)) == length &&
+                    fflush(out.file) == 0 && fsync(fileno(out.file)) == 0;
+    if(fclose(out.file) != 0) complete = false;
+    out.file = NULL;
+    return complete;
+}
+
+// Both files are synced before the prepared marker is published. Moving the
+// marker after both final renames commits the pair. Until then each old file
+// stays available so a failed or interrupted install can be rolled back.
+struct MapInstall3ds
+{
+    const std::string target[2], next[2], old[2];
+    const std::string prepared, committed, pending;
+
+    MapInstall3ds(const char *map, const char *cfg)
+        : target{std::string(homedir) + map, std::string(homedir) + cfg},
+          next{target[0] + ".ac-map-next", target[1] + ".ac-map-next"},
+          old{target[0] + ".ac-map-old", target[1] + ".ac-map-old"},
+          prepared(target[0] + ".ac-map-install"), committed(target[0] + ".ac-map-done"), pending(prepared + ".part") {}
+
+    bool clearfiles() const
+    {
+        bool complete = removemapfile(pending);
+        loopi(2)
+        {
+            if(!removemapfile(next[i])) complete = false;
+            if(!removemapfile(old[i])) complete = false;
+        }
+        return complete;
+    }
+
+    bool rollback(unsigned original) const
+    {
+        loopi(2)
+        {
+            const int saved = mapfilepresent(old[i]);
+            if(saved < 0) return false;
+            if(original & (1 << i))
+            {
+                if(saved)
+                {
+                    if(!removemapfile(target[i]) || rename(old[i].c_str(), target[i].c_str()) != 0) return false;
+                    ac3ds_note_home_write(target[i].c_str());
+                }
+                else if(mapfilepresent(target[i]) != 1) return false;
+            }
+            else if(!removemapfile(target[i])) return false;
+        }
+        return clearfiles() && removemapfile(prepared);
+    }
+};
+}
+
+bool recovermapfiles3ds(const char *map, const char *cfg)
+{
+    if(!homedir[0]) return true;
+    const MapInstall3ds files(map, cfg);
+    const size_t root = strlen(homedir);
+    const bool maybeprepared = homemayexist(files.prepared.c_str() + root);
+    const bool maybecommitted = homemayexist(files.committed.c_str() + root);
+    const int prepared = maybeprepared ? mapfilepresent(files.prepared) : 0;
+    const int committed = maybecommitted ? mapfilepresent(files.committed) : 0;
+    if(prepared < 0 || committed < 0 || (prepared && committed)) return false;
+    if(committed)
+    {
+        if(mapfilepresent(files.target[0]) != 1 || mapfilepresent(files.target[1]) != 1) return false;
+        if(files.clearfiles()) removemapfile(files.committed);
+        return true; // both live files were committed, even if cleanup must be retried
+    }
+    if(!prepared) return true;
+    FILE *journal = fopen(files.prepared.c_str(), "rb");
+    if(!journal) return false;
+    const int original = fgetc(journal);
+    const bool valid = original >= 0 && original <= 3 && fgetc(journal) == EOF && !ferror(journal);
+    fclose(journal);
+    return valid && files.rollback(unsigned(original));
+}
+
+bool installmapfiles3ds(const char *map, const char *cfg, const char *backup, stream *mapsource, stream *cfgsource)
+{
+    if(!homedir[0] || !recovermapfiles3ds(map, cfg)) return false;
+    const MapInstall3ds files(map, cfg);
+    // Resolve the write path once to create its directories and index both
+    // final files. Index the marker before use so a retry can see it too.
+    if(findfile(map, "wb") != files.target[0] || findfile(cfg, "wb") != files.target[1]) return false;
+    if(mapfilepresent(files.committed) != 0 || !files.clearfiles()) return false;
+
+    uchar original = 0;
+    loopi(2)
+    {
+        const int present = mapfilepresent(files.target[i]);
+        if(present < 0) return false;
+        if(present) original |= 1 << i;
+    }
+    int borrowed = 0;
+    stream *journal = openmemfile(&original, 1, &borrowed);
+    const bool staged = stagemapfile(files.next[0], mapsource, MAXMAPSENDSIZE) &&
+                        stagemapfile(files.next[1], cfgsource, MAXCFGFILESIZE) &&
+                        stagemapfile(files.pending, journal, 1);
+    delete journal;
+    if(!staged || rename(files.pending.c_str(), files.prepared.c_str()) != 0)
+    {
+        files.clearfiles();
+        return false;
+    }
+    ac3ds_note_home_write(files.prepared.c_str());
+    bool installed = true;
+    loopi(2) if((original & (1 << i)) && rename(files.target[i].c_str(), files.old[i].c_str()) != 0) { installed = false; break; }
+    if(installed) loopi(2) if(rename(files.next[i].c_str(), files.target[i].c_str()) != 0) { installed = false; break; }
+    if(!installed || rename(files.prepared.c_str(), files.committed.c_str()) != 0)
+    {
+        if(!files.rollback(original)) clientlogf("map install rollback pending for %s", map);
+        return false;
+    }
+    ac3ds_note_home_write(files.committed.c_str());
+    if((original & 1) && rename(files.old[0].c_str(), findfile(backup, "wb")) != 0)
+        clientlogf("could not retain an extra backup of %s", map);
+    if(files.clearfiles()) removemapfile(files.committed);
+    return true;
 }
 #endif
 

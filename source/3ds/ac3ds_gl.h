@@ -183,6 +183,9 @@ void ac3ds_gl_probe_fog();
 void ac3ds_gl_set_command_dumps(unsigned count);
 void ac3ds_gl_set_projective(bool allowed);
 void ac3ds_gl_startup_state(uint32_t out[6]);
+// Watchdog samples, without service calls: GX count/command id, GX result,
+// command-list bytes, last observed top VBlank and completed present waits.
+void ac3ds_gl_runtime_state(uint32_t out[5]);
 bool ac3ds_gl_queue_readback_565(GLuint id, uint16_t **out, int *outw, int *outh);
 bool ac3ds_gl_drain_startup_frame(uint32_t &gpuStatus, int32_t &readResult);
 void ac3ds_gl_set_late_vblank(bool enabled);
@@ -199,12 +202,19 @@ void ac3ds_gl_collect_retired();
 void *ac3ds_gl_proc(const char *);
 bool ac3ds_gl_texture_ready(GLuint);
 bool ac3ds_gl_read_ok();
-// Diagnostic frame recorder: the right half of the finished top picture for a
-// run of consecutive gameplay frames, in the GPU's own tile order. State: 0
-// idle, 1 recording, 2 finishing, 3 ready. The data stays valid until freed.
-bool ac3ds_gl_burst_start(unsigned frames);
-int ac3ds_gl_burst_state();
-const void *ac3ds_gl_burst_data(unsigned *bytes);
+// Diagnostic frame recorder: the right half of consecutive gameplay frames,
+// in the GPU's tile order. Ready means the GPU has finished using the buffer.
+enum class Ac3dsBurstState { Idle, Recording, Draining, Ready };
+struct Ac3dsBurstReadout
+{
+    const void *data = nullptr;
+    unsigned bytes = 0, captured = 0, planned = 0;
+    const char *failure = nullptr;
+    uint32_t result = 0;
+};
+unsigned ac3ds_gl_burst_start(unsigned frames);
+Ac3dsBurstState ac3ds_gl_burst_state();
+Ac3dsBurstReadout ac3ds_gl_burst_data();
 void ac3ds_gl_burst_free();
 void ac3ds_gl_stats(char *, unsigned);
 void ac3ds_gl_profile_start(unsigned intervals);

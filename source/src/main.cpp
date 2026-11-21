@@ -799,6 +799,9 @@ void resetgl()
 #endif
 
     loadingscreen();
+#ifdef __3DS__
+    ac3ds_reset_pixel_font();
+#endif
 
     extern void cleanupparticles();
     extern void cleanupmodels();
@@ -868,6 +871,9 @@ void limitfps(int &millis, int curmillis)
         }
         if(delay > 0)
         {
+#ifdef __3DS__
+            Ac3dsPhaseScope phase("frame limiter: SDL delay");
+#endif
             SDL_Delay(delay);
             millis += delay;
         }
@@ -928,8 +934,10 @@ void ac3ds_discard_pending_input()
 {
     for(int i = events.length()-1; i >= 0; --i)
     {
-        if(events[i].type == SDL_KEYDOWN || events[i].type == SDL_MOUSEMOTION)
-            events.remove(i);
+        const SDL_Event &event = events[i];
+        if(event.type == SDL_KEYDOWN || event.type == SDL_MOUSEMOTION ||
+           (event.type == SDL_USEREVENT &&
+            (event.user.code == AC3DS_MENU_TOUCH_EVENT || event.user.code == AC3DS_SERVER_JOIN_EVENT))) events.remove(i);
     }
 }
 #endif
@@ -1053,6 +1061,8 @@ void checkinput()
                 if(event.user.code == AC3DS_MENU_TOUCH_EVENT)
                     ac3ds_menu_touch(event.user.windowID, int(reinterpret_cast<intptr_t>(event.user.data1)),
                                      Ac3dsMenuTouch(reinterpret_cast<intptr_t>(event.user.data2)));
+                else if(event.user.code == AC3DS_SERVER_JOIN_EVENT)
+                    ac3ds_dispatch_server_join(event.user.windowID, unsigned(reinterpret_cast<uintptr_t>(event.user.data1)));
                 break;
 #endif
             case SDL_KEYDOWN:
@@ -1229,6 +1239,10 @@ void checkinput()
 
 VARF(gamespeed, 10, 100, 1000, if(multiplayer()) gamespeed = 100);
 VARF(paused, 0, 0, 1, if(multiplayer()) paused = 0);
+
+#ifdef __3DS__
+bool ac3ds_offline_match_paused() { return paused && !multiplayer(NULL) && !watchingdemo; }
+#endif
 
 bool inmainloop = false;
 static int clockrealbase = 0, clockvirtbase = 0;
@@ -1841,6 +1855,9 @@ int main(int argc, char **argv)
         exec("config/defaults.cfg");
         bootstrapentropy += 5 + rnd(7);
     }
+#ifdef __3DS__
+    ac3ds_upgrade_scope_binding();
+#endif
     autostartscripts("_aftersaved_");
     exechook(HOOK_SP_MP, "afterinit", "");
     if(waitforauth)
@@ -1908,11 +1925,14 @@ int main(int argc, char **argv)
     for(;;)
     {
 #ifdef __3DS__
-        AC3DS_PHASE("system events");
+        AC3DS_PHASE("frame tick");
         ac3ds_crash_tick();
+        AC3DS_PHASE("system events");
         if(!ac3ds_main_loop()) break;
         if(ac3ds_take_clock_reset())
         {
+            Ac3dsPhaseScope phase("APT: reset frame clock");
+            ac3ds_crash_note_event("clock reset");
             clockreset();
             ac3ds_audio_service();
         }
@@ -1920,7 +1940,11 @@ int main(int argc, char **argv)
         // player is not dropped straight back into a firefight.
         if(ac3ds_take_resume() && !multiplayer(NULL) && !watchingdemo && *getclientmap() &&
            ac3ds_menu_panel() == Ac3dsMenu::None && !getcurcommand(NULL))
+        {
+            Ac3dsPhaseScope phase("APT: reopen offline pause menu");
             execute("ac3ds_pause_menu");
+        }
+        AC3DS_PHASE("frame clock");
 #endif
         static int frames = 0;
         static float fps = 10.0f;
@@ -1931,6 +1955,9 @@ int main(int argc, char **argv)
         limitfps(millis, totalmillis);
         int elapsed = millis-totalmillis;
         entropy_add_byte(elapsed);
+#ifdef __3DS__
+        const int frameGameMillis = lastmillis;
+#endif
         if(multiplayer(NULL))
         {
             if(ispaused) curtime = 0;
@@ -1956,6 +1983,7 @@ int main(int argc, char **argv)
 
 #ifdef __3DS__
         extern void ac3ds_resolve_aim();
+        AC3DS_PHASE("aim: resolve previous depth");
         ac3ds_resolve_aim();
         Ac3dsPhaseTimer updatePhase(Ac3dsPhase::Update);
         AC3DS_PHASE("input");
@@ -1963,7 +1991,18 @@ int main(int argc, char **argv)
         checkinput();
 
 #ifdef __3DS__
+        // The pause menu can open during input. Keep the elapsed wall time
+        // for UI and audio, but discard this simulation step before either
+        // the client or the local server can act on it.
+        const bool offlineMatchPaused = ac3ds_offline_match_paused();
         AC3DS_PHASE("update world");
+        if(offlineMatchPaused)
+        {
+            lastmillis = frameGameMillis;
+            curtime = 0;
+            gets2c(); // a pending online connection still needs its events
+        }
+        else
 #endif
         if(lastmillis) updateworld(curtime, lastmillis);
 
@@ -1971,6 +2010,7 @@ int main(int argc, char **argv)
 
 #ifdef __3DS__
         AC3DS_PHASE("server slice");
+        if(!offlineMatchPaused)
 #endif
         serverslice(0);
 #ifdef __3DS__
@@ -1999,13 +2039,13 @@ int main(int argc, char **argv)
             // Benchmark aid: turn the view by a fixed step every frame.
             extern float ac3dsautoturn;
             extern int ac3dsautomove, ac3dsautostrafe;
-            if(ac3dsautoturn && !multiplayer(NULL) && player1->state == CS_ALIVE)
+            if(ac3dsautoturn && !offlineMatchPaused && !multiplayer(NULL) && player1->state == CS_ALIVE)
             {
                 player1->yaw += ac3dsautoturn;
                 while(player1->yaw >= 360) player1->yaw -= 360;
             }
             static bool automoving = false;
-            if((ac3dsautomove || ac3dsautostrafe) && !multiplayer(NULL) && player1->state == CS_ALIVE)
+            if((ac3dsautomove || ac3dsautostrafe) && !offlineMatchPaused && !multiplayer(NULL) && player1->state == CS_ALIVE)
             {
                 player1->move = ac3dsautomove;
                 player1->strafe = ac3dsautostrafe;

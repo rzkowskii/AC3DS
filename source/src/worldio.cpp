@@ -59,6 +59,15 @@ const char **setnames(const char *name)
     return paths;
 }
 
+#ifdef __3DS__
+static bool recoverclientmap3ds(const char *name)
+{
+    if(recovermapfiles3ds(cgzname, mcfname)) return true;
+    conoutf("\f3could not recover map %s from the SD card", name);
+    return false;
+}
+#endif
+
 // the optimize routines below are here to reduce the detrimental effects of messy mapping by
 // setting certain properties (vdeltas and textures) to neighbouring values wherever there is no
 // visible difference. This allows the mipmapper to generate more efficient mips.
@@ -93,6 +102,9 @@ void writemap(const char *name, int msize, uchar *mdata)
 uchar *readmap(const char *name, int *size, int *revision)
 {
     setnames(name);
+#ifdef __3DS__
+    if(!recoverclientmap3ds(name)) return NULL;
+#endif
     uchar *data = (uchar *)loadfile(cgzname, size);
     if(!data) { conoutf("\f3could not read map %s", cgzname); return NULL; }
     header *h = peekmapheader(data, *size);
@@ -123,6 +135,78 @@ void writecfggz(const char *name, int size, int sizegz, uchar *data)
     }
     DELETEA(rawcfg);
 }
+
+#ifdef __3DS__
+static bool validateclientcgz(const uchar *data, int mapsize, bool &oversized)
+{
+    header incoming{};
+    constexpr int baseheader = sizeof(header) - sizeof(int) * 16;
+    z_stream z{};
+    if(inflateInit2(&z, MAX_WBITS + 16) != Z_OK) return false;
+    z.next_in = const_cast<uchar *>(data);
+    z.avail_in = mapsize;
+    z.next_out = reinterpret_cast<uchar *>(&incoming);
+    z.avail_out = baseheader;
+    int status = inflate(&z, Z_NO_FLUSH);
+    lilswap(&incoming.version, 4);
+    const bool supported = status == Z_OK && !z.avail_out &&
+                           (!memcmp(incoming.head, "CUBE", 4) || !memcmp(incoming.head, "ACMP", 4)) &&
+                           incoming.version >= 0 && incoming.version <= MAPVERSION &&
+                           incoming.numents >= 0 && incoming.numents <= MAXENTITIES &&
+                           incoming.sfactor >= SMALLEST_FACTOR && incoming.sfactor <= LARGEST_FACTOR;
+    oversized = supported && incoming.sfactor > CLIENTMAXMAPFACTOR;
+    if(!supported || oversized) { inflateEnd(&z); return false; }
+
+    const int headerbytes = fixmapheadersize(incoming.version, incoming.headersize);
+    if(headerbytes < baseheader || headerbytes > int(sizeof(header)) + MAXHEADEREXTRA)
+    {
+        inflateEnd(&z);
+        return false;
+    }
+    const unsigned cells = 1u << (2 * incoming.sfactor);
+    const unsigned metadata = headerbytes + incoming.numents * (incoming.version < 10 ? 12 : sizeof(persistent_entity));
+    // The older light fields occupy an extra byte in version 2. Even a map
+    // using only maximum runs needs one record per subsequent 255 cubes.
+    const unsigned limit = metadata + (incoming.version == 2 ? 10 : 9) * cells;
+    const unsigned minimum = metadata + 3 + 2 * ((cells - 1 + 254) / 255);
+    uchar discard[8192];
+    do
+    {
+        z.next_out = discard;
+        z.avail_out = sizeof(discard);
+        status = inflate(&z, Z_NO_FLUSH);
+    }
+    while(status == Z_OK && z.total_out <= limit);
+    const bool complete = status == Z_STREAM_END && !z.avail_in && z.total_out >= minimum && z.total_out <= limit;
+    inflateEnd(&z);
+    return complete;
+}
+
+bool writeclientmap3ds(const char *name, int mapsize, int cfgsize, int cfgsizegz, const uchar *data, bool &oversized)
+{
+    oversized = false;
+    if(!validateclientcgz(data, mapsize, oversized)) return false;
+    vector<uchar> cfg;
+    if(cfgsize)
+    {
+        databuf<uchar> raw = cfg.reserve(cfgsize);
+        uLongf length = cfgsize;
+        if(uncompress(raw.buf, &length, data + mapsize, cfgsizegz) != Z_OK || length != uLongf(cfgsize)) return false;
+        cfg.advance(cfgsize);
+    }
+
+    int borrowed = 0;
+    stream *map = openmemfile(data, mapsize, &borrowed);
+    // An empty profile CFG shadows any older companion in a package or
+    // mounted ZIP when the new map revision has no separate CFG.
+    stream *config = openvecfile(&cfg, false);
+    setnames(name);
+    const bool written = installmapfiles3ds(cgzname, mcfname, bakname, map, config);
+    delete config;
+    delete map;
+    return written;
+}
+#endif
 
 #define GZBUFSIZE ((MAXCFGFILESIZE * 11) / 10)
 
@@ -404,6 +488,9 @@ bool embedconfigfile()
     if(securemapcheck(getclientmap())) return false;
     if(unsavededits) { conoutf("There are unsaved edits: they need to be saved or discarded before a config file can be embedded."); return false; }
     setnames(getclientmap());
+#ifdef __3DS__
+    if(!recoverclientmap3ds(getclientmap())) return false;
+#endif
     int len;
     uchar *buf = (uchar *)loadfile(mcfname, &len);
     if(buf)
@@ -423,6 +510,9 @@ void extractconfigfile()
     if(securemapcheck(getclientmap())) return;
     if(unsavededits) { conoutf("There are unsaved edits: they need to be saved or discarded before the config file can be extracted."); return; }
     setnames(getclientmap());
+#ifdef __3DS__
+    if(!recoverclientmap3ds(getclientmap())) return;
+#endif
     int n = findheaderextra(HX_CONFIG);
     if(n < 0) conoutf("no embedded config found");
     else
@@ -761,6 +851,9 @@ void save_world(char *mname, bool skipoptimise, bool addcomfort)
 
     // get target file ready
     setnames(mname);
+#ifdef __3DS__
+    if(!recoverclientmap3ds(mname)) return;
+#endif
     if(mapbackupsonsave) backup(cgzname, bakname);
     stream *f = opengzfile(cgzname, "wb");
     if(!f) { conoutf("could not write map to %s", cgzname); return; }
@@ -887,6 +980,9 @@ void save_world9(char *mname)
         listheaderextras();
     }
     setnames(mname);
+#ifdef __3DS__
+    if(!recoverclientmap3ds(mname)) return;
+#endif
     backup(cgzname, bakname);
     stream *f = opengzfile(cgzname, "wb");
     if(!f) { conoutf("could not write map to %s", cgzname); return; }
@@ -966,7 +1062,8 @@ bool incompatiblemap = false;
 int load_world(char *mname)        // still supports all map formats that have existed since the earliest cube betas!
 {
 #ifdef __3DS__
-    const char *const previousPhase = ac3ds_crash_phase;
+    const char *const previousPhase = ac3ds_crash_phase.load(std::memory_order_relaxed);
+    const bool previousLoad = ac3ds_crash_loading_map.exchange(true, std::memory_order_release);
     AC3DS_PHASE("load map");
     ac3ds_load_profile_reset();
     ac3ds_load_start = ac3ds_stage_start = svcGetSystemTick();
@@ -976,9 +1073,11 @@ int load_world(char *mname)        // still supports all map formats that have e
     struct RestorePhase
     {
         const char *p;
+        const bool loading;
         ~RestorePhase()
         {
-            ac3ds_crash_phase = p;
+            AC3DS_PHASE(p);
+            ac3ds_crash_loading_map.store(loading, std::memory_order_release);
             ac3ds_crash_set_map(getclientmap()); // a refused load leaves the old map in play
             ac3ds_loading_done();
             const u64 now = svcGetSystemTick();
@@ -990,7 +1089,7 @@ int load_world(char *mname)        // still supports all map formats that have e
             ++ac3ds_load_generation; // the main loop logs the first frames after it
             if(clientlogfile) clientlogfile->fflush();
         }
-    } restorePhase{previousPhase};
+    } restorePhase{previousPhase, previousLoad};
     {
         defformatstring(loadingtitle)("%s", mname);
         ac3ds_loading_screen(loadingtitle, "Reading the map", 0.02f);
@@ -1003,6 +1102,9 @@ int load_world(char *mname)        // still supports all map formats that have e
 
     advancemaprevision = 1;
     setnames(mname);
+#ifdef __3DS__
+    if(validmapname(mname) && !recoverclientmap3ds(mname)) return -2;
+#endif
     maploaded = getfilesize(ocgzname);
     if(maploaded > 0)
     {
@@ -1234,7 +1336,11 @@ int load_world(char *mname)        // still supports all map formats that have e
     AC3DS_LOAD_STAGE("map models", "Loading map models", 0.60f);
     watch.start();
     if(autodownload) resetmdlnotfound();
+#ifdef __3DS__
+    const bool modelsReady = preload_mapmodels(autodownload != 0);
+#else
     preload_mapmodels(autodownload ? true : false);
+#endif
     int mdlloadtime = watch.elapsed();
 
     c2skeepalive();
@@ -1274,6 +1380,11 @@ int load_world(char *mname)        // still supports all map formats that have e
     clientlogf("loaded textures (%d milliseconds)", texloadtime+watch.elapsed());
     c2skeepalive();
     watch.start();
+#ifdef __3DS__
+    // The first pass resolved the models, skins and texture overrides. Only
+    // rescan after a miss or after package installation may have supplied assets.
+    if(!modelsReady || downloaded > 0)
+#endif
     res |= preload_mapmodels(false) ? 0 : LWW_MISSINGMEDIA * 4;
     clientlogf("loaded mapmodels (%d milliseconds)", mdlloadtime+watch.elapsed());
     c2skeepalive();

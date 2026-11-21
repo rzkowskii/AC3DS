@@ -49,6 +49,10 @@ namespace
     unsigned worldHeightsGeneration;
     bool worldClipActive;
     bool worldOcclusionActive;
+    // isoccluded returns 0, 1 or 2. Store that in the low two bits and the
+    // current view's tag in the rest of each byte. Zero is an unused tag.
+    constexpr unsigned occlusionResultMask = 3;
+    uchar cubeOcclusionTag;
     std::vector<uchar> cubeOcclusion;
     std::vector<uchar> cubeWallCandidates;
     struct WallFace { short height[4]; uchar texture, direction; };
@@ -221,7 +225,14 @@ namespace
            cubeOcclusionX != camera1->o.x || cubeOcclusionY != camera1->o.y)
         {
             cubeOcclusion.resize(mipsize);
-            memset(cubeOcclusion.data(), 0, cubeOcclusion.size());
+            constexpr unsigned tagStep = occlusionResultMask + 1;
+            cubeOcclusionTag = uchar(cubeOcclusionTag + tagStep);
+            if(!cubeOcclusionTag)
+            {
+                // Clear before reusing a tag so old results cannot match it.
+                memset(cubeOcclusion.data(), 0, cubeOcclusion.size());
+                cubeOcclusionTag = tagStep;
+            }
             cubeOcclusionGeneration = generation;
             cubeOcclusionWorld = world;
             cubeOcclusionX = camera1->o.x;
@@ -232,8 +243,16 @@ namespace
     uchar worldoccluded(const sqr *cube, int x, int y, float size)
     {
         uchar &cached = cubeOcclusion[cube - world];
-        if(!cached) cached = 1 + isoccluded(camera1->o.x, camera1->o.y, x, y, size);
-        return cached - 1;
+        const unsigned tag = cubeOcclusionTag;
+        // XOR removes a matching tag and leaves the occlusion result. A
+        // differing tag leaves at least one high bit set.
+        unsigned result = cached ^ tag;
+        if(result > occlusionResultMask)
+        {
+            result = isoccluded(camera1->o.x, camera1->o.y, x, y, size);
+            cached = uchar(tag | result);
+        }
+        return result;
     }
 
     void preparewallcandidates()
@@ -462,6 +481,7 @@ void ac3ds_release_world_tables()
     }
     worldClipCache = nullptr;
     std::vector<uchar>().swap(cubeOcclusion);
+    cubeOcclusionTag = 0;
     cubeOcclusionWorld = nullptr;
     cubeOcclusionGeneration = 0;
     std::vector<uchar>().swap(cubeWallCandidates);

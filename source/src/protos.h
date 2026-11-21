@@ -168,6 +168,7 @@ extern void rendermenu();
 extern bool menuvisible();
 extern void menureset(void *menu);
 extern void menuitemmanual(void *menu, char *text, char *action = NULL, color *bgcolor = NULL, const char *desc = NULL);
+extern void menuitemcopy(void *menu, const char *text, const char *action, const char *desc = NULL);
 extern void menuimagemanual(void *menu, const char *filename1, const char *filename2, char *text, char *action = NULL, color *bgcolor = NULL, const char *desc = NULL);
 extern void menutitlemanual(void *menu, const char *title);
 extern bool needscoresreorder;
@@ -244,6 +245,9 @@ struct gmenu
     int xoffs, yoffs;
     char *previewtexture, *previewtexturetitle;
     mdirlist *dirlist;
+#ifdef __3DS__
+    bool handheld_weapon_picker = false;
+#endif
 
     gmenu() : name(NULL), title(NULL), header(NULL), footer(NULL), menuselinit(-1), initaction(NULL), usefont(NULL),
               allowblink(false), persistentselection(false), synctabstops(false), hasdesc(false), headfootheap(false),
@@ -290,6 +294,9 @@ struct serverinfo
     string description;
     string cmd;
     int mode, numplayers, maxclients, ping, protocol, minremain, resolved, port, lastpingmillis, pongflags, getinfo, menuline_from, menuline_to;
+#ifdef __3DS__
+    unsigned handheld_id = 0;
+#endif
     ENetAddress address;
     vector<const char *> playernames;
     uchar namedata[MAXTRANS];
@@ -304,7 +311,7 @@ struct serverinfo
 
     serverinfo()
      : mode(0), numplayers(0), maxclients(0), ping(9999), protocol(0), minremain(0),
-       resolved(UNRESOLVED), port(-1), lastpingmillis(0), pongflags(0), getinfo(EXTPING_NOP),
+       resolved(UNRESOLVED), port(-1), lastpingmillis(0), pongflags(0), getinfo(EXTPING_NOP), menuline_from(0), menuline_to(0),
        bgcolor(NULL), favcat(-1), msweight(0), weight(0), uplinkqual(0), uplinkqual_age(0)
     {
         name[0] = full[0] = map[0] = sdesc[0] = description[0] = '\0';
@@ -328,6 +335,9 @@ struct httpget
     int maxredirects, maxtransfer, maxsize, connecttimeout;  // set manually
     int (__cdecl *callbackfunc)(void *data, float progress);
     void *callbackdata;
+#ifdef __3DS__
+    bool service_dns;                                  // allow progress and cancellation during foreground lookup
+#endif
 
     // internal
     ENetSocket tcp;
@@ -593,6 +603,7 @@ extern void flagidle(int flag);
 extern void flagmsg(int flag, int message, int actor, int flagtime);
 extern bool tryrespawn();
 #ifdef __3DS__
+extern bool ac3ds_offline_match_paused();
 // What the fire button would do for a dead or spectating player right now.
 enum
 {
@@ -641,6 +652,14 @@ struct discscore { int team, flags, frags, deaths; char name[MAXNAMELEN + 1]; };
 extern vector<discscore> discscores;
 extern void showscores(bool on);
 extern void renderscores(void *menu, bool init);
+#ifdef __3DS__
+struct Ac3dsScoreDisplay
+{
+    string summary, outcome;
+    unsigned layoutRevision;
+};
+extern Ac3dsScoreDisplay ac3ds_score_display;
+#endif
 extern const char *asciiscores(bool destjpg = false);
 extern void consolescores();
 extern void calcteamscores(int scores[4]);
@@ -743,6 +762,10 @@ extern bool setfont(const char *name);
 extern font *getfont(const char *name);
 extern void pushfont(const char *name);
 extern void popfont();
+#ifdef __3DS__
+extern bool ac3ds_push_pixel_font();
+extern void ac3ds_reset_pixel_font();
+#endif
 extern void draw_text(const char *str, int left, int top, int r = 255, int g = 255, int b = 255, int a = 255, int cursor = -1, int maxwidth = -1);
 extern void draw_textf(const char *fstr, int left, int top, ...) PRINTFARGS(1, 4);
 extern int text_width(const char *str);
@@ -880,6 +903,9 @@ extern int load_world(char *mname);
 extern char *getfiledesc(const char *dir, const char *name, const char *ext);
 extern void writemap(const char *name, int size, uchar *data);
 extern void writecfggz(const char *name, int size, int sizegz, uchar *data);
+#ifdef __3DS__
+extern bool writeclientmap3ds(const char *name, int mapsize, int cfgsize, int cfgsizegz, const uchar *data, bool &oversized);
+#endif
 extern uchar *readmap(const char *name, int *size, int *revision);
 extern uchar *readmcfggz(const char *name, int *size, int *sizegz);
 extern void rlencodecubes(vector<uchar> &f, sqr *s, int len, bool preservesolids);
@@ -949,7 +975,12 @@ extern void renderbounceents();
 extern void addgib(playerent *d);
 extern playerent *playerincrosshair();
 extern int magsize(int gun);
-extern void setscope(bool activate);
+extern void clearscope();
+#ifdef __3DS__
+extern void ac3ds_install_default_scope_action();
+extern bool ac3ds_can_toggle_scope();
+extern bool ac3ds_scope_latched();
+#endif
 extern void intersectgeometry(const vec &from, vec &to);
 extern int intersect(playerent *d, const vec &from, const vec &to, vec *end = NULL);
 extern bool intersect(entity *e, const vec &from, const vec &to, vec *end = NULL);

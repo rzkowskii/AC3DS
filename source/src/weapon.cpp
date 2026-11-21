@@ -1505,7 +1505,7 @@ void sniperrifle::attackfx(const vec &from, const vec &to, int millis)
 bool sniperrifle::reload(bool autoreloaded)
 {
     bool r = weapon::reload(autoreloaded);
-    if(owner==player1 && r) { scoped = false; player1->scoping = false; }
+    if(owner==player1 && r) clearscope();
     return r;
 }
 
@@ -1524,9 +1524,9 @@ int sniperrifle::dynspread()
 }
 float sniperrifle::dynrecoil() { return scoped && lastmillis - scoped_since > SCOPESETTLETIME ? info.recoil / 3 : info.recoil; }
 bool sniperrifle::selectable() { return weapon::selectable() && !m_noprimary && this == owner->primweap; }
-void sniperrifle::onselecting(bool sound) { weapon::onselecting(sound); scoped = false; player1->scoping = false; }
-void sniperrifle::ondeselecting() { scoped = false; owner->scoping = false; }
-void sniperrifle::onownerdies() { shots = 0; scoped = false; owner->scoping = false; }
+void sniperrifle::onselecting(bool sound) { weapon::onselecting(sound); clearscope(); }
+void sniperrifle::ondeselecting() { clearscope(); }
+void sniperrifle::onownerdies() { shots = 0; clearscope(); }
 void sniperrifle::renderhudmodel() { if(!scoped) weapon::renderhudmodel(); }
 
 void sniperrifle::renderaimhelp(bool teamwarning)
@@ -1539,15 +1539,50 @@ void sniperrifle::renderaimhelp(bool teamwarning)
     else drawcrosshair(owner, CROSSHAIR_EDIT);
 }
 
+bool sniperrifle::scope_available() const
+{
+    return this == owner->weaponsel && !reloading && owner->state == CS_ALIVE;
+}
+
 void sniperrifle::setscope(bool enable)
 {
-    if(this == owner->weaponsel && !reloading && owner->state == CS_ALIVE)
-    {
-        if(scoped == false && enable == true) scoped_since = lastmillis;
-        if(enable != scoped) owner->scoping = enable;
-        scoped = enable;
-    }
+    if(!enable) { clearscope(); return; }
+    if(!scope_available()) return;
+#ifdef __3DS__
+    if(intermission) return;
+    scope_latched = true;
+#endif
+    applyscope(true);
 }
+
+void sniperrifle::applyscope(bool enable)
+{
+    if(enable && !scoped) scoped_since = lastmillis;
+    owner->scoping = scoped = enable;
+}
+
+void sniperrifle::clearscope()
+{
+#ifdef __3DS__
+    scope_held = scope_latched = false;
+#endif
+    applyscope(false);
+}
+
+#ifdef __3DS__
+void sniperrifle::set_scope_hold(bool enable)
+{
+    if(enable && (!scope_available() || intermission)) return;
+    scope_held = enable;
+    applyscope(scope_held || scope_latched);
+}
+
+void sniperrifle::toggle_scope_latch()
+{
+    scope_latched = !scope_latched;
+    applyscope(scope_held || scope_latched);
+}
+#endif
 
 // carbine
 
@@ -1668,14 +1703,54 @@ void knife::attackfx(const vec &from, const vec &to, int millis) { attacksound()
 void knife::renderstats() { }
 
 
-void setscope(bool enable)
+void clearscope()
 {
-    if(player1->weaponsel->type != GUN_SNIPER) return;
-    sniperrifle *sr = (sniperrifle *)player1->weaponsel;
-    sr->setscope(enable);
+    if(!player1 || !player1->weaponsel) return;
+    static_cast<sniperrifle *>(player1->weapons[GUN_SNIPER])->clearscope();
 }
 
-COMMANDF(setscope, "i", (int *on) { setscope(*on != 0); });
+COMMANDF(setscope, "i", (int *on)
+{
+    if(player1 && player1->weaponsel)
+        static_cast<sniperrifle *>(player1->weapons[GUN_SNIPER])->setscope(*on != 0);
+});
+
+#ifdef __3DS__
+COMMANDF(ac3ds_scope_hold, "i", (int *on)
+{
+    if(player1 && player1->weaponsel)
+        static_cast<sniperrifle *>(player1->weapons[GUN_SNIPER])->set_scope_hold(*on != 0);
+});
+
+void ac3ds_install_default_scope_action()
+{
+    // Keep altaction and its bindings intact so profile scripts can remap
+    // them. The stock sniper action releases only the shoulder hold.
+    defformatstring(name)("altaction_%d", GUN_SNIPER);
+    const char *action = getalias(name);
+    if(action && !strcmp(action, " setscope 1; onrelease [ setscope 0 ] "))
+        alias(name, "ac3ds_scope_hold 1; onrelease [ac3ds_scope_hold 0]");
+}
+
+bool ac3ds_can_toggle_scope()
+{
+    const weapon *selected = player1 ? player1->weaponsel : NULL;
+    return selected && selected->type == GUN_SNIPER && player1->state == CS_ALIVE &&
+           !player1->weaponchanging && !selected->reloading && !editmode && !watchingdemo &&
+           !ispaused && !intermission && !ac3ds_offline_match_paused() && *getclientmap();
+}
+
+bool ac3ds_scope_latched()
+{
+    const weapon *selected = player1 ? player1->weaponsel : NULL;
+    return selected && selected->type == GUN_SNIPER && static_cast<const sniperrifle *>(selected)->is_scope_latched();
+}
+
+COMMANDF(ac3ds_scope_toggle, "", ()
+{
+    if(ac3ds_can_toggle_scope()) static_cast<sniperrifle *>(player1->weaponsel)->toggle_scope_latch();
+});
+#endif
 
 void shoot(playerent *p, vec &targ)
 {
@@ -1760,6 +1835,10 @@ void checkakimbo()
 
 void checkweaponstate()
 {
+#ifdef __3DS__
+    // A network team change can enter spectator mode without going through deathstate().
+    if(player1->scoping && player1->state != CS_ALIVE) clearscope();
+#endif
     checkweaponswitch();
     checkakimbo();
 }

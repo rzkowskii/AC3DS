@@ -38,6 +38,8 @@ python3 -c 'import subprocess, sys; subprocess.run(sys.argv[1:], timeout=600)' \
 
 Stage `network` for this endpoint. Check that the desktop server received `AC3DS_QA_LOOPBACK` and logged the guest leaving. A recorded `.dmo` from the original server can seed a separate `demo` run.
 
+For `server-join`, start `python3 scripts/qa/join-servers.py` before launching Azahar. The responder advertises two password-protected loopback entries with matching player names. The guest checks which server opens the stock password prompt after a sort or after selecting a nickname. It also checks cancellation when a pressed server disappears. The lower-screen captures show the card before the sort, while JOIN is held through the sort, and while the stylus is still down after the target disappears. The responder exits after 90 seconds by default.
+
 ```sh
 qa_demo=$(mktemp -d /tmp/ac3ds-qa-demo.XXXXXX)
 python3 scripts/stage-emulator-qa.py demo --sd "$qa_demo" --demo "$recording"
@@ -55,7 +57,11 @@ python3 scripts/stage-emulator-qa.py demo --sd "$qa_demo" --demo "$recording"
 | `network` | Join the original desktop dedicated server at `127.0.0.1:28783`, exchange a chat message, then disconnect. Confirm the matching log lines on the host. | Test multiple peers, LAN browsing, authentication, admin and votes, server discovery, custom media and map transfers. |
 | `dedicated` | Start the native guest dedicated server, inspect its stock map scan log and query its loopback server browser port for a protocol-1300 response | Connect an original desktop game client to the guest to verify reverse ENet session, gameplay and disconnect. |
 | `demo` | Play, seek and stop an original recorded `.dmo`, capture gameplay during playback. Stage with `--demo` and keep the original recording with the receipt. | Verify deterministic playback, downloading a demo over the game protocol, controls and timestamps against the desktop. |
-| `hid` | Circle Pad movement, L fire, X reload and a bottom-screen screenshot through Azahar’s emulated input | Check C-Stick and touch aiming, menus, remapping and software keyboard on the same build. |
+| `hid` | Circle Pad movement, L fire, X reload, touch RELOAD, and a screenshot after the touch | Check C-Stick and touch aiming, menus, remapping and software keyboard on the same build. |
+| `weapon-picker` | Touch down, drag cancellation, release to select, parent menu return, D-pad selection, respawn, forced loadout and custom Weapons menu fallback | Check stylus input during play, including gestures interrupted by HOME or sleep. |
+| `ui-review` | Hold and release on a refreshed reference menu, replace a bot while holding an administration row, and capture the match result and the same selected server on both screens in a 300-entry list | Check online administration menus as players join and leave. Check the scoreboard at both text sizes in a busy match. |
+| `server-join` | Preserve the pressed server across a sort, join through a nickname detail row, and cancel when the pressed server disappears | Check JOIN against a live server and verify the full connection flow. |
+| `scope` | Sniper touch toggle on release, drag cancellation, independent R hold and touch zoom after reloading the stock scripts, scripted unzoom, drawer blocking, and cleanup at weapon reload, weapon switch and match end | Check stylus accuracy, zoom and input recovery after HOME and lid sleep. |
 | `audio` | Load `ac_kazemat`, position the listener below the stock helicopter sound and check compressed PCM decode and NDSP wave submission during a five-second dwell | Capture and listen to the guest output. Compare ambience, effects, speech, music and spatial placement. |
 | `performance` | Three 600-interval samples at Good settings, covering `ac_desert`, `ac_desert` with six bots and `ac_venison` with eight bots and both water effects | Check gameplay during movement and combat, varied views and player counts, editor work and audio plus network load. Compare p99 and maximum frame intervals, intervals over 20 ms and missed VBlanks as well as mean FPS. |
 | `venison` | Run the eight-bot water scene at CPU 100%, capture `qa_venison_water.png` before timing, and require 600 submissions with both projected passes running | Repeat from varied camera positions and compare reflection and refraction against desktop. Death and bot spawn order can affect frame timings between runs. |
@@ -75,12 +81,12 @@ The probe targets the same loopback address as the guest's explicit bind and que
 
 ## Drive the HID fixture on macOS
 
-Stage `hid` and pass its profile, arguments, required markers and expected file to the runner. Add `--touch-key 69 280 178` to map the host E key to the center of the guest touchscreen’s Capture button. The fixture writes `screenshots/qa_hid_ready.png` once the local player is alive in bot deathmatch. Wait for that file inside the runner’s virtual SD before posting keys to the PID from `result.json`.
+Stage `hid` and pass its profile, arguments, required markers and expected files to the runner. Add `--touch-key 69 160 22` to map the host E key to the guest touchscreen’s RELOAD button. The fixture writes `screenshots/qa_hid_ready.png` once the local player is alive in bot deathmatch. Wait for that file inside the runner’s virtual SD before posting keys to the PID from `result.json`.
 
 ```sh
 mkdir -p build-azahar
 swiftc scripts/qa/azahar-keys.swift -o build-azahar/azahar-keys
-build-azahar/azahar-keys "$azahar_pid" UP .7 WAIT .2 Q .6 WAIT .3 Z .2 WAIT .6 E .2
+build-azahar/azahar-keys "$azahar_pid" UP .7 WAIT .2 Q .6 WAIT .3 Z .2 WAIT 2.8 Q .6 WAIT .3 E .2
 ```
 
-The helper requires macOS Accessibility access. Focus Azahar’s game view before driving it. The helper requests app activation, and Qt delivers gameplay input through the focused render widget. Verify the guest’s movement, fire, reload and touchscreen log markers and inspect the second PNG. If the key sequence fails to reach the guest, focus the game view, repeat the sequence and click the bottom-screen Capture button directly.
+The helper requires macOS Accessibility access. Focus Azahar’s game view before driving it. The sequence fires before each reload, first with X and then with the touchscreen. Verify the guest’s movement, fire, physical and touch reload markers and inspect `screenshots/qa_hid_touch.png`. If the virtual touch fails to reach the guest, focus the game view and click RELOAD on the bottom screen after firing the second time.

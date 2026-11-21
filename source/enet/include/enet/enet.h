@@ -471,6 +471,12 @@ ENET_API int        enet_socket_listen (ENetSocket, int);
 ENET_API ENetSocket enet_socket_accept (ENetSocket, ENetAddress *);
 ENET_API int        enet_socket_connect (ENetSocket, const ENetAddress *);
 #ifdef __3DS__
+/* Asynchronous IPv4 lookup. poll: 1 pending, 0 success (updates host only),
+   -1 failure. Terminal polls release the handle. abandon releases pending work
+   when the socket service returns. A zero timeout never waits. */
+ENET_API void *     enet_3ds_resolve_begin (const char *);
+ENET_API int        enet_3ds_resolve_poll (void *, ENetAddress *, unsigned);
+ENET_API void       enet_3ds_resolve_abandon (void *);
 /* Polls a nonblocking TCP connect. Returns 0 on connection, 1 on timeout, or -1 on error. */
 ENET_API int        enet_3ds_connect_status (ENetSocket, int);
 /* Blocking TCP connect on a helper thread, so callers can show progress and

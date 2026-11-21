@@ -108,7 +108,12 @@ std::atomic<unsigned> mixerCompleted{0};
 void finishMixer()
 {
     if(!mixerPending) return;
-    while(mixerCompleted.load(std::memory_order_acquire) != mixerSubmitted) LightEvent_Wait(&mixerDone);
+    if(mixerCompleted.load(std::memory_order_acquire) != mixerSubmitted)
+    {
+        Ac3dsPhaseScope phase("audio: wait for mixer");
+        do LightEvent_Wait(&mixerDone);
+        while(mixerCompleted.load(std::memory_order_acquire) != mixerSubmitted);
+    }
     mixerPending = false;
 }
 
@@ -529,6 +534,7 @@ void ac3ds_audio_lifecycle_event(bool suspended)
 
 void ac3ds_audio_service()
 {
+    Ac3dsPhaseScope phase("audio: lifecycle service");
     finishMixer();
     serviceAudio();
 }

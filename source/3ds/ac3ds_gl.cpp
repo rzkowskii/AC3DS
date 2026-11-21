@@ -1,10 +1,12 @@
 #include "ac3ds_gl.h"
+#include "crash_3ds.h"
 #include "performance.h"
 
 #include <3ds.h>
 #include <citro3d.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -16,9 +18,9 @@
 void ac3dsRecordGpu(float drawingMs, float processingMs); // rendergl.cpp profiler
 unsigned ac3dsCommandDumps = 0, ac3dsCommandDumpIndex = 0;
 const u32 *ac3dsLastList = nullptr;
-u32 ac3dsLastListBytes = 0;
+std::atomic<u32> ac3dsLastListBytes{0};
 // High half: GX commands handed to GSP. Low half: the last command id.
-u32 ac3dsGxSubmit = 0, ac3dsGxResult = 0;
+std::atomic<u32> ac3dsGxSubmit{0}, ac3dsGxResult{0};
 extern "C" {
 extern const unsigned char cube_vertex_shbin[];
 extern const unsigned int cube_vertex_shbin_size;
@@ -30,8 +32,11 @@ Result __wrap_gspSubmitGxCommand(const u32 command[8])
 {
     // Record what GSP answered for the startup report.
     const Result result = __real_gspSubmitGxCommand(command);
-    ac3dsGxSubmit = (ac3dsGxSubmit & 0xffff0000) + 0x10000 + (command[0] & 0xff);
-    ac3dsGxResult = u32(result);
+    ac3dsGxResult.store(u32(result), std::memory_order_relaxed);
+    u32 previous = ac3dsGxSubmit.load(std::memory_order_relaxed);
+    u32 next;
+    do { next = (previous & 0xffff0000) + 0x10000 + (command[0] & 0xff); }
+    while(!ac3dsGxSubmit.compare_exchange_weak(previous, next, std::memory_order_relaxed));
     return result;
 }
 
@@ -51,7 +56,7 @@ Result __wrap_GX_ProcessCommandList(u32 *buffer, u32 bytes, u8 flags)
         --ac3dsCommandDumps;
     }
     ac3dsLastList = buffer;
-    ac3dsLastListBytes = bytes;
+    ac3dsLastListBytes.store(bytes, std::memory_order_relaxed);
     return __real_GX_ProcessCommandList(buffer,bytes,flags);
 }
 }
@@ -204,8 +209,7 @@ bool readOkay = true, fullFlush = false;
 // Frame recorder (diagnostic): copies the right half of the finished top
 // picture, as the GPU left it, for a run of consecutive frames. The copy is a
 // queued GX command between the last command list and the display transfer,
-// like the aim-depth tile, so recording does not add a CPU/GPU barrier and
-// leaves the frame pacing it is meant to observe alone.
+// like the aim-depth tile. The CPU reads the image after the last copy drains.
 constexpr unsigned burstTileRows = 25, burstFirstTileRow = 25, burstHeaderBytes = 4096;
 constexpr size_t burstFrameBytes = size_t(burstTileRows)*(screenH/8)*256;
 struct BurstMeta { u32 ms, barriers, presentWaits, vblank; };
@@ -213,7 +217,9 @@ struct Burst
 {
     u8 *data = nullptr;
     unsigned frames = 0, captured = 0;
-    int state = 0; // 0 idle, 1 recording, 2 last copy queued, 3 ready
+    Ac3dsBurstState state = Ac3dsBurstState::Idle;
+    const char *failure = nullptr;
+    Result result = 0;
     u64 startTick = 0;
 };
 Burst burst;
@@ -439,14 +445,21 @@ void retire()
     for(auto *v : retiredGeometry) linearFree(v);
     retiredGeometry.clear();
 }
-unsigned presentWaits = 0;
-u32 waitTopVblank()
+std::atomic<u32> presentWaits{0}, observedTopVblank{0};
+u32 readTopVblank()
 {
+    const u32 slot = C3D_FrameCounter(0);
+    observedTopVblank.store(slot, std::memory_order_relaxed);
+    return slot;
+}
+u32 waitTopVblank(const char *description = "GPU frame start VBlank")
+{
+    Ac3dsPhaseScope phase(description);
     Ac3dsPhaseTimer wait(Ac3dsPhase::VBlankWait);
     u32 slot;
     // A vblank that arrives during the counter check is already pending in
     // GSP's event queue. Only the top-screen counter drives gameplay pace.
-    while((slot = C3D_FrameCounter(0)) == lastTopVblank) gspWaitForAnyEvent();
+    while((slot = readTopVblank()) == lastTopVblank) gspWaitForAnyEvent();
     return slot;
 }
 // The display transfer writes to the buffer the last present swapped away
@@ -467,29 +480,34 @@ void waitTopPresented()
 {
     if(!presentGuard) return;
     if(!gspIsPresentPending(GSP_SCREEN_TOP)) { heldRun = 0; return; }
+    Ac3dsPhaseScope phase("GPU previous present wait");
     Ac3dsPhaseTimer wait(Ac3dsPhase::VBlankWait);
     const u64 began = svcGetSystemTick();
-    const u32 slot = C3D_FrameCounter(0);
-    while(gspIsPresentPending(GSP_SCREEN_TOP) && C3D_FrameCounter(0) == slot) gspWaitForAnyEvent();
-    ++presentWaits;
+    const u32 slot = readTopVblank();
+    while(gspIsPresentPending(GSP_SCREEN_TOP) && readTopVblank() == slot) gspWaitForAnyEvent();
+    presentWaits.fetch_add(1, std::memory_order_relaxed);
     // Idle for over a third of a refresh, eight frames running.
     heldRun = svcGetSystemTick()-began > SYSCLOCK_ARM11/180 ? heldRun+1 : 0;
     if(heldRun >= 8)
     {
-        lastTopVblank = C3D_FrameCounter(0);
+        lastTopVblank = readTopVblank();
         heldRun = 0;
     }
 }
-bool startFrame(bool sync)
+bool startFrame(bool sync, const char *vblankPhase = "GPU frame start VBlank", const char *queuePhase = "GPU acquire frame queue")
 {
     if(!ready || frame) return frame;
     // After HOME -> Close libctru neither reacquires the GPU right nor runs
     // the restore hooks. A list submitted now would never complete, and the
     // next wait for the queue would hang the exit.
     if(!gspHasGpuRight()) return false;
-    if(sync) waitTopVblank();
+    if(sync) waitTopVblank(vblankPhase);
     Ac3dsPhaseTimer queue(Ac3dsPhase::QueueStart);
-    const bool started = C3D_FrameBegin(0);
+    bool started;
+    {
+        Ac3dsPhaseScope phase(queuePhase);
+        started = C3D_FrameBegin(0);
+    }
     queue.stop();
     if(!started) return false;
     // GPU time of the previous frame's command lists (Citro3D measures it from
@@ -498,10 +516,10 @@ bool startFrame(bool sync)
     {
         ac3dsRecordGpu(C3D_GetDrawingTime(), C3D_GetProcessingTime());
     }
-    if(sync) lastTopVblank = C3D_FrameCounter(0);
+    if(sync) lastTopVblank = readTopVblank();
     frameHasVblank = sync;
     frame = true;
-    if(burst.state == 2) burst.state = 3; // the queue holding the last copy has drained
+    if(burst.state == Ac3dsBurstState::Draining) burst.state = Ac3dsBurstState::Ready;
     retire();
     // APT restore can dirty Citro3D's saved loader state. Re-establish the
     // complete buffer description before using offset-only updates.
@@ -552,29 +570,42 @@ void splitFrame()
     flushData();
     C3D_FrameSplit(submitFlags);
 }
+void reserveCommands();
 void queueBurstFrame()
 {
-    if(burst.state != 1 || !burst.data || target != top) return;
+    if(burst.state != Ac3dsBurstState::Recording || target != top) return;
     u8 *out = burst.data+burstHeaderBytes+burst.captured*burstFrameBytes;
     const auto *color = static_cast<const u32 *>(top->frameBuf.colorBuf);
     const size_t offset = size_t(burstFirstTileRow)*(screenH/8)*64;
     // Close the list first so the copy sees the whole frame.
+    reserveCommands();
     splitFrame();
-    ++queuedGx;
-    if(R_FAILED(GSPGPU_FlushDataCache(out,burstFrameBytes)) ||
-       R_FAILED(GX_TextureCopy(const_cast<u32 *>(color+offset),0,reinterpret_cast<u32 *>(out),0,burstFrameBytes,8)))
+    queuedGx += 2;
+    Result result;
     {
-        burst.frames = burst.captured;
-        burst.state = 2;
+        Ac3dsPhaseScope phase("GPU gunburst cache flush");
+        result = GSPGPU_FlushDataCache(out,burstFrameBytes);
+    }
+    const char *operation = "cache flush";
+    if(R_SUCCEEDED(result))
+    {
+        operation = "texture copy";
+        result = GX_TextureCopy(const_cast<u32 *>(color+offset),0,reinterpret_cast<u32 *>(out),0,burstFrameBytes,GX_TRANSFER_RAW_COPY(1));
+    }
+    if(R_FAILED(result))
+    {
+        burst.failure = operation;
+        burst.result = result;
+        burst.state = Ac3dsBurstState::Draining;
         return;
     }
     BurstMeta meta;
     meta.ms = u32((svcGetSystemTick()-burst.startTick)*1000/SYSCLOCK_ARM11);
     meta.barriers = currentCounters.barriers;
-    meta.presentWaits = presentWaits;
-    meta.vblank = C3D_FrameCounter(0);
+    meta.presentWaits = presentWaits.load(std::memory_order_relaxed);
+    meta.vblank = readTopVblank();
     std::memcpy(burst.data+64+burst.captured*sizeof(BurstMeta),&meta,sizeof(meta));
-    if(++burst.captured == burst.frames) burst.state = 2;
+    if(++burst.captured == burst.frames) burst.state = Ac3dsBurstState::Draining;
 }
 void recycleFrame()
 {
@@ -2065,13 +2096,22 @@ void ac3ds_gl_probe_fog() { ac3ds_gl_startup_draw(true); }
 void ac3ds_gl_startup_state(uint32_t out[6])
 {
     // GX submissions and the last GSP result, the last list, and the GPU busy bits.
-    out[0] = ac3dsGxSubmit;
-    out[1] = ac3dsGxResult;
+    out[0] = ac3dsGxSubmit.load(std::memory_order_relaxed);
+    out[1] = ac3dsGxResult.load(std::memory_order_relaxed);
     out[2] = ac3dsLastList ? osConvertVirtToPhys(ac3dsLastList) : 0;
-    out[3] = ac3dsLastListBytes;
+    out[3] = ac3dsLastListBytes.load(std::memory_order_relaxed);
     out[4] = 0xffffffff;
     GSPGPU_ReadHWRegs(0x400034,&out[4],sizeof(u32));
     out[5] = osGetMemRegionFree(MEMREGION_APPLICATION);
+}
+
+void ac3ds_gl_runtime_state(uint32_t out[5])
+{
+    out[0] = ac3dsGxSubmit.load(std::memory_order_relaxed);
+    out[1] = ac3dsGxResult.load(std::memory_order_relaxed);
+    out[2] = ac3dsLastListBytes.load(std::memory_order_relaxed);
+    out[3] = observedTopVblank.load(std::memory_order_relaxed);
+    out[4] = presentWaits.load(std::memory_order_relaxed);
 }
 
 void ac3ds_gl_startup_draw(bool fog)
@@ -2134,7 +2174,7 @@ void ac3ds_gl_end_frame()
     flushData();
     top->used = true;
     if(gameplayFrame) queueBurstFrame();
-    if(gameplayFrame && lateVblankFrame) lastTopVblank = waitTopVblank();
+    if(gameplayFrame && lateVblankFrame) lastTopVblank = waitTopVblank("GPU late submission VBlank");
     else if(gameplayFrame) waitTopPresented();
     if(gameplayFrame && lateVblankFrame != lastGameplayLate)
     {
@@ -2166,7 +2206,10 @@ void ac3ds_gl_end_frame()
         profile.haveBaseline = true;
     }
     gameplayFrame = false;
-    C3D_FrameEnd(fullFlush ? 0 : submitFlags);
+    {
+        Ac3dsPhaseScope phase("GPU submit frame");
+        C3D_FrameEnd(fullFlush ? 0 : submitFlags);
+    }
     lastCounters = currentCounters;
     currentCounters = {};
     frame = false;
@@ -3471,9 +3514,12 @@ bool ac3ds_gl_queue_aim_depth()
 }
 bool ac3ds_gl_take_aim_depth(float &depth)
 {
-    if(!aimQueued || !startFrame(!lateVblankRequested)) return false;
+    if(!aimQueued || !startFrame(!lateVblankRequested, "GPU aim VBlank", "GPU aim acquire frame queue")) return false;
     aimQueued = false;
-    if(R_FAILED(GSPGPU_InvalidateDataCache(aimTile,256))) return false;
+    {
+        Ac3dsPhaseScope phase("GPU aim cache invalidate");
+        if(R_FAILED(GSPGPU_InvalidateDataCache(aimTile,256))) return false;
+    }
     const u32 value = aimTile[morton(screenH/2,screenW/2)]&0xffffff;
     if(aimDepthMap.w && value)
     {
@@ -3488,40 +3534,56 @@ bool ac3ds_gl_take_aim_depth(float &depth)
 }
 
 bool ac3ds_gl_read_ok() { return readOkay; }
-bool ac3ds_gl_burst_start(unsigned frames)
+unsigned ac3ds_gl_burst_start(unsigned frames)
 {
-    if(!ready || burst.state) return false;
+    if(!ready || burst.state != Ac3dsBurstState::Idle) return 0;
     static_assert(64+96*sizeof(BurstMeta) <= burstHeaderBytes, "burst header too small");
     frames = std::min(frames,96u);
-    // Leave the world caches their reserve and a margin, or recording would
-    // change what is being recorded.
-    while(frames >= 8 && linearSpaceFree() < burstHeaderBytes+frames*burstFrameBytes+2*worldCacheReserveBytes) frames /= 2;
-    if(frames < 8) return false;
-    burst.data = static_cast<u8 *>(linearMemAlign(burstHeaderBytes+frames*burstFrameBytes,0x1000));
-    if(!burst.data) return false;
+    // Leave the world caches their reserve and a margin. Try a shorter take
+    // if the full buffer won't fit, including when free memory is fragmented.
+    for(; frames; frames /= 2)
+    {
+        const size_t bytes = burstHeaderBytes + frames*burstFrameBytes;
+        if(linearSpaceFree() < bytes + 2*worldCacheReserveBytes) continue;
+        burst.data = static_cast<u8 *>(linearMemAlign(bytes,0x1000));
+        if(burst.data) break;
+    }
+    if(!burst.data) return 0;
     std::memset(burst.data,0,burstHeaderBytes);
     burst.frames = frames;
-    burst.captured = 0;
     burst.startTick = svcGetSystemTick();
-    burst.state = 1;
-    return true;
+    burst.state = Ac3dsBurstState::Recording;
+    return frames;
 }
-int ac3ds_gl_burst_state() { return burst.state; }
-const void *ac3ds_gl_burst_data(unsigned *bytes)
+Ac3dsBurstState ac3ds_gl_burst_state() { return burst.state; }
+Ac3dsBurstReadout ac3ds_gl_burst_data()
 {
-    if(burst.state != 3 || !burst.data) return nullptr;
+    if(burst.state != Ac3dsBurstState::Ready) return {};
+    Ac3dsBurstReadout readout{nullptr, 0, burst.captured, burst.frames, burst.failure, uint32_t(burst.result)};
+    if(!burst.captured) return readout;
+    const size_t payloadBytes = burst.captured*burstFrameBytes;
+    {
+        Ac3dsPhaseScope phase("GPU gunburst cache invalidate");
+        const Result result = GSPGPU_InvalidateDataCache(burst.data+burstHeaderBytes,payloadBytes);
+        if(R_FAILED(result))
+        {
+            readout.failure = "cache invalidate";
+            readout.result = uint32_t(result);
+            return readout;
+        }
+    }
     const u32 header[8] = { 0x42473341u /* "A3GB" */, 1, burst.captured, burstTileRows, u32(screenH/8), burstFirstTileRow,
                             u32(screenH), u32(screenW) };
     std::memcpy(burst.data,header,sizeof(header));
-    *bytes = unsigned(burstHeaderBytes+burst.captured*burstFrameBytes);
-    GSPGPU_InvalidateDataCache(burst.data+burstHeaderBytes,burst.captured*burstFrameBytes);
-    return burst.data;
+    readout.bytes = unsigned(burstHeaderBytes+payloadBytes);
+    readout.data = burst.data;
+    return readout;
 }
 void ac3ds_gl_burst_free()
 {
-    // Only once the queue that wrote into it has drained (state 3), or never started.
-    if(burst.state == 1 || burst.state == 2) return;
-    if(burst.data) linearFree(burst.data);
+    // The active queue may still refer to the buffer until Ready.
+    if(burst.state != Ac3dsBurstState::Ready) return;
+    linearFree(burst.data);
     burst = {};
 }
 void ac3ds_gl_profile_start(unsigned intervals)

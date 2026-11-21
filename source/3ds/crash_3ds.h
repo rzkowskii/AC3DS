@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <stddef.h>
 
 // Handheld crash and stall reports. A CPU exception is written to
@@ -24,7 +25,28 @@ void ac3ds_memory_line(char *out, size_t size);
 void ac3ds_crash_set_map(const char *name);
 size_t ac3ds_heap_unclaimed();
 void ac3ds_crash_note_log(const char *line);
+// Record an infrequent lifecycle event with the current main-loop phase.
+// The event name, like a phase, must point at a string literal.
+void ac3ds_crash_note_event(const char *name, int detail = 0);
 
-// The last main-loop phase entered. Must point at a string literal.
-extern const char *volatile ac3ds_crash_phase;
-#define AC3DS_PHASE(name) (ac3ds_crash_phase = (name))
+// Only the game thread and its synchronous callbacks change this phase.
+// Worker threads and crash handlers may read it without taking a lock.
+extern std::atomic<const char *> ac3ds_crash_phase;
+// The load allowance remains active when a scoped phase names a GPU wait.
+extern std::atomic<bool> ac3ds_crash_loading_map;
+#define AC3DS_PHASE(name) (ac3ds_crash_phase.store((name), std::memory_order_release))
+
+class Ac3dsPhaseScope
+{
+    const char *const parent;
+
+public:
+    explicit Ac3dsPhaseScope(const char *phase) noexcept
+        : parent(ac3ds_crash_phase.load(std::memory_order_relaxed))
+    {
+        AC3DS_PHASE(phase);
+    }
+    ~Ac3dsPhaseScope() { AC3DS_PHASE(parent); }
+    Ac3dsPhaseScope(const Ac3dsPhaseScope &) = delete;
+    Ac3dsPhaseScope &operator=(const Ac3dsPhaseScope &) = delete;
+};

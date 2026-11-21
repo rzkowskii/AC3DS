@@ -312,11 +312,17 @@ VAR(rereadtexturelists, 0, 1, 1); // flag to indicate additional texture files t
 VAR(rereadsoundlists, 0, 1, 1); // same for map sounds
 
 static int installedfiles = 0; // files written by the last processdownload()
+#ifdef __3DS__
+static bool downloadcheckpoint();
+#endif
 
 bool processdownload(package *pck, stream *f) // write downloaded data to file(s)
 {
     installedfiles = 0;
     if(!f || !f->seek(0)) { delete f; return false; }
+#ifdef __3DS__
+    if(downloadcheckpoint()) { delete f; return false; }
+#endif
     bool installed = false;
     if(pck->iszip)
     { // unpack zip file
@@ -329,6 +335,9 @@ bool processdownload(package *pck, stream *f) // write downloaded data to file(s
             loopv(files)
             {
                 if(i >= MAXFILESINADZIP) break;
+#ifdef __3DS__
+                if(downloadcheckpoint()) { complete = false; break; }
+#endif
                 const char *zname = behindpath(files[i]); // ignore _all_ paths inside the zip
                 filtertext(cleanzname, zname, FTXT__MEDIAFILENAME);
                 bool isok = false;
@@ -350,11 +359,10 @@ bool processdownload(package *pck, stream *f) // write downloaded data to file(s
                 {
 #ifdef __3DS__
                     stream *entry = zipmanualstream(mz, i);
-                    bool saved = entry && installfile3ds(path(filename), entry, MAXMEDIADOWNLOADFILESIZE, true);
+                    bool saved = entry && installfile3ds(path(filename), entry, MAXMEDIADOWNLOADFILESIZE, true, downloadcheckpoint);
                     delete entry;
                     if(saved) { installed = true; installedfiles++; }
                     else complete = false;
-                    c2skeepalive(); // each file is several SD operations: keep the server connection serviced
 #else
                     stream *zf = openfile(path(filename), "wb");
                     if(zf)
@@ -379,7 +387,7 @@ bool processdownload(package *pck, stream *f) // write downloaded data to file(s
     { // write single file
         int maxsize = pck->type == PCK_MOD ? MAXMODDOWNLOADSIZE : MAXMEDIADOWNLOADFILESIZE;
 #ifdef __3DS__
-        installed = installfile3ds(path(pck->fullpath, true), f, maxsize, true);
+        installed = installfile3ds(path(pck->fullpath, true), f, maxsize, true, downloadcheckpoint);
         if(installed) installedfiles++;
 #else
         stream *d = openfile(path(pck->fullpath, true), "wb");
@@ -426,9 +434,35 @@ int progress_n, progress_of;
 // not spawned yet (five or more players in a team mode, or a full server),
 // so 0 and values above about 40 get the console kicked there.
 VARP(ac3dsdownloadwait, 0, 30, 180);
-static stopwatch downloadwatch;
-static int downloadlimit = 0;      // milliseconds, 0: none
+static uint downloadstart, downloadservice;
+static int downloadlimit = -1;     // milliseconds, -1: none
 static bool downloadexpired = false;
+
+static bool downloadcheckpoint()
+{
+    if(canceldownloads) return true;
+    const uint now = SDL_GetTicks();
+    if(downloadlimit >= 0 && now - downloadstart >= uint(downloadlimit))
+    {
+        downloadexpired = canceldownloads = true;
+        return true;
+    }
+    // The time check runs before every write. Poll HID and service ENet at
+    // most ten times a second, regardless of how many blocks are staged.
+    if(now - downloadservice >= 100)
+    {
+        downloadservice = now;
+        c2skeepalive();
+        if(interceptkey(SDLK_ESCAPE)) canceldownloads = true;
+    }
+    return canceldownloads;
+}
+
+static void finishcancelledpackages()
+{
+    if(downloadexpired) conoutf("\f3missing content not fetched within %d seconds of the map change: playing without it (ac3dsdownloadwait sets the limit)", ac3dsdownloadwait);
+    if(canceldownloads) pendingpackages.deletecontents();
+}
 #define CANCELKEYNAME "START"
 #else
 #define CANCELKEYNAME "ESC"
@@ -439,19 +473,15 @@ int progress_callback_dlpackage(void *data, float progress)
     // The HTTP client calls this at least four times a second while it waits
     // or transfers. Upstream only services the server connection between the
     // stages of a map load, which a PC download finishes well within.
-    c2skeepalive();
 #ifdef __3DS__
-    if(downloadlimit && int(downloadwatch.elapsed()) > downloadlimit)
-    {
-        downloadexpired = canceldownloads = true;
-        return 1;
-    }
-    // Drawing the screen and reading the buttons ten times a second is plenty;
-    // a transfer calls in for every block it receives.
+    if(downloadcheckpoint()) return 1;
+    // A transfer calls in for every block it receives.
     static uint lastdrawn = 0;
     const uint now = SDL_GetTicks();
     if(now - lastdrawn < 100 && progress < 1.0f) return 0;
     lastdrawn = now;
+#else
+    c2skeepalive();
 #endif
     if(progress_of < 0)
     {
@@ -460,11 +490,13 @@ int progress_callback_dlpackage(void *data, float progress)
         else show_out_of_renderloop_progress(min(progress, 1.0f), txt);
     }
     else loadingscreen("downloading package %d of %d...\n%s  \fs%s%d%%\fr\n(" CANCELKEYNAME " to cancel)", progress_n, progress_of, (const char *)data, progress < 0 ? "\f3waiting " : "", int(100.0 * fabs(progress)));
+#ifndef __3DS__
     if(interceptkey(SDLK_ESCAPE))
     {
         canceldownloads = true;
         return 1;
     }
+#endif
     return 0;
 }
 
@@ -476,17 +508,19 @@ bool dlpackage(httpget &h, package *pck, pckserver *s) // download one package f
     h.callbackdata = pck->name;
     progress_n = progress_of - pendingpackages.length() + 1;
 #ifdef __3DS__
+    if(downloadcheckpoint()) return false;
+    h.service_dns = true;
     stopwatch phase;
     phase.start();
 #endif
-    // A listed server was resolved by the startup ping. The lookup blocks with
-    // nothing serviced, so it is not repeated for every map load.
+    // A listed server was already resolved by the startup ping.
     if(*u.domain && h.set_host(u.domain, s ? s->ip : 0))
     {
 #ifdef __3DS__
         const int resolved = phase.elapsed();
+        if(downloadcheckpoint()) return false;
 #endif
-        if(*u.port) h.set_port(atoi(u.port));
+        h.set_port(*u.port ? atoi(u.port) : 80);
         h.outstream = openvecfile(NULL);
         defformatstring(url)("%s%s", u.path, pck->requestname);
         int got = h.get(url, 6000, 90000);
@@ -504,14 +538,14 @@ bool dlpackage(httpget &h, package *pck, pckserver *s) // download one package f
 #ifdef __3DS__
                 // Where the time goes on the handheld: name lookup, transfer, writing to the card.
                 phase.start();
-                if(progress_of >= 0) loadingscreen("installing package %d of %d...\n%s", progress_n, progress_of, pck->name);
+                if(progress_of >= 0 && !downloadcheckpoint()) loadingscreen("installing package %d of %d...\n%s\n(" CANCELKEYNAME " to cancel)", progress_n, progress_of, pck->name);
 #endif
                 bool installed = processdownload(pck, h.outstream);
                 h.outstream = NULL; // deleted by processdownload()
 #ifdef __3DS__
                 clientlogf("package %s: host lookup %d ms, %d bytes in %d ms, %d files written in %d ms", pck->requestname, resolved, got, int(h.elapsedtime), installedfiles, int(phase.elapsed()));
 #endif
-                if(!installed) clientlogf("could not install downloaded package %s", pck->requestname);
+                if(!installed && !canceldownloads) clientlogf("could not install downloaded package %s", pck->requestname);
                 return installed;
             }
             else clientlogf("download %s:%d%s failed, server response %d%s%s", u.domain, h.ip.port, url, h.response, h.err ? ", err: " : "", h.err ? h.err : "");
@@ -520,7 +554,7 @@ bool dlpackage(httpget &h, package *pck, pckserver *s) // download one package f
     }
     else
     {
-        if(s) s->resolved = 0;
+        if(s && !canceldownloads) s->resolved = 0;
         clientlogf("resolving host \"%s\" failed", u.domain);
         h.disconnect();
     }
@@ -546,22 +580,33 @@ int downloadpackages(bool loadscr) // get all pending packages
     canceldownloads = false;
     progress_of = loadscr ? pendingpackages.length() : -1;
 #ifdef __3DS__
+    if(pendingpackages.empty()) return 0;
     downloadexpired = false;
-    downloadlimit = 0;
+    downloadlimit = -1;
     if(loadscr && multiplayer(NULL) && ac3dsdownloadwait)
     {
         // Counted from the start of the load, not of this stage: loadscr is
         // only set for the call from load_world().
         extern int ac3ds_load_elapsed();
-        downloadlimit = max(ac3dsdownloadwait * 1000 - ac3ds_load_elapsed(), 1);
+        downloadlimit = max(ac3dsdownloadwait * 1000 - ac3ds_load_elapsed(), 0);
     }
-    downloadwatch.start();
-#endif
+    downloadstart = SDL_GetTicks();
+    downloadservice = downloadstart - 100;
+    if(downloadcheckpoint()) { finishcancelledpackages(); return 0; }
+    while(sem_pckservers.timedwait(50))
+    {
+        if(downloadcheckpoint()) { finishcancelledpackages(); return 0; }
+        if(SDL_GetTicks() - downloadstart < 1000) continue;
+        conoutf("\f3failed to download packages: still pinging the servers...");
+        return 0;
+    }
+#else
     if(sem_pckservers.timedwait(1000))
     { // can't lock the server list -> this means, the server ping threads have not finished yet
         if(pendingpackages.length()) conoutf("\f3failed to download packages: still pinging the servers...");
         return 0;
     }
+#endif
     pckservers.sort(pckserversort);
     loopv(pendingpackages)
     {
@@ -609,14 +654,14 @@ int downloadpackages(bool loadscr) // get all pending packages
             if(!s->resolved || !s->ping) break;
         }
     }
-#ifdef __3DS__
-    if(downloadexpired) conoutf("\f3missing content not fetched within %d seconds of the map change: playing without it (ac3dsdownloadwait sets the limit)", ac3dsdownloadwait);
-#endif
+#ifndef __3DS__
     if(canceldownloads) pendingpackages.deletecontents();
+#endif
 
     // print error messages for all failed packages - and remove them
     loopv(pendingpackages)
     {
+        if(canceldownloads) break;
         package *pck = pendingpackages[i];
         if(!*pck->host)
         {
@@ -630,8 +675,9 @@ int downloadpackages(bool loadscr) // get all pending packages
     pendingpackages.sort(packagesort_host);
     loopvrev(pendingpackages)
     {
+        if(canceldownloads) break;
         package *pck = pendingpackages[i];
-        if(!canceldownloads && !dlpackage(h, pck, NULL))
+        if(!dlpackage(h, pck, NULL) && !canceldownloads)
         {
             conoutf("\f3failed to load %s from %s, giving up", pck->name, pck->host);
             failed = true;
@@ -640,6 +686,11 @@ int downloadpackages(bool loadscr) // get all pending packages
     }
     sem_pckservers.post();
     h.disconnect();
+#ifdef __3DS__
+    finishcancelledpackages();
+#else
+    if(canceldownloads) pendingpackages.deletecontents();
+#endif
     return failed ? 0 : h.traffic;
 }
 

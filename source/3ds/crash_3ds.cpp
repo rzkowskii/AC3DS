@@ -5,6 +5,7 @@
 // into static buffers and writes through FS:USER directly.
 
 #include "crash_3ds.h"
+#include "ac3ds_gl.h"
 #include "system.h"
 
 #include <3ds.h>
@@ -16,7 +17,8 @@
 #include <cstring>
 #include <cstdlib>
 
-const char *volatile ac3ds_crash_phase = "startup";
+std::atomic<const char *> ac3ds_crash_phase{"startup"};
+std::atomic<bool> ac3ds_crash_loading_map{false};
 
 // Markers in .text, .data and .bss with unmangled names. Their run-time
 // addresses go into every crash and fatal-error report, so
@@ -65,6 +67,21 @@ constexpr int logRingLines = 8, logRingWidth = 96;
 char logRing[logRingLines][logRingWidth] = {};
 std::atomic<u32> logRingNext{0};
 
+constexpr unsigned eventRingSize = 16;
+struct EventRecord
+{
+    std::atomic<unsigned> sequence{0}, frame{0}, millis{0};
+    std::atomic<int> detail{0};
+    std::atomic<const char *> name{nullptr}, phase{nullptr};
+};
+EventRecord eventRing[eventRingSize];
+std::atomic<unsigned> eventRingNext{0};
+
+const char *currentPhase()
+{
+    const char *phase = ac3ds_crash_phase.load(std::memory_order_acquire);
+    return phase ? phase : "?";
+}
 
 // One report buffer per writer: the exception handler and the watchdog thread.
 struct ReportBuffer
@@ -97,6 +114,22 @@ void appendContext(ReportBuffer &r)
     {
         const char *line = logRing[(next + i) % logRingLines];
         if(line[0]) append(r, "log: %.*s\n", logRingWidth - 1, line);
+    }
+}
+
+void appendEvents(ReportBuffer &r)
+{
+    const unsigned next = eventRingNext.load();
+    const unsigned count = next < eventRingSize ? next : eventRingSize;
+    for(unsigned i = next - count; i < next; ++i)
+    {
+        const EventRecord &entry = eventRing[i % eventRingSize];
+        if(entry.sequence.load() != i + 1) continue;
+        const unsigned frame = entry.frame.load(), millis = entry.millis.load();
+        const int detail = entry.detail.load();
+        const char *name = entry.name.load(), *phase = entry.phase.load();
+        if(entry.sequence.load() != i + 1) continue;
+        append(r, "event: frame %u at %u ms, %s (%d) [%s]\n", frame, millis, name, detail, phase);
     }
 }
 
@@ -198,7 +231,8 @@ void appendStack(ReportBuffer &r, u32 from, u32 codeBase, u32 codeEnd)
     crashReport.length = 0;
     append(crashReport, "AssaultCube 3DS build %d crash report\n", AC3DS_BUILD_NUMBER);
     append(crashReport, "thread: %s\n", currentThreadName());
-    append(crashReport, "phase: %s\n", ac3ds_crash_phase ? ac3ds_crash_phase : "?");
+    const char *phase = currentPhase();
+    append(crashReport, "phase: %s\n", phase);
     append(crashReport, "exception: %s (%d)\n", exceptionName(excep->type), int(excep->type));
     append(crashReport, "pc=%08lx lr=%08lx sp=%08lx cpsr=%08lx\n", regs->pc, regs->lr, regs->sp, regs->cpsr);
     append(crashReport, "far=%08lx fsr=%08lx fpexc=%08lx fpinst=%08lx\n", excep->far, excep->fsr, excep->fpexc, excep->fpinst);
@@ -225,7 +259,7 @@ void appendStack(ReportBuffer &r, u32 from, u32 codeBase, u32 codeEnd)
 
     char l1[48], l2[48], l3[48], l4[48], l5[48];
     snprintf(l1, sizeof(l1), "%s in %s", exceptionName(excep->type), currentThreadName());
-    snprintf(l2, sizeof(l2), "phase %s", ac3ds_crash_phase ? ac3ds_crash_phase : "?");
+    snprintf(l2, sizeof(l2), "phase %s", phase);
     snprintf(l3, sizeof(l3), "pc  %08lx  lr  %08lx", regs->pc, regs->lr);
     snprintf(l4, sizeof(l4), "far %08lx  fsr %08lx", excep->far, excep->fsr);
     snprintf(l5, sizeof(l5), "sp  %08lx", regs->sp);
@@ -272,26 +306,35 @@ void watchdogMain(void *)
         }
         // Map loads take tens of seconds on the handheld, so a load stage
         // gets a much longer allowance before it counts as a stall.
-        const char *phase = ac3ds_crash_phase;
-        const bool loading = phase && !strncmp(phase, "load map", 8);
+        const char *phase = currentPhase();
+        const bool loading = ac3ds_crash_loading_map.load(std::memory_order_acquire);
         if(++stalledSeconds < (loading ? 180 : 30) || reported || reporting.load()) continue;
         reported = true;
         stallReport.length = 0;
         append(stallReport, "AssaultCube 3DS build %d stall report\n", AC3DS_BUILD_NUMBER);
         append(stallReport, "main loop did not advance for %d s after %lu frames\n", stalledSeconds, now);
-        append(stallReport, "phase: %s\n", phase ? phase : "?");
-        // Written before asking GSP for the GPU state: if GSP itself is stuck,
-        // the report still reaches the SD card.
+        append(stallReport, "phase: %s\n", phase);
+        uint32_t gpu[5];
+        ac3ds_gl_runtime_state(gpu);
+        append(stallReport, "renderer: last top VBlank=%u, present waits=%u, GX submit=%08x (count:id), result=%08x, last list bytes=%u\n",
+               unsigned(gpu[3]), unsigned(gpu[4]), unsigned(gpu[0]), unsigned(gpu[1]), unsigned(gpu[2]));
+        appendEvents(stallReport);
+        appendContext(stallReport);
+        // Write the captured state before looking at GSP. It can be the
+        // service that stopped responding.
         writeFile(stallPath, stallReport);
         u32 gpuBusy = 0xffffffff;
-        GSPGPU_ReadHWRegs(0x400034, &gpuBusy, sizeof(gpuBusy));
-        append(stallReport, "gpu busy=%08lx (bit 31 = P3D, 30 = PPF, 26/27 = PSC)\n", gpuBusy);
-        appendContext(stallReport);
+        const bool gpuRight = gspHasGpuRight();
+        append(stallReport, "GSP: GPU right=%d, top present pending=%d, bottom present pending=%d\n",
+               gpuRight, gspIsPresentPending(GSP_SCREEN_TOP), gspIsPresentPending(GSP_SCREEN_BOTTOM));
+        writeFile(stallPath, stallReport);
+        const Result gpuResult = GSPGPU_ReadHWRegs(0x400034, &gpuBusy, sizeof(gpuBusy));
+        append(stallReport, "gpu busy=%08lx (bit 31 = P3D, 30 = PPF, 26/27 = PSC), read result=%08lx\n", gpuBusy, u32(gpuResult));
         writeFile(stallPath, stallReport);
         if(!aptIsActive() || reporting.load()) continue;
         char l1[48], l2[48], l3[48];
         snprintf(l1, sizeof(l1), "No progress after frame %lu", now);
-        snprintf(l2, sizeof(l2), "phase %s", phase ? phase : "?");
+        snprintf(l2, sizeof(l2), "phase %s", phase);
         snprintf(l3, sizeof(l3), "gpu busy %08lx", gpuBusy);
         const char *lines[] = { l1, l2, l3 };
         showOnTouchScreen("AssaultCube stopped responding", lines, 3, "        stall.txt");
@@ -312,7 +355,7 @@ void writeFatal(const char *what, void *caller)
     append(crashReport, "AssaultCube 3DS build %d fatal error\n", AC3DS_BUILD_NUMBER);
     append(crashReport, "%s\n", what);
     append(crashReport, "thread: %s\n", currentThreadName());
-    append(crashReport, "phase: %s\n", ac3ds_crash_phase ? ac3ds_crash_phase : "?");
+    append(crashReport, "phase: %s\n", currentPhase());
     append(crashReport, "caller=%08lx\n", u32(uintptr_t(caller)));
     append(crashReport, "image: text=%08lx data=%08lx bss=%08lx frame=%lu\n", u32(uintptr_t(&ac3ds_image_text_marker)),
            u32(uintptr_t(&ac3ds_image_data_marker)), u32(uintptr_t(&ac3ds_image_bss_marker)),
@@ -450,6 +493,21 @@ void ac3ds_crash_note_log(const char *line)
     const u32 slot = logRingNext.load(std::memory_order_relaxed) % logRingLines;
     strncpy(logRing[slot], line, logRingWidth - 1);
     logRingNext.store(slot + 1, std::memory_order_relaxed);
+}
+
+void ac3ds_crash_note_event(const char *name, int detail)
+{
+    const unsigned index = eventRingNext.fetch_add(1);
+    EventRecord &entry = eventRing[index % eventRingSize];
+    // Invalidate the old entry before writing. The watchdog skips a slot if
+    // a write was interrupted or the ring advanced while reading it.
+    entry.sequence.store(0);
+    entry.frame.store(mainTicks.load(std::memory_order_relaxed));
+    entry.millis.store(unsigned(svcGetSystemTick() / (SYSCLOCK_ARM11 / 1000)));
+    entry.name.store(name);
+    entry.phase.store(currentPhase());
+    entry.detail.store(detail);
+    entry.sequence.store(index + 1);
 }
 
 void ac3ds_crash_start_watchdog()

@@ -175,7 +175,7 @@ extern void *scoremenu;
 void rendermenu()
 {
     if(!curmenu) return;
-    if(curmenu != scoremenu) setscope(false);
+    if(curmenu != scoremenu) clearscope();
     gmenu &m = *curmenu;
     m.refresh();
 #ifdef __3DS__
@@ -939,6 +939,10 @@ void *addmenu(const char *name, const char *title, bool allowinput, void (__cdec
     DELSTRING(m->usefont);
     m->allowblink = false;
     m->forwardkeys = forwardkeys;
+#ifdef __3DS__
+    if(curmenu == m) ++handheld_menu_revision;
+    m->handheld_weapon_picker = false;
+#endif
     lastmenu = m;
     mitem::menugreyedout = false;
     return m;
@@ -954,7 +958,8 @@ void menureset(void *menu)
 {
     gmenu &m = *(gmenu *)menu;
 #ifdef __3DS__
-    if(curmenu == menu) ++handheld_menu_revision;
+    ac3ds_invalidate_menu_touch(menu);
+    m.handheld_weapon_picker = false;
 #endif
     m.items.deletecontents();
 }
@@ -972,6 +977,12 @@ void menuitemmanual(void *menu, char *text, char *action, color *bgcolor, const 
 {
     gmenu &m = *(gmenu *)menu;
     m.items.add(new mitemmanual(&m, text, action, NULL, bgcolor, desc));
+}
+
+void menuitemcopy(void *menu, const char *text, const char *action, const char *desc)
+{
+    gmenu &m = *static_cast<gmenu *>(menu);
+    m.items.add(new mitemtext(&m, newstring(text), action ? newstring(action) : NULL, NULL, NULL, desc ? newstring(desc) : NULL));
 }
 
 void menuimagemanual(void *menu, const char *filename, const char *altfontname, char *text, char *action, color *bgcolor, const char *desc)
@@ -1274,6 +1285,11 @@ const void *ac3ds_menu_identity()
     return curmenu && curmenu->allowinput ? curmenu : NULL;
 }
 
+void ac3ds_invalidate_menu_touch(const void *menu)
+{
+    if(menu && curmenu == menu) ++handheld_menu_revision;
+}
+
 // Strip Cube text formatting before drawing with the lower screen's pixel font.
 static void handheldtext(char *out, size_t capacity, const char *text)
 {
@@ -1320,6 +1336,88 @@ static int handheldmenupage(const gmenu &menu, int direction)
     return menu.menusel;
 }
 
+struct HandheldPrimary
+{
+    int gun;
+    const char *label;
+};
+
+static constexpr HandheldPrimary handheldprimaries[] =
+{
+    {GUN_ASSAULT, "ASSAULT"},
+    {GUN_SUBGUN, "SMG"},
+    {GUN_SNIPER, "SNIPER"},
+    {GUN_SHOTGUN, "SHOTGUN"},
+    {GUN_CARBINE, "CARBINE"}
+};
+static constexpr int handheldprimarycount = sizeof(handheldprimaries) / sizeof(handheldprimaries[0]);
+static_assert(handheldprimarycount + 1 == Ac3dsMenuView::row_count, "The last touch cell is Back");
+
+static bool handheldweaponpicker(const gmenu &menu)
+{
+    return menu.handheld_weapon_picker && menu.items.length() == handheldprimarycount;
+}
+
+static int handheldprimaryselection()
+{
+    if(player1) loopi(handheldprimarycount)
+        if(handheldprimaries[i].gun == player1->nextprimary) return i;
+    return 0;
+}
+
+static const char *handheldmenutitle(const gmenu &menu)
+{
+    return !strcmp(menu.name, "main") ? "AssaultCube 3DS" : menu.title ? menu.title : menu.name;
+}
+
+static bool handheldmenuentry(Ac3dsMenuRow &entry, mitem &item, int i, int primaryselection)
+{
+    entry.index = i;
+    entry.disabled = item.greyedout;
+    handheldtext(entry.label, sizeof(entry.label), item.gettext());
+    if(primaryselection >= 0)
+        copystring(entry.value, i == primaryselection ? "Selected" : guns[handheldprimaries[i].gun].title, sizeof(entry.value));
+    switch(item.mitemtype)
+    {
+        case mitem::TYPE_SLIDER:
+        {
+            mitemslider &slider = static_cast<mitemslider &>(item);
+            entry.kind = Ac3dsMenuItem::Slider;
+            const int choice = slider.value - slider.min_;
+            if(slider.opts.inrange(choice)) handheldtext(entry.value, sizeof(entry.value), slider.opts[choice]);
+            else if(slider.handheld_scale > 1)
+                snprintf(entry.value, sizeof(entry.value), "%.1f", double(slider.value) / slider.handheld_scale);
+            else snprintf(entry.value, sizeof(entry.value), "%d", slider.value);
+            break;
+        }
+        case mitem::TYPE_CHECKBOX:
+            entry.kind = Ac3dsMenuItem::Toggle;
+            copystring(entry.value, static_cast<mitemcheckbox &>(item).checked ? "On" : "Off", sizeof(entry.value));
+            break;
+        case mitem::TYPE_TEXTINPUT:
+        {
+            mitemtextinput &field = static_cast<mitemtextinput &>(item);
+            entry.kind = Ac3dsMenuItem::Text;
+            handheldtext(entry.value, sizeof(entry.value), field.hideinput && *field.input.buf ? "********" : field.input.buf);
+            break;
+        }
+        case mitem::TYPE_KEYINPUT:
+        {
+            mitemkeyinput &binding = static_cast<mitemkeyinput &>(item);
+            entry.kind = Ac3dsMenuItem::Binding;
+            handheldtext(entry.value, sizeof(entry.value), binding.keyname);
+            return binding.capture;
+        }
+        default:
+        {
+            const char *action = item.getaction();
+            entry.kind = action && *action && strcmp(action, "-1") ? Ac3dsMenuItem::Action : Ac3dsMenuItem::ReadOnly;
+            break;
+        }
+    }
+    return false;
+}
+
 void ac3ds_menu_view(Ac3dsMenuView &view)
 {
     if(ac3ds_menu_panel() != Ac3dsMenu::Standard) return;
@@ -1327,8 +1425,9 @@ void ac3ds_menu_view(Ac3dsMenuView &view)
     view.revision = handheld_menu_revision;
     view.selection = menu.menusel;
     view.back = !menustack.empty();
-    handheldtext(view.title, sizeof(view.title),
-                 !strcmp(menu.name, "main") ? "AssaultCube 3DS" : menu.title ? menu.title : menu.name);
+    view.weapon_picker = handheldweaponpicker(menu);
+    view.mode_loadout = view.weapon_picker && (m_noprimary || m_osok);
+    handheldtext(view.title, sizeof(view.title), handheldmenutitle(menu));
 
     constexpr int size = Ac3dsMenuView::row_count;
     int count = 0, selected = 0;
@@ -1339,54 +1438,15 @@ void ac3ds_menu_view(Ac3dsMenuView &view)
     }
     view.page = selected / size;
     view.pages = (count + size - 1) / size;
+    const int primaryselection = view.weapon_picker ? handheldprimaryselection() : -1;
     int skip = view.page * size, row = 0;
     loopv(menu.items)
     {
         mitem &item = *menu.items[i];
         if(!handheldmenurow(item) || skip-- > 0) continue;
         Ac3dsMenuRow &entry = view.rows[row++];
-        entry.index = i;
-        entry.disabled = item.greyedout;
-        handheldtext(entry.label, sizeof(entry.label), item.gettext());
-        switch(item.mitemtype)
-        {
-            case mitem::TYPE_SLIDER:
-            {
-                mitemslider &slider = static_cast<mitemslider &>(item);
-                entry.kind = Ac3dsMenuItem::Slider;
-                const int choice = slider.value - slider.min_;
-                if(slider.opts.inrange(choice)) handheldtext(entry.value, sizeof(entry.value), slider.opts[choice]);
-                else if(slider.handheld_scale > 1)
-                    snprintf(entry.value, sizeof(entry.value), "%.1f", double(slider.value) / slider.handheld_scale);
-                else snprintf(entry.value, sizeof(entry.value), "%d", slider.value);
-                break;
-            }
-            case mitem::TYPE_CHECKBOX:
-                entry.kind = Ac3dsMenuItem::Toggle;
-                copystring(entry.value, static_cast<mitemcheckbox &>(item).checked ? "On" : "Off", sizeof(entry.value));
-                break;
-            case mitem::TYPE_TEXTINPUT:
-            {
-                mitemtextinput &field = static_cast<mitemtextinput &>(item);
-                entry.kind = Ac3dsMenuItem::Text;
-                handheldtext(entry.value, sizeof(entry.value), field.hideinput && *field.input.buf ? "********" : field.input.buf);
-                break;
-            }
-            case mitem::TYPE_KEYINPUT:
-            {
-                mitemkeyinput &binding = static_cast<mitemkeyinput &>(item);
-                entry.kind = Ac3dsMenuItem::Binding;
-                view.binding |= binding.capture && i == menu.menusel;
-                handheldtext(entry.value, sizeof(entry.value), binding.keyname);
-                break;
-            }
-            default:
-            {
-                const char *action = item.getaction();
-                entry.kind = action && *action && strcmp(action, "-1") ? Ac3dsMenuItem::Action : Ac3dsMenuItem::ReadOnly;
-                break;
-            }
-        }
+        const bool capturing = handheldmenuentry(entry, item, i, primaryselection);
+        view.binding |= capturing && i == menu.menusel;
         if(row == size) break;
     }
 }
@@ -1431,6 +1491,19 @@ void ac3ds_menu_touch(unsigned revision, int index, Ac3dsMenuTouch action)
 
 void ac3ds_install_handheld_menus()
 {
+    delmenu("Weapons");
+    gmenu *weapons = static_cast<gmenu *>(addmenu("Weapons", NULL, true));
+    execute("menutitle [Primary weapon]; menuinit []; menuheader [] [Choose your preferred primary.]");
+    for(const HandheldPrimary &choice : handheldprimaries)
+    {
+        const guninfo &gun = guns[choice.gun];
+        defformatstring(action)("nextprimary %s; closemenu Weapons", gun.modelname);
+        defformatstring(preview)("menumdl Weapons weapons/%s/menu mapmodel 75 12", gun.modelname);
+        weapons->items.add(new mitemtext(weapons, newstring(choice.label),
+            newstring(action), newstring(preview), NULL, newstring(gun.title)));
+    }
+    weapons->handheld_weapon_picker = true;
+
     execute(R"CFG(
         delmenu welcome
         newmenu welcome
@@ -1451,7 +1524,7 @@ void ac3ds_install_handheld_menus()
         menuitem "Vote no" [ closecurmenu; key_voteno ]
         menuitem "Toggle full map" [ closecurmenu; showscores 0; showmap (! $showmap) ]
         menuitem "Drop flag" [ closecurmenu; dropflag ]
-        menuitem "Weapons" [ showmenu Weapons ]
+        menuitem "Primary weapon" [ showmenu Weapons ]
         menuitem "Handheld controls" [ showmenu [Handheld controls] ]
         menuitem "Settings" [ showmenu Settings ]
         menuitem "Screenshot" [ closecurmenu; sleep 100 [ screenshot ] ]
@@ -1470,7 +1543,7 @@ void ac3ds_install_handheld_menus()
         menuitem "Vote no" [ closecurmenu; key_voteno ]
         menuitem "Toggle full map" [ closecurmenu; showscores 0; showmap (! $showmap) ]
         menuitem "Drop flag" [ closecurmenu; dropflag ]
-        menuitem "Weapons" [ showmenu Weapons ]
+        menuitem "Primary weapon" [ showmenu Weapons ]
         menuitem "Scores" [ closecurmenu; showscores 1 ]
         menuitem "Server / team menu" [ ingamemenu ]
         menuitem "Handheld controls" [ showmenu [Handheld controls] ]
@@ -1561,13 +1634,53 @@ int movemenuselection(int currentmenusel, int direction)
 }
 
 #ifdef __3DS__
+struct ScoreboardLayout
+{
+    float scale;
+    int height, pagesize;
+};
+
+static int displayedScoreboardPageSize = 0;
+
+static ScoreboardLayout scoreboardlayout(int itemcount, int headerrows, int fontheight)
+{
+    extern int hudtextscale, hidespecthud;
+    int respawnsecs;
+    const bool prompt = !hidespecthud && respawnstatus(respawnsecs) != RS_NONE;
+    const float fullheight = 2.0f * VIRTH * (prompt ? (AC3DS_RESPAWN_PROMPT_TOP + 10) / 240.0f : 1.0f);
+    const int rowheight = fontheight * 5 / 4;
+    const int fixedheight = (headerrows + 2) * rowheight + 6 * fontheight;
+    const int limit = MAXMENU - headerrows;
+    const float ceiling = hudtextscale / 100.0f;
+    const float scale = clamp(fullheight / (min(itemcount, limit) * rowheight + fixedheight), min(1.35f, ceiling), ceiling);
+    const int height = int(fullheight / scale + 0.5f);
+    const int fitrows = max(1, (height - fixedheight) / rowheight);
+    return {scale, height, min(limit, fitrows)};
+}
+
 // L/ZL and R/ZR arrive as Page Up and Page Down. Over the scoreboard, the one
 // menu that takes no input, they still turn its page, but the key is not
 // consumed: the shoulder buttons keep their match bindings, so fire can respawn
 // the player while the scoreboard that opens on death is up.
-static bool scoreboardpage(int sel)
+static bool scoreboardpage(gmenu &menu, int headerrows, int direction)
 {
-    menuselect(curmenu, sel);
+    const int count = menu.items.length();
+    if(count)
+    {
+        // Navigate the rows drawn in the last frame. The font and footer
+        // measured during rendering can differ from the input-time layout.
+        int size = displayedScoreboardPageSize;
+        if(!size)
+        {
+            const font *menufont = menu.usefont ? getfont(menu.usefont) : NULL;
+            size = scoreboardlayout(count, headerrows, menufont ? menufont->defaulth : FONTH).pagesize;
+        }
+        const int pages = (count + size - 1) / size;
+        const int page = (menu.menusel / size + direction + pages) % pages;
+        menuselect(&menu, page * size);
+        extern int debugevents;
+        if(debugevents >= 2) clientlogf("scoreboard: page %d/%d (%d rows per page)", page + 1, pages, size);
+    }
     return false;
 }
 #endif
@@ -1607,15 +1720,30 @@ bool menukey(int code, bool isdown, SDL_Keymod mod)
         }
     }
     code = ac3ds_menu_key(code);
+    if(isdown && handheldweaponpicker(*curmenu))
+    {
+        constexpr int columns = Ac3dsMenuView::weapon_columns;
+        int target = menusel;
+        switch(code)
+        {
+            case SDLK_LEFT: target -= menusel % columns; break;
+            case SDLK_RIGHT: target += columns - 1 - menusel % columns; break;
+            case SDLK_UP: target -= columns; break;
+            case SDLK_DOWN: target += columns; break;
+        }
+        if(target != menusel && curmenu->items.inrange(target)) menuselect(curmenu, target);
+        if(code == SDLK_LEFT || code == SDLK_RIGHT || code == SDLK_UP || code == SDLK_DOWN) return true;
+    }
 #endif
     if(isdown)
     {
-        int pagesize = MAXMENU - curmenu->headeritems();
+        const int headerrows = curmenu->headeritems(), pagesize = MAXMENU - headerrows;
 
         switch(code)
         {
             case SDLK_PAGEUP:
 #ifdef __3DS__
+                if(curmenu == scoremenu) return scoreboardpage(*curmenu, headerrows, -1);
                 if(ac3ds_menu_panel() == Ac3dsMenu::Standard)
                 {
                     menusel = handheldmenupage(*curmenu, -1);
@@ -1623,12 +1751,10 @@ bool menukey(int code, bool isdown, SDL_Keymod mod)
                 }
 #endif
                 menusel -= pagesize;
-#ifdef __3DS__
-                if(!curmenu->allowinput) return scoreboardpage(menusel);
-#endif
                 break;
             case SDLK_PAGEDOWN:
 #ifdef __3DS__
+                if(curmenu == scoremenu) return scoreboardpage(*curmenu, headerrows, 1);
                 if(ac3ds_menu_panel() == Ac3dsMenu::Standard)
                 {
                     menusel = handheldmenupage(*curmenu, 1);
@@ -1637,9 +1763,6 @@ bool menukey(int code, bool isdown, SDL_Keymod mod)
 #endif
                 if(menusel+pagesize>=n && menusel/pagesize!=(n-1)/pagesize) menusel = n-1;
                 else menusel += pagesize;
-#ifdef __3DS__
-                if(!curmenu->allowinput) return scoreboardpage(menusel);
-#endif
                 break;
             case SDLK_ESCAPE:
             case SDL_AC_BUTTON_RIGHT:
@@ -1789,6 +1912,10 @@ void gmenu::open()
 {
     inited = false;
     if(!allowinput) menusel = 0;
+#ifdef __3DS__
+    if(this == scoremenu) displayedScoreboardPageSize = 0;
+    if(handheldweaponpicker(*this)) menusel = handheldprimaryselection();
+#endif
     if(!forwardkeys) player1->stopmoving();
     setcontext("menu", name);
     if(initaction)
@@ -1823,7 +1950,7 @@ void gmenu::init()
     if(!menuseldescbgcolor) menuseldescbgcolor = new color(0.2f, 0.2f, 0.2f, 0.2f);
     if(dirlist && dirlist->dir && dirlist->ext)
     {
-        items.deletecontents();
+        menureset(this);
 
         if(dirlist->subdiraction)
         {
@@ -1987,19 +2114,21 @@ static Texture *handheldpreview(gmenu &menu, mitem *item, const char *&descripti
 
 static void renderhandheldmenu(gmenu &menu)
 {
-    Ac3dsMenuView view;
-    ac3ds_menu_view(view);
-    mitem *item = menu.items.inrange(menu.menusel) ? menu.items[menu.menusel] : NULL;
-    const Ac3dsMenuRow *row = NULL;
-    for(const Ac3dsMenuRow &entry : view.rows)
-        if(entry.index == view.selection) { row = &entry; break; }
+    const int selected = menu.menusel;
+    mitem *item = menu.items.inrange(selected) ? menu.items[selected] : NULL;
+    Ac3dsMenuRow row;
+    const bool binding = item && handheldmenuentry(row, *item, selected,
+                         handheldweaponpicker(menu) ? handheldprimaryselection() : -1);
     const char *detail = item ? item->getdesc() : NULL;
     if(!detail || !*detail) detail = menu.footer;
     Texture *preview = handheldpreview(menu, item, detail);
     const bool brand = !strcmp(menu.name, "main") || !strcmp(menu.name, "welcome");
 
-    // The projection makes the default font roughly 11 pixels high at 400x240.
-    const int width = VIRTW * 3 / 4, height = VIRTH * 3 / 4, pad = 82;
+    const bool pixel = ac3ds_push_pixel_font();
+    const int width = pixel ? AC3DS_WIDTH : VIRTW * 3 / 4;
+    const int height = pixel ? AC3DS_HEIGHT : VIRTH * 3 / 4;
+    const int pad = pixel ? 15 : 82;
+    const int headingScale = pixel ? 2 : 1;
     glPushMatrix();
     glLoadIdentity();
     glOrtho(0, width, height, 0, -1, 1);
@@ -2016,18 +2145,6 @@ static void renderhandheldmenu(gmenu &menu)
         {
             const int size = width - 2 * pad;
             handheldmenuimage(startscreen->id, pad, pad / 2, size, size * 48 / 100, 0.04f, 0.52f);
-            // "3DS" badge in the empty top-right corner beside the logo.
-            const float badgescale = 2.0f;
-            int bw, bh;
-            text_bounds("3DS", bw, bh);
-            const int badgew = int(bw * badgescale) + FONTH, badgeh = int(FONTH * badgescale) + FONTH / 2;
-            const int bx = width - pad - badgew, by = pad / 2;
-            handheldmenurect(bx, by, badgew, badgeh, 169, 207, 118, 255);
-            glPushMatrix();
-            glTranslatef(bx + (badgew - bw * badgescale) / 2, by + (badgeh - FONTH * badgescale) / 2, 0);
-            glScalef(badgescale, badgescale, 1);
-            draw_text("3DS", 0, 0, 12, 21, 18, 255);
-            glPopMatrix();
         }
     }
     else if(preview && preview != notexture && preview->xs && preview->ys)
@@ -2039,29 +2156,30 @@ static void renderhandheldmenu(gmenu &menu)
         handheldmenuimage(preview->id, x, y, w, h);
     }
 
-    const char *heading = row && row->label[0] ? row->label : view.title;
+    const char *heading = row.label[0] ? row.label : handheldmenutitle(menu);
     if(!strcmp(menu.name, "Match menu")) heading = "Match paused";
     else if(!strcmp(menu.name, "Match menu online")) heading = "Match menu";
     if(menu.previewtexturetitle && *menu.previewtexturetitle) heading = menu.previewtexturetitle;
-    if(view.binding) detail = "Press and release a button. START cancels.";
-    else if(!detail && row && !row->disabled)
+    if(binding) detail = "Press and release a button. START cancels.";
+    else if(!detail && item && !row.disabled)
     {
-        if(row->kind == Ac3dsMenuItem::Slider) detail = "Use Left / Right or tap - / + to adjust.";
-        else if(row->kind == Ac3dsMenuItem::Text) detail = "Press A or tap the row to open the keyboard.";
-        else if(row->kind == Ac3dsMenuItem::Binding) detail = "Press A or tap the row to change the binding.";
+        if(row.kind == Ac3dsMenuItem::Slider) detail = "Use Left / Right or tap - / + to adjust.";
+        else if(row.kind == Ac3dsMenuItem::Text) detail = "Press A or tap the row to open the keyboard.";
+        else if(row.kind == Ac3dsMenuItem::Binding) detail = "Press A or tap the row to change the binding.";
     }
-    if(!view.pages && !detail) detail = "No entries";
+    if(menu.items.empty() && !detail) detail = "No entries";
 
     const int textwidth = width - 4 * pad;
     int textw, headingh, detailh = 0, headerh = 0;
     text_bounds(heading, textw, headingh, textwidth);
     if(detail) text_bounds(detail, textw, detailh, textwidth);
     if(menu.header) text_bounds(menu.header, textw, headerh, textwidth);
+    headingh *= headingScale;
     const int cardh = min(height - 2 * pad, 3 * pad / 2 + headingh + detailh + headerh +
-                          (row && row->value[0] ? FONTH : 0));
+                          (row.value[0] ? FONTH : 0));
     const int y = height - pad - cardh;
     handheldmenurect(pad, y, width - 2 * pad, cardh, 12, 21, 18, 245);
-    handheldmenurect(pad, y, 14, cardh, 169, 207, 118, 255);
+    handheldmenurect(pad, y, pixel ? 2 : 14, cardh, 169, 207, 118, 255);
     int line = y + 3 * pad / 4;
     const int x = 2 * pad, bottom = height - pad / 2;
     if(menu.header)
@@ -2069,11 +2187,18 @@ static void renderhandheldmenu(gmenu &menu)
         draw_text(menu.header, x, line, 171, 195, 174, 255, -1, textwidth);
         line += headerh;
     }
-    if(line + FONTH < bottom) draw_text(heading, x, line, 235, 246, 231, 255, -1, textwidth);
-    line += headingh;
-    if(row && row->value[0] && line + FONTH < bottom)
+    if(line + FONTH * headingScale < bottom)
     {
-        draw_text(row->value, x, line, 186, 216, 145, 255, -1, textwidth);
+        glPushMatrix();
+        glTranslatef(x, line, 0);
+        glScalef(1, headingScale, 1);
+        draw_text(heading, 0, 0, 235, 246, 231, 255, -1, textwidth);
+        glPopMatrix();
+    }
+    line += headingh;
+    if(row.value[0] && line + FONTH < bottom)
+    {
+        draw_text(row.value, x, line, 186, 216, 145, 255, -1, textwidth);
         line += FONTH;
     }
     if(detail && line + FONTH < bottom)
@@ -2085,6 +2210,7 @@ static void renderhandheldmenu(gmenu &menu)
     }
     ignoreblinkingbit = false;
     glPopMatrix();
+    if(pixel) popfont();
 }
 #endif
 
@@ -2096,10 +2222,13 @@ static void renderhandheldmenu(gmenu &menu)
 // carries the details and actions.
 static void renderhandheldservers(gmenu &menu)
 {
-    static Ac3dsServerRow rows[256];
-    int selected = -1;
-    const int count = ac3ds_server_rows(&menu, rows, 256, selected);
     const int width = VIRTW / 2, height = VIRTH / 2, pad = FONTH / 2;
+    const int headerh = FONTH * 3 / 2, footerh = FONTH * 2, rowh = FONTH * 6 / 5;
+    const int top = headerh + FONTH / 6, visible = max(1, (height - footerh - top) / rowh);
+    static vector<Ac3dsServerRow> rows;
+    while(rows.length() < visible) rows.add();
+    const Ac3dsServerList list = ac3ds_server_window(&menu, rows.getbuf(), visible);
+    const int count = list.count, first = list.first, selected = list.selected;
     glPushMatrix();
     glLoadIdentity();
     glOrtho(0, width, height, 0, -1, 1);
@@ -2109,7 +2238,6 @@ static void renderhandheldservers(gmenu &menu)
     handheldmenurect(0, 0, width, height, 6, 11, 9, 255);
 
     // Header: title and count, sort order on the right.
-    const int headerh = FONTH * 3 / 2;
     handheldmenurect(0, 0, width, headerh, 12, 21, 18, 255);
     handheldmenurect(0, headerh - FONTH / 10, width, FONTH / 10, 169, 207, 118, 255);
     extern void *searchmenu;
@@ -2119,17 +2247,13 @@ static void renderhandheldservers(gmenu &menu)
     draw_text(sorted, width - pad - text_width(sorted), (headerh - FONTH) / 2, 171, 195, 174, 255);
 
     // Rows.
-    const int footerh = FONTH * 2, rowh = FONTH * 6 / 5;
-    const int top = headerh + FONTH / 6, visible = max(1, (height - headerh - footerh - FONTH / 6) / rowh);
-    int first = 0;
-    if(selected >= 0) first = clamp(selected - visible / 2, 0, max(0, count - visible));
     const int marker = FONTH / 2, playersx = pad + marker + FONTH / 3;
     const int namex = playersx + text_width("88/88") + FONTH / 3;
     if(!count)
         draw_text(ac3ds_server_total() ? "Waiting for servers..." : "No servers. Tap SCAN.", pad, top + rowh, 185, 207, 188, 255);
     for(int i = first; i < count && i < first + visible; ++i)
     {
-        const Ac3dsServerRow &r = rows[i];
+        const Ac3dsServerRow &r = rows[i - first];
         const int y = top + (i - first) * rowh;
         if(i == selected)
         {
@@ -2169,7 +2293,7 @@ static void renderhandheldservers(gmenu &menu)
     string line;
     if(selected >= 0)
     {
-        const Ac3dsServerRow &r = rows[selected];
+        const Ac3dsServerRow &r = rows[selected - first];
         if(r.map[0]) formatstring(line)("%s  %s  %dmin", r.map, r.mode, r.minremain);
         else copystring(line, r.responded ? "Empty server" : "Waiting for an answer");
     }
@@ -2178,30 +2302,271 @@ static void renderhandheldservers(gmenu &menu)
     draw_text(line, pad, height - footerh + (footerh - FONTH) / 2, 235, 246, 231, 255);
     glPopMatrix();
 }
+
+static const char *nextscorecell(const char *row, string &cell, char *flag = NULL)
+{
+    const size_t length = strcspn(row, "\t");
+    size_t copied = min(length, sizeof(cell) - 1);
+    memcpy(cell, row, copied);
+    cell[copied] = '\0';
+    if(flag)
+    {
+        const char *icon = strchr(cell, '\a');
+        *flag = icon ? icon[1] : '\0';
+        if(icon) copied = icon - cell;
+    }
+    while(copied && cell[copied - 1] == ' ') --copied;
+    cell[copied] = '\0';
+    row += length;
+    return *row == '\t' ? row + 1 : row;
+}
+
+static void drawscoretext(const char *text, int x, int y, const bvec &color, int heightScale)
+{
+    if(heightScale == 1) draw_text(text, x, y, color.x, color.y, color.z);
+    else
+    {
+        glPushMatrix();
+        glTranslatef(x, y, 0);
+        glScalef(1, heightScale, 1);
+        draw_text(text, 0, 0, color.x, color.y, color.z);
+        glPopMatrix();
+    }
+}
+
+static void drawscorelabel(const char *text, int x, int y, int width, const bvec &color)
+{
+    if(!text || !*text || width <= 0) return;
+    string label;
+    copystring(label, text);
+    if(text_width(label) > width)
+    {
+        const int ellipsis = text_width("...");
+        const bool canEllipsize = width > ellipsis;
+        label[text_visible(label, width - (canEllipsize ? ellipsis : 0), 0, -1)] = '\0';
+        if(canEllipsize) concatstring(label, "...");
+    }
+    draw_text(label, x, y, color.x, color.y, color.z);
+}
+
+constexpr int scoreCellPad = 4, scoreFlagWidth = 12;
+
+struct HandheldScoreColumn { const char *heading; int width, x, line; bool name; };
+
+struct HandheldScoreColumns
+{
+    unsigned revision = 0;
+    int count = 0, lines = 1;
+    HandheldScoreColumn columns[7];
+};
+
+static const HandheldScoreColumns &handheldscorecolumns(const gmenu &menu, int maxWidth)
+{
+    static HandheldScoreColumns layout;
+    if(layout.revision == ac3ds_score_display.layoutRevision) return layout;
+    layout.revision = ac3ds_score_display.layoutRevision;
+    layout.count = 0;
+    layout.lines = 1;
+    const bool flagMode = m_flags_;
+
+    const char *headings = menu.title ? menu.title : "";
+    while(*headings && layout.count < int(sizeof(layout.columns) / sizeof(layout.columns[0])))
+    {
+        string heading;
+        headings = nextscorecell(headings, heading);
+        HandheldScoreColumn column{"", 0, 0, 0, false};
+        if(!strcmp(heading, "flags")) column.heading = "Flag";
+        else if(!strcmp(heading, "frags")) column.heading = "K";
+        else if(!strcmp(heading, "deaths")) column.heading = "D";
+        else if(!strcmp(heading, "ratio"))
+        {
+            column.heading = "K/D";
+            column.width = text_width("10.00");
+        }
+        else if(!strcmp(heading, "pj/ping")) column.heading = "PJ/Ping";
+        else if(!strcmp(heading, "cn"))
+        {
+            column.heading = "CN";
+            column.width = text_width("RVSF");
+        }
+        else if(!strcmp(heading, "name"))
+        {
+            column.heading = "Player";
+            column.width = MAXNAMELEN * curfont->defaultw + (flagMode ? scoreFlagWidth : 0);
+            column.name = true;
+        }
+        else continue;
+        column.width = max(column.width, max(2 * curfont->defaultw, text_width(column.heading))) + scoreCellPad;
+        layout.columns[layout.count++] = column;
+    }
+
+    // Fit the complete cells on every page. Widths are recalculated only when
+    // score data or column preferences change, so paging itself is inexpensive.
+    loopv(menu.items)
+    {
+        const char *row = menu.items[i]->gettext();
+        if(!row || !*row) continue;
+        loopj(layout.count)
+        {
+            string cell;
+            HandheldScoreColumn &column = layout.columns[j];
+            char flag;
+            row = nextscorecell(row, cell, column.name ? &flag : NULL);
+            // Reserve the icon after the full name and status, including when
+            // nobody is carrying a flag. Possession must not change the pages.
+            const int iconSpace = flagMode && column.name ? scoreFlagWidth : 0;
+            column.width = max(column.width, text_width(cell) + scoreCellPad + iconSpace);
+        }
+    }
+
+    int used = 0;
+    loopi(layout.count)
+    {
+        HandheldScoreColumn &column = layout.columns[i];
+        if(used && used + column.width > maxWidth)
+        {
+            ++layout.lines;
+            used = 0;
+        }
+        column.x = used;
+        column.line = layout.lines - 1;
+        used += column.width;
+    }
+    return layout;
+}
+
+static void renderhandheldscoreboard(gmenu &menu)
+{
+    constexpr int left = 8, top = 6, width = AC3DS_WIDTH - 2 * left, pad = 8;
+    constexpr int innerWidth = width - 2 * pad;
+    const HandheldScoreColumns &layout = handheldscorecolumns(menu, innerWidth);
+    const bool outcome = *ac3ds_score_display.outcome;
+    const int columnsY = top + 38 + (outcome ? 11 : 0);
+    extern int hidespecthud, hudtextscale;
+    int seconds;
+    const bool respawn = !hidespecthud && respawnstatus(seconds) != RS_NONE;
+    const int limit = respawn ? AC3DS_RESPAWN_PROMPT_TOP - 4 : AC3DS_HEIGHT - top;
+    const int footerHeight = menu.footer && *menu.footer ? 16 : 4;
+    // A large row needs room for both its headings and one whole record.
+    const int largeRowHeight = layout.lines * (FONTH * 2 + 2) + 1;
+    const bool largeFits = columnsY + 2 * largeRowHeight + 2 + footerHeight <= limit;
+    const int glyphScale = hudtextscale >= 240 && largeFits ? 2 : 1;
+    const int lineHeight = FONTH * glyphScale + 2;
+    const int rowHeight = layout.lines * lineHeight + 1, rowsY = columnsY + rowHeight + 2;
+    const int count = menu.items.length();
+    displayedScoreboardPageSize = max(1, (limit - rowsY - footerHeight) / rowHeight);
+    const int pageSize = displayedScoreboardPageSize;
+    const int pages = max(1, (count + pageSize - 1) / pageSize);
+    menu.menusel = clamp(menu.menusel, 0, max(0, count - 1));
+    const int page = menu.menusel / pageSize, offset = page * pageSize;
+    const int visible = min(count - offset, pageSize);
+    const int bottom = rowsY + min(count, pageSize) * rowHeight + footerHeight;
+
+    static const bvec textColor(242, 246, 236), muted(177, 194, 177), accent(181, 224, 123);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0, AC3DS_WIDTH, AC3DS_HEIGHT, 0, -1, 1);
+    glEnable(GL_BLEND);
+    handheldmenurect(left, top, width, bottom - top, 9, 17, 13, 247);
+    handheldmenurect(left, top, width, columnsY - top, 19, 36, 26, 255);
+    handheldmenurect(left, top, width, 1, 181, 224, 123, 255);
+
+    glPushMatrix();
+    glTranslatef(left + pad, top + 7, 0);
+    glScalef(2, 2, 1);
+    draw_text("Scoreboard", 0, 0, textColor.x, textColor.y, textColor.z);
+    glPopMatrix();
+
+    drawscorelabel(ac3ds_score_display.summary, left + pad, top + 27, innerWidth, muted);
+    if(outcome) drawscorelabel(ac3ds_score_display.outcome, left + pad, top + 38, innerWidth, textColor);
+    if(pages > 1)
+    {
+        defformatstring(indicator)("%d/%d", page + 1, pages);
+        draw_text(indicator, left + width - pad - text_width(indicator), top + 11, accent.x, accent.y, accent.z);
+    }
+
+    handheldmenurect(left, columnsY, width, rowsY - columnsY, 27, 47, 33, 255);
+    loopi(layout.count)
+    {
+        const HandheldScoreColumn &column = layout.columns[i];
+        const int x = left + pad + column.x + (column.name ? scoreCellPad / 2 : (column.width - text_width(column.heading)) / 2);
+        drawscoretext(column.heading, x, columnsY + 2 + column.line * lineHeight, accent, glyphScale);
+    }
+
+    loopi(visible)
+    {
+        mitem &item = *menu.items[offset + i];
+        const char *row = item.gettext();
+        if(!row || !*row) continue;
+        const int y = rowsY + i * rowHeight;
+        if(const color *background = item.bgcolor)
+        {
+            if(background->r > background->b) handheldmenurect(left, y, width, rowHeight, 61, 30, 31, 255);
+            else if(background->b > background->r) handheldmenurect(left, y, width, rowHeight, 29, 43, 63, 255);
+            else
+            {
+                handheldmenurect(left, y, width, rowHeight, 38, 65, 41, 255);
+                handheldmenurect(left, y, 2, rowHeight, 181, 224, 123, 255);
+            }
+        }
+        else if(i % 2) handheldmenurect(left, y, width, rowHeight, 17, 28, 21, 255);
+
+        const bvec &rowColor = row[0] == '\f' && row[1] == '4' ? muted : textColor;
+        loopj(layout.count)
+        {
+            const HandheldScoreColumn &column = layout.columns[j];
+            string cell;
+            char flag;
+            row = nextscorecell(row, cell, &flag);
+            const int x = left + pad + column.x;
+            const int lineY = y + column.line * lineHeight;
+            if(*cell)
+                drawscoretext(cell, x + (column.name ? scoreCellPad / 2 : (column.width - text_width(cell)) / 2),
+                              lineY + 1, rowColor, glyphScale);
+            if(flag)
+            {
+                const bvec flagColor = flag == 'D' ? bvec(255, 126, 117) : flag == 'H' ? bvec(118, 186, 255) : bvec(245, 216, 94);
+                const int flagX = x + scoreCellPad / 2 + text_width(cell) + 2;
+                const int flagY = lineY + (lineHeight + 1 - 7) / 2;
+                handheldmenurect(flagX, flagY, 1, 7, flagColor.x, flagColor.y, flagColor.z, 255);
+                handheldmenurect(flagX + 1, flagY, 6, 4, flagColor.x, flagColor.y, flagColor.z, 255);
+            }
+        }
+    }
+
+    if(menu.footer && *menu.footer)
+    {
+        const int y = bottom - footerHeight;
+        handheldmenurect(left, y, width, footerHeight, 19, 36, 26, 255);
+        drawscorelabel(menu.footer, left + pad, y + 4, innerWidth, muted);
+    }
+    glPopMatrix();
+}
 #endif
 
 void gmenu::render()
 {
 #ifdef __3DS__
-    // Information menus (the scoreboard) drawn over play on the top screen
-    // get the handheld text scale; layout runs in the scaled space. The
-    // scoreboard shrinks toward a readable floor when its rows would not fit.
-    extern int hudtextscale;
-    extern void *scoremenu;
-    const bool scaledmenu = this == scoremenu;
-    float uiscale = scaledmenu ? hudtextscale / 100.0f : 1.0f;
-    // While the respawn prompt shows at the bottom of the screen, the
-    // scoreboard is laid out in the space above it. The margin the layout
-    // keeps under the box already covers part of the strip.
-    extern int hidespecthud;
-    int respawnsecs;
-    const bool prompt = scaledmenu && !hidespecthud && respawnstatus(respawnsecs) != RS_NONE;
-    const float fullh = 2.0f * VIRTH * (prompt ? (AC3DS_RESPAWN_PROMPT_TOP + 10) / 240.0f : 1.0f);
-    int VW2 = int(2 * VIRTW / uiscale), VH2 = int(fullh / uiscale);
-#else
-    const int VW2 = 2 * VIRTW, VH2 = 2 * VIRTH;
+    if(this == scoremenu && ac3ds_push_pixel_font())
+    {
+        renderhandheldscoreboard(*this);
+        popfont();
+        return;
+    }
 #endif
     if(usefont) pushfont(usefont);
+    const int hitems = headeritems();
+#ifdef __3DS__
+    const bool scoreboard = this == scoremenu;
+    const ScoreboardLayout layout = scoreboard ? scoreboardlayout(items.length(), hitems, FONTH) :
+                                                 ScoreboardLayout{1.0f, 2 * VIRTH, MAXMENU - hitems};
+    if(scoreboard) displayedScoreboardPageSize = layout.pagesize;
+    const int VW2 = int(2 * VIRTW / layout.scale + 0.5f), VH2 = layout.height;
+    const int pagesize = layout.pagesize;
+#else
+    const int VW2 = 2 * VIRTW, VH2 = 2 * VIRTH;
+    const int pagesize = MAXMENU - hitems;
+#endif
     if(!allowblink) ignoreblinkingbit = true;
     bool synctabs = title != NULL || synctabstops;
     const char *t = title;
@@ -2212,7 +2577,7 @@ void gmenu::render()
         else formatstring(buf)("[ %s menu ]", name);
         t = buf;
     }
-    int w = 0, footermaxw = VW2 - 6 * FONTH, hitems = headeritems(), footwidth, footheight, maxfootheight = 0;
+    int w = 0, footermaxw = VW2 - 6 * FONTH, footwidth, footheight, maxfootheight = 0;
     if(hasdesc) loopv(items) if(items[i]->getdesc())
     {
         text_bounds(items[i]->getdesc(), footwidth, footheight, footermaxw);
@@ -2221,35 +2586,13 @@ void gmenu::render()
     }
     if(synctabs) text_startcolumns();
     loopv(items) w = max(w, items[i]->width());
-    int pagesize = MAXMENU - hitems,
-        offset = menusel - (menusel%pagesize),
+    int offset = menusel - (menusel%pagesize),
         mdisp = min(items.length(), pagesize),
         cdisp = min(items.length()-offset, pagesize),
         pages = (items.length() - 1) / pagesize;
 #ifdef __3DS__
-    if(scaledmenu)
-    {
-        // Height in font units: header, title, rows and footer, plus the
-        // 3*FONTH margins the vertical clamp below keeps on each side.
-        const int rowstep = (FONTH*5)/4, fixedh = (hitems+2)*rowstep + 6*FONTH;
-        const float ceiling = uiscale, minscale = min(1.35f, ceiling);
-        uiscale = clamp(fullh / (mdisp*rowstep + fixedh), minscale, ceiling);
-        // Round so a scale chosen to fit exactly is not truncated one unit short.
-        VW2 = int(2 * VIRTW / uiscale + 0.5f);
-        VH2 = int(fullh / uiscale + 0.5f);
-        // Still too tall at the floor: page the rows so the header and footer stay on screen.
-        const int fitrows = max(1, (VH2 - fixedh) / rowstep);
-        if(fitrows < pagesize && fitrows < items.length())
-        {
-            pagesize = fitrows;
-            offset = menusel - (menusel%pagesize);
-            mdisp = min(items.length(), pagesize);
-            cdisp = min(items.length()-offset, pagesize);
-            pages = (items.length() - 1) / pagesize;
-        }
-    }
     glPushMatrix();
-    glScalef(uiscale, uiscale, 1);
+    glScalef(layout.scale, layout.scale, 1);
     struct PopScale { ~PopScale() { glPopMatrix(); } } popscale;
 #endif
     mitem::whitepulse.alpha = (sinf(lastmillis/200.0f)+1.0f)/2.0f;
@@ -2337,8 +2680,8 @@ void clearchanges(int type)
 void refreshapplymenu(void *menu, bool init)
 {
     gmenu *m = (gmenu *) menu;
-    if(!m || (!init && needsapply.length() != m->items.length()-3)) return;
-    m->items.deletecontents();
+    if(!m || (!init && needsapply.length() == m->items.length()-3)) return;
+    menureset(m);
     loopv(needsapply) m->items.add(new mitemtext(m, newstring(needsapply[i]), NULL, NULL, NULL));
     m->items.add(new mitemtext(m, newstring(""), NULL, NULL, NULL));
     m->items.add(new mitemtext(m, newstring("Yes"), newstring("resetgl"), NULL, NULL));

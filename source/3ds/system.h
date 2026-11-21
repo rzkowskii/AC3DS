@@ -15,7 +15,7 @@ constexpr int AC3DS_RESPAWN_PROMPT_TOP = 200;
 enum class Ac3dsMenu { None, Standard, ServerBrowser, ServerInfo };
 
 enum class Ac3dsMenuItem { Empty, ReadOnly, Action, Slider, Toggle, Text, Binding };
-enum class Ac3dsMenuTouch { Activate, Decrease, Increase, Previous, Next, Back };
+enum class Ac3dsMenuTouch { None, Activate, Decrease, Increase, Previous, Next, Back };
 
 struct Ac3dsMenuRow
 {
@@ -28,15 +28,18 @@ struct Ac3dsMenuRow
 struct Ac3dsMenuView
 {
     static constexpr int row_count = 6;
+    static constexpr int weapon_columns = 2;
     unsigned revision = 0;
     int page = 0, pages = 0, selection = -1;
-    bool binding = false, back = false;
+    bool binding = false, back = false, weapon_picker = false, mode_loadout = false;
     char title[64] = {};
     Ac3dsMenuRow rows[row_count];
 };
 
 struct SDL_KeyboardEvent;
 constexpr int AC3DS_MENU_TOUCH_EVENT = 0x4143;
+constexpr int AC3DS_SERVER_JOIN_EVENT = 0x4144;
+void ac3ds_dispatch_server_join(unsigned context, unsigned id);
 
 const char *ac3ds_system_init();
 void ac3ds_system_shutdown();
@@ -55,6 +58,8 @@ void ac3ds_draw_controls();
 void ac3ds_service_controls();
 void ac3ds_draw_server_controls();
 void ac3ds_controls_changed();
+void ac3ds_minimap_reset();
+void ac3ds_minimap_updated();
 void ac3ds_show_startup_report(const char *const *lines, int count);
 // Lower-screen loading progress (title and stage may be null to keep them).
 void ac3ds_loading_screen(const char *title, const char *stage, float progress);
@@ -62,11 +67,13 @@ void ac3ds_loading_done();
 bool ac3ds_save_bottom_screen(const char *path);
 Ac3dsMenu ac3ds_menu_panel();
 const void *ac3ds_menu_identity();
+void ac3ds_invalidate_menu_touch(const void *menu);
 void ac3ds_menu_view(Ac3dsMenuView &view);
 void ac3ds_menu_touch(unsigned revision, int index, Ac3dsMenuTouch action);
 void ac3ds_install_handheld_menus();
 void ac3ds_install_keymap();
 void ac3ds_default_binds();
+void ac3ds_upgrade_scope_binding();
 // The physical button whose binding for a dead or spectating player is exactly
 // `action`, named as on the console ("L", "D-Pad Left"); NULL if there is none.
 const char *ac3ds_spectator_button(const char *action);

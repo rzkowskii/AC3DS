@@ -14,8 +14,8 @@
 - **Designed for two screens.** The top screen is the game, at the full 400×240. The bottom screen is your match screen:
   - a rotating close-range radar, or a north-up view of the whole map;
   - drag the stylus to look around, and double-tap to jump;
-  - big translucent RELOAD and GRENADE buttons;
-  - a small corner tab that slides out MENU, SCORES, WEAPON and CHAT, and stays out of the way while you play.
+  - translucent RELOAD and GRENADE buttons and a WEAPON button for choosing your next primary;
+  - a small corner tab for MENU, SCORES and CHAT.
 - **Fast loading.** The maps timed on a New 2DS XL load in 1.1 to 3.3 seconds (`ac_douze` 1.1 s, `ac_dusk` 2.3 s, `ac_arctic2` 2.8 s, `ac_alcove` 3.3 s). Early in the port the first map took 68 seconds.
 - **Smooth play.** The game runs in New 3DS 804 MHz mode, synced to the top screen's 60 Hz refresh. In the Azahar emulator, six-bot matches run at 59.8 to 59.9 FPS. Once a map is running, the frame samples logged on the handheld during online play are mostly 14 to 17 ms.
 - **Faithful to the original.** It has:
@@ -40,8 +40,8 @@ All captured in the Azahar emulator in New 3DS mode, with the top and bottom scr
 | **ac_arctic2**: snow, sky box and mountains | **ac_aqueous**: bots on the move |
 | ![Bots with shadows on ac_sunset](docs/screenshots/sunset-bots.png) | ![Stone corridor in ac_shine](docs/screenshots/shine-corridor.png) |
 | **ac_sunset**: bots with stencil shadows | **ac_shine**: lit stone corridors |
-| ![Whole-map overview on the touch screen](docs/screenshots/arctic-map-overview.png) | ![The slide-out drawer with MENU, SCORES, WEAPON and CHAT](docs/screenshots/arctic-drawer.png) |
-| **Touch screen**: whole-map overview (tap MAP) | **Touch screen**: slide-out drawer |
+| ![Whole-map overview on the touch screen](docs/screenshots/arctic-map-overview.png) | ![The slide-out drawer in an earlier build](docs/screenshots/arctic-drawer.png) |
+| **Touch screen**: whole-map overview (tap MAP) | **Touch screen**: earlier drawer layout |
 | ![Main menu with the AssaultCube 3DS title](docs/screenshots/menu-main.png) | ![Map browser with a live preview](docs/screenshots/menu-maps.png) |
 | **Main menu**: touch-friendly pages | **Map browser**: preview on top, list below |
 | ![Server browser with the public server list on top and a JOIN card below](docs/screenshots/server-browser.png) | ![The courtyard ramparts of ac_douze](docs/screenshots/douze-ramparts.png) |
@@ -136,14 +136,16 @@ Emulator figures are from Azahar at its stock CPU clock, which does not model GP
 | Circle Pad | Move and strafe |
 | C-Stick, or drag on the touch screen | Aim |
 | Double-tap the touch screen | Jump |
-| L / R | Fire / scope or weapon special |
+| L / R | Fire / hold to scope or use the weapon special |
 | A / B | Jump / knife |
 | X / Y | Reload / last weapon |
 | ZL / ZR | Quick grenade / crouch |
 | D-Pad | Primary / secondary weapon (up / down), previous / next weapon (left / right) |
 | START / SELECT | Match menu / hold for scores |
 | Touch: RELOAD, GRENADE, MAP | Reload, throw a grenade, switch radar and map |
-| Touch: corner tab | Menu, scores, next weapon, chat |
+| Touch: SCOPE | Toggle sniper zoom from the bottom-left corner |
+| Touch: WEAPON | Choose a primary for the next spawn in modes with a selectable loadout |
+| Touch: corner tab | Menu, scores, chat |
 
 Open **Handheld controls** from the main menu to rebind buttons and tune aiming. [Full controls](docs/controls-3ds.md)
 
