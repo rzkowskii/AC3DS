@@ -1374,3 +1374,11 @@ struct servercommandline
     }
 };
 
+
+#ifdef __3DS__
+// Largest move of the hud gun across the view between two frames since the
+// last report, in thousandths of a unit, with what was happening then.
+struct Ac3dsGunTrace { int jump, weapon, sinceShot, depth; float aimoff; };
+extern Ac3dsGunTrace ac3dsGunTrace;
+extern int ac3dsgunaim;
+#endif

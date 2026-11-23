@@ -1526,6 +1526,7 @@ void ac3ds_install_handheld_menus()
         menuitem "Drop flag" [ closecurmenu; dropflag ]
         menuitem "Primary weapon" [ showmenu Weapons ]
         menuitem "Handheld controls" [ showmenu [Handheld controls] ]
+        menuitem "Diagnostics" [ showmenu Diagnostics ]
         menuitem "Settings" [ showmenu Settings ]
         menuitem "Screenshot" [ closecurmenu; sleep 100 [ screenshot ] ]
         menuitem "Command line" [ closecurmenu; key_commandline ]
@@ -1547,10 +1548,22 @@ void ac3ds_install_handheld_menus()
         menuitem "Scores" [ closecurmenu; showscores 1 ]
         menuitem "Server / team menu" [ ingamemenu ]
         menuitem "Handheld controls" [ showmenu [Handheld controls] ]
+        menuitem "Diagnostics" [ showmenu Diagnostics ]
         menuitem "Settings" [ showmenu Settings ]
         menuitem "Screenshot" [ closecurmenu; sleep 100 [ screenshot ] ]
         menuitem "Command line" [ closecurmenu; key_commandline ]
         menuitem "Disconnect" [ closecurmenu; disconnect ]
+
+        // Switches for faults only the handheld shows. None is saved: every
+        // launch starts from the defaults.
+        newmenu Diagnostics
+        menuitem "Record weapon frames" [ closecurmenu; closecurmenu; ac3dsgunburst 16 ]
+        menuitemcheckbox "Gun kick follows aim point" "$ac3dsgunaim" [ ac3dsgunaim $arg1; ac3dsdiag ]
+        menuitemcheckbox "Weapon sway" [(! $nosway)] [ nosway (! $arg1); ac3dsdiag ]
+        menuitemcheckbox "Hold frame for the previous one" "$ac3dspresentguard" [ ac3dspresentguard $arg1; ac3dsdiag ]
+        menuitemcheckbox "Submit frames on the VBlank" "$ac3dslatevblank" [ ac3dslatevblank $arg1; ac3dsdiag ]
+        menuitemcheckbox "Weapon depth band" "$ac3dsgunband" [ ac3dsgunband $arg1; ac3dsdiag ]
+        menuitemcheckbox "Weapon fog stage" "$ac3dsgunfog" [ ac3dsgunfog $arg1; ac3dsdiag ]
 
         delmenu "\fsVideo"
         newmenu "\fsVideo"

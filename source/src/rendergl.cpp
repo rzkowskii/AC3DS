@@ -147,6 +147,27 @@ FVAR(ac3dsautoturn, 0, 0, 45);
 // circle pad would, so a walking view can be captured without input.
 VAR(ac3dsautomove, -1, 0, 1);
 VAR(ac3dsautostrafe, -1, 0, 1);
+// Hold fire, offline only.
+VAR(ac3dsautofire, 0, 0, 1);
+// Extra degrees on every other frame, to turn unevenly as a stylus does.
+FVAR(ac3dsturnjitter, 0, 0, 45);
+// One log line with the diagnostic switches, what the hud gun did and how
+// frames were paced since the last one. Written every 30 s of play and
+// whenever a switch on the Diagnostics menu changes.
+void ac3dsdiag()
+{
+    extern int ac3dsgunfog, ac3dsgunband, ac3dspresentguard, ac3dslatevblank, nosway;
+    uint32_t gl[5];
+    ac3ds_gl_runtime_state(gl);
+    static uint32_t lastwaits = 0;
+    clientlogf("AC3DS_DIAG aim %d sway %d guard %d late %d band %d fog %d | gun jump %d/1000 depth %d/1000 weapon %d %d ms after shot, aim off %.2f deg | %u frames held",
+        ac3dsgunaim, nosway ? 0 : 1, ac3dspresentguard, ac3dslatevblank, ac3dsgunband, ac3dsgunfog,
+        ac3dsGunTrace.jump, ac3dsGunTrace.depth, ac3dsGunTrace.weapon, ac3dsGunTrace.sinceShot, ac3dsGunTrace.aimoff,
+        unsigned(gl[4]-lastwaits));
+    lastwaits = gl[4];
+    ac3dsGunTrace = Ac3dsGunTrace();
+}
+COMMAND(ac3dsdiag, "");
 
 // Frame recorder for faults only the handheld shows (the weapon flashing while
 // moving in build 13). "ac3dsgunburst [frames]" counts down three seconds, then
@@ -158,7 +179,7 @@ static int ac3dsBurstAt = 0, ac3dsBurstFrames = 0, ac3dsBurstShown = 0;
 void ac3dsgunburst(int *frames)
 {
     if(ac3dsBurstAt || ac3ds_gl_burst_state() != Ac3dsBurstState::Idle) { conoutf("already recording"); return; }
-    ac3dsBurstFrames = *frames > 0 ? *frames : 24;
+    ac3dsBurstFrames = *frames > 0 ? *frames : 16;
     ac3dsBurstAt = lastmillis + 3000;
     ac3dsBurstShown = 0;
 }

@@ -1048,6 +1048,20 @@ void weapon::attackphysics(vec &from, vec &to) // physical fx to the owner
 
 VARP(righthanded, 0, 1, 1); // flowtron 20090727
 
+#ifdef __3DS__
+// 0: the kick pulls the gun along this frame's view direction, as on desktop,
+// where the aim point is never a frame behind. 1 is the behaviour up to build 21.
+VAR(ac3dsgunaim, 0, 0, 1);
+Ac3dsGunTrace ac3dsGunTrace = { 0, 0, 0, 0, 0 };
+void ac3dsgunstat()
+{
+    conoutf("AC3DS_GUN jump %d/1000 at depth %d/1000, weapon %d, %d ms after a shot, aim off %.2f deg",
+        ac3dsGunTrace.jump, ac3dsGunTrace.depth, ac3dsGunTrace.weapon, ac3dsGunTrace.sinceShot, ac3dsGunTrace.aimoff);
+    ac3dsGunTrace = Ac3dsGunTrace();
+}
+COMMAND(ac3dsgunstat, "");
+#endif
+
 void weapon::renderhudmodel(int lastaction, int index)
 {
     playerent *p = owner;
@@ -1055,8 +1069,46 @@ void weapon::renderhudmodel(int lastaction, int index)
     float dist = worldpos.dist(p->o, unitv);
     unitv.div(dist);
 
+#ifdef __3DS__
+    // The aim point is a frame old on this port (it is read back from the
+    // previous frame's depth), and the kick after a shot pulls the gun along
+    // the direction to it: while turning, the gun then jumps from frame to
+    // frame. Use the view direction of this frame instead.
+    const float yawr = RAD*(p->yaw-90), pitchr = RAD*p->pitch;
+    const vec forward(cosf(yawr)*cosf(pitchr), sinf(yawr)*cosf(pitchr), sinf(pitchr));
+    const vec side(cosf(yawr-PI/2), sinf(yawr-PI/2), 0);
+    const float aimoff = acosf(clamp(unitv.dot(forward), -1.0f, 1.0f))/RAD;
+    if(!ac3dsgunaim) unitv = forward;
+#endif
     weaponmove wm;
     if(!intermission || !ispaused) wm.calcmove(unitv, lastaction, p);
+#ifdef __3DS__
+    {
+        // How far the gun moved across the view since the last frame.
+        static vec lastoffset(0, 0, 0);
+        static int lasttime = 0;
+        vec offset(wm.pos);
+        offset.sub(p->o);
+        vec up;
+        up.cross(side, forward);
+        const vec view(offset.dot(side), offset.dot(up), offset.dot(forward));
+        if(lastmillis-lasttime <= 100)
+        {
+            const float dx = view.x-lastoffset.x, dy = view.y-lastoffset.y;
+            const int jump = int(sqrtf(dx*dx+dy*dy)*1000);
+            if(jump > ac3dsGunTrace.jump)
+            {
+                ac3dsGunTrace.jump = jump;
+                ac3dsGunTrace.weapon = type;
+                ac3dsGunTrace.sinceShot = lastmillis-lastaction;
+                ac3dsGunTrace.depth = int(view.z*1000);
+            }
+        }
+        if(aimoff > ac3dsGunTrace.aimoff) ac3dsGunTrace.aimoff = aimoff;
+        lastoffset = view;
+        lasttime = lastmillis;
+    }
+#endif
     defformatstring(path)("weapons/%s", info.modelname);
     bool emit = (wm.anim&ANIM_INDEX)==ANIM_GUN_SHOOT && (lastmillis - lastaction) < flashtime();
     rendermodel(path, wm.anim|ANIM_DYNALLOC|(righthanded==index ? ANIM_MIRROR : 0)|(emit ? ANIM_PARTICLE : 0), 0, -1, wm.pos, 0, p->yaw+90, p->pitch+wm.k_rot, 40.0f, wm.basetime, NULL, NULL, 1.28f);

@@ -2041,9 +2041,14 @@ int main(int argc, char **argv)
             extern int ac3dsautomove, ac3dsautostrafe;
             if(ac3dsautoturn && !offlineMatchPaused && !multiplayer(NULL) && player1->state == CS_ALIVE)
             {
-                player1->yaw += ac3dsautoturn;
+                extern float ac3dsturnjitter;
+                player1->yaw += ac3dsautoturn + ((frames&1) ? ac3dsturnjitter : 0);
                 while(player1->yaw >= 360) player1->yaw -= 360;
             }
+            extern int ac3dsautofire;
+            static bool autofiring = false;
+            if(ac3dsautofire && !offlineMatchPaused && !multiplayer(NULL) && player1->state == CS_ALIVE) player1->attacking = autofiring = true;
+            else if(autofiring) player1->attacking = autofiring = false;
             static bool automoving = false;
             if((ac3dsautomove || ac3dsautostrafe) && !offlineMatchPaused && !multiplayer(NULL) && player1->state == CS_ALIVE)
             {
@@ -2139,6 +2144,8 @@ int main(int argc, char **argv)
             char memory[224];
             ac3ds_memory_line(memory, sizeof(memory));
             clientlogf("frame %d done (%d ms) %s %s", frames, elapsed, getclientmap(), memory);
+            extern void ac3dsdiag();
+            ac3dsdiag();
             if(clientlogfile) clientlogfile->fflush();
         }
 #endif
