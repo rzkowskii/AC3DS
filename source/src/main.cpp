@@ -1431,7 +1431,14 @@ int main(int argc, char **argv)
 {
 #ifdef __3DS__
     ac3ds_crash_install("main");
-    if(const char *error = ac3ds_system_init()) fatal("%s", error);
+    if(const char *error = ac3ds_system_init())
+    {
+        if(*error) fatal("%s", error);
+        // The first-run download was declined or did not finish, and its own
+        // screen has said so. Nothing else has started yet.
+        ac3ds_system_shutdown();
+        return EXIT_SUCCESS;
+    }
     ac3ds_read_launch_arguments(argc, argv);
 #endif
     DEBUGCODE(sanitychecks());
@@ -1490,6 +1497,9 @@ int main(int argc, char **argv)
 #endif
 
     if(*stream_capabilities()) clientlogf("info: %s", stream_capabilities());
+#ifdef __3DS__
+    clientlogf("game data: %s", ac3ds_asset_source());
+#endif
 
     bool waitforauth = false;
     initing = INIT_RESET;

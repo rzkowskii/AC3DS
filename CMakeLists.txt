@@ -12,6 +12,11 @@ option(AC3DS_EMBED_ASSETS "Embed release assets in 3DSX RomFS" ON)
 option(AC3DS_PRODUCTION "Use release product version and master port" ON)
 option(AC3DS_LTO "Enable link-time optimization for the native game" ON)
 option(AC3DS_HEAPTRACK "Development: track heap blocks by caller (ac3dsheap command)" OFF)
+option(AC3DS_FIRSTRUN "First-run download of the official game data when none is found (links mbedTLS and bzip2)" ON)
+option(AC3DS_FIRSTRUN_TEST "Development: let a file on the SD card point the first-run download at a test server" OFF)
+if(AC3DS_FIRSTRUN_TEST AND (AC3DS_PRODUCTION OR NOT AC3DS_FIRSTRUN))
+    message(FATAL_ERROR "AC3DS_FIRSTRUN_TEST is for development builds only: it needs AC3DS_FIRSTRUN=ON and AC3DS_PRODUCTION=OFF")
+endif()
 if(AC3DS_EMBED_ASSETS AND NOT EXISTS "${AC3DS_ASSET_ARCHIVE}")
     message(FATAL_ERROR "Set AC3DS_ASSET_ARCHIVE to the supplied RC1 tar.bz2 or disable AC3DS_EMBED_ASSETS")
 endif()
@@ -93,9 +98,27 @@ list(TRANSFORM cube_units APPEND ".cpp")
 set(enet_units callbacks compress host list packet peer protocol unix)
 list(TRANSFORM enet_units PREPEND "source/enet/")
 list(TRANSFORM enet_units APPEND ".c")
-set(platform_units ac3ds_gl audio_3ds crash_3ds dedicated smallpool_3ds system texprefetch_3ds)
+set(platform_units ac3ds_gl audio_3ds crash_3ds dedicated romfs_image smallpool_3ds system texprefetch_3ds)
 if(AC3DS_HEAPTRACK)
     list(APPEND platform_units heaptrack_3ds)
+endif()
+# The first-run download speaks TLS 1.2 through mbedTLS (3ds-mbedtls in
+# portlibs): the console's own TLS stops at 1.1, which GitHub refuses. The
+# release is a .tar.bz2, unpacked with libbz2 (3ds-bzip2).
+set(ac3ds_firstrun_libs "")
+if(AC3DS_FIRSTRUN)
+    list(APPEND platform_units firstrun_3ds firstrun_core https_3ds)
+    foreach(lib mbedtls mbedx509 mbedcrypto bz2)
+        find_library(ac3ds_lib_${lib} NAMES ${lib} HINTS "${DEVKITPRO}/portlibs/3ds/lib" REQUIRED)
+        list(APPEND ac3ds_firstrun_libs "${ac3ds_lib_${lib}}")
+    endforeach()
+    # Written against the 2.28 interface; 3.x renamed parts of it.
+    file(STRINGS "${DEVKITPRO}/portlibs/3ds/include/mbedtls/version.h" ac3ds_mbedtls_version
+        REGEX "#define MBEDTLS_VERSION_STRING " LIMIT_COUNT 1)
+    if(NOT ac3ds_mbedtls_version MATCHES "\"2\\.28\\.")
+        message(FATAL_ERROR "AC3DS_FIRSTRUN needs mbedTLS 2.28 in portlibs (3ds-mbedtls); found: ${ac3ds_mbedtls_version}. "
+            "Configure with -DAC3DS_FIRSTRUN=OFF to build without the first-run download.")
+    endif()
 endif()
 list(TRANSFORM platform_units PREPEND "source/3ds/")
 list(TRANSFORM platform_units APPEND ".cpp")
@@ -125,6 +148,9 @@ target_link_options(assaultcube PRIVATE -Wl,--gc-sections -Wl,--wrap=GX_ProcessC
 # The small-block allocator (source/3ds/smallpool_3ds.cpp) sits in front of newlib's malloc family.
 target_link_options(assaultcube PRIVATE -Wl,--wrap=_malloc_r -Wl,--wrap=_free_r -Wl,--wrap=_realloc_r
     -Wl,--wrap=_calloc_r -Wl,--wrap=_memalign_r)
+if(AC3DS_FIRSTRUN)
+    target_compile_definitions(assaultcube PRIVATE AC3DS_FIRSTRUN $<$<BOOL:${AC3DS_FIRSTRUN_TEST}>:AC3DS_FIRSTRUN_TEST>)
+endif()
 if(AC3DS_HEAPTRACK)
     target_compile_definitions(assaultcube PRIVATE AC3DS_HEAPTRACK)
     target_link_options(assaultcube PRIVATE -Wl,--wrap=_Znwj -Wl,--wrap=_Znaj)
@@ -135,7 +161,7 @@ if(AC3DS_LTO)
 endif()
 target_link_libraries(assaultcube PRIVATE
     SDL2_image::SDL2_image-static SDL2::SDL2-static
-    "${ac3ds_lib_vorbisidec}" "${ac3ds_lib_ogg}" "${ac3ds_lib_z}"
+    "${ac3ds_lib_vorbisidec}" "${ac3ds_lib_ogg}" "${ac3ds_lib_z}" ${ac3ds_firstrun_libs}
     "${ac3ds_lib_citro3d}" "${ac3ds_lib_ctru}" m)
 
 # 3dsxtool silently drops GOT-relative relocations; fail the build instead.

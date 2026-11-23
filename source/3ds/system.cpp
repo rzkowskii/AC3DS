@@ -3,12 +3,16 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <atomic>
+#include "romfs_image.h"
 
 #include "cube.h"
 #include "audio_3ds.h"
 #include "system.h"
 #include "crash_3ds.h"
 #include "ac3ds_servers.h"
+#ifdef AC3DS_FIRSTRUN
+#include "firstrun_3ds.h"
+#endif
 
 extern void pushevent(const SDL_Event &event);
 
@@ -521,6 +525,75 @@ namespace
                stat("packages/misc/notexture.jpg", &info) == 0 && S_ISREG(info.st_mode);
     }
 
+    // Where the game data comes from, for the log, and why the game data file
+    // on the SD card was not used ("" when there is none or it is in use).
+    string asset_source = "", image_problem = "";
+
+    struct ImageFile final : romfsimage::Source
+    {
+        Handle handle = 0;
+
+        long long size() override
+        {
+            u64 bytes = 0;
+            return R_SUCCEEDED(FSFILE_GetSize(handle, &bytes)) ? (long long)bytes : -1;
+        }
+
+        bool read(long long offset, void *out, size_t bytes) override
+        {
+            u32 got = 0;
+            return R_SUCCEEDED(FSFILE_Read(handle, &got, u64(offset), out, u32(bytes))) && got == bytes;
+        }
+    };
+
+    // The game data as one file (romfs_image.h), mounted as romfs:, the device
+    // an asset-embedded build reads from: past this function the game cannot
+    // tell the two apart. libctru trusts the image's tables blindly, so the
+    // image is checked first. False with image_problem set: the file is there
+    // and cannot be used.
+    bool mount_image()
+    {
+        image_problem[0] = '\0';
+        defformatstring(path)("%s/%s", game_dir, romfsimage::file_name);
+        struct stat info;
+        if(stat(path, &info) != 0) return false;
+        ImageFile file;
+        // The handle stays with the mount, which closes it when unmounted.
+        const Result opened = FSUSER_OpenFileDirectly(&file.handle, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, ""),
+                                                      fsMakePath(PATH_ASCII, strchr(path, '/')), FS_OPEN_READ, 0);
+        if(R_FAILED(opened))
+        {
+            formatstring(image_problem)("the file could not be opened (%08lX)", (unsigned long)opened);
+            return false;
+        }
+        static const char *const sentinels[] = { "config/font.cfg", "packages/misc/notexture.jpg" };
+        romfsimage::Info image;
+        if(!romfsimage::check(file, sentinels, 2, image, image_problem, sizeof(image_problem)))
+        {
+            FSFILE_Close(file.handle);
+            return false;
+        }
+        const Result mounted = romfsMountFromFile(file.handle, 0, "romfs"); // closes the handle when it fails
+        if(R_FAILED(mounted))
+        {
+            formatstring(image_problem)("the file could not be mounted (%08lX)", (unsigned long)mounted);
+            return false;
+        }
+        romfs_ready = true;
+        if(!select_assets("romfs:/"))
+        {
+            chdir("sdmc:/");
+            romfsExit();
+            romfs_ready = false;
+            copystring(image_problem, "the file does not hold the game's files");
+            return false;
+        }
+        formatstring(asset_source)("%s on the SD card (%u files, %u folders, %u bytes; tables in memory %u bytes)", romfsimage::file_name,
+                                   image.files, image.directories, image.image_size,
+                                   image.dir_hash_size + image.dir_table_size + image.file_hash_size + image.file_table_size);
+        return true;
+    }
+
     void add_cstick_aim(const circlePosition &stick, float speed, float &dx, float &dy)
     {
         const float x = stick.dx, y = stick.dy;
@@ -858,6 +931,63 @@ static float measure_cpu_boost()
     return fast ? float(double(slow) / double(fast)) : 0.0f;
 }
 
+// Selects the game data, from the first place that has it: the .3dsx itself
+// (an asset-embedded build), the one-file image on the SD card (what the
+// first-run download writes), or loose config and packages folders on the SD
+// card (a manual installation, or a download by build 24). NULL when the game
+// can start; otherwise what to tell the player, "" if that has been done.
+static const char *find_assets()
+{
+    romfs_ready = R_SUCCEEDED(romfsInit());
+    if(romfs_ready && select_assets("romfs:/"))
+    {
+        copystring(asset_source, "built into the .3dsx");
+        return NULL;
+    }
+    if(romfs_ready)
+    {
+        // A RomFS without the game in it: the image needs the device name.
+        chdir("sdmc:/");
+        romfsExit();
+        romfs_ready = false;
+    }
+    bool found = mount_image();
+    if(!found && select_assets(game_dir))
+    {
+        found = true;
+        if(image_problem[0]) formatstring(asset_source)("folders on the SD card (%s not used: %s)", romfsimage::file_name, image_problem);
+        else copystring(asset_source, "folders on the SD card");
+    }
+    static string problem;
+#ifdef AC3DS_FIRSTRUN
+    if(found)
+    {
+        ac3ds_first_run_tidy(game_dir);
+        return NULL;
+    }
+    // No usable game data anywhere: offer to fetch the official package. The
+    // offer draws on the lower screen with the console font, so it needs the
+    // display but none of the game's own files.
+    gfxInit(GSP_BGR8_OES, GSP_RGB565_OES, false);
+    gfx_ready = true;
+    if(ac3ds_first_run(game_dir, image_problem[0] ? image_problem : NULL) != AC3DS_FIRSTRUN_INSTALLED)
+        return ""; // declined or failed, and already explained
+    if(mount_image()) return NULL;
+    formatstring(problem)("The game data was downloaded but /3ds/assaultcube/%s cannot be used: %s.", romfsimage::file_name,
+                          image_problem[0] ? image_problem : "it is missing");
+    return problem;
+#else
+    if(found) return NULL;
+    if(!image_problem[0])
+        return "AssaultCube assets were not found. Install the Lockdown Edition config and packages directories under /3ds/assaultcube.";
+    formatstring(problem)("The game data file /3ds/assaultcube/%s is damaged: %s. Delete it and install the game data again.",
+                          romfsimage::file_name, image_problem);
+    return problem;
+#endif
+}
+
+const char *ac3ds_asset_source() { return asset_source; }
+
 const char *ac3ds_system_init()
 {
     SDL_SetMainReady();
@@ -867,15 +997,16 @@ const char *ac3ds_system_init()
     ac3ds_cpu_clock_ratio = measure_cpu_boost(); // leaves the boost on
     mkdir("sdmc:/3ds", 0777);
     mkdir(game_dir, 0777);
-    romfs_ready = R_SUCCEEDED(romfsInit());
-    if(!(romfs_ready && select_assets("romfs:/")) && !select_assets(game_dir))
-        return "AssaultCube assets were not found. Install the Lockdown Edition config and packages directories under /3ds/assaultcube.";
+    if(const char *problem = find_assets()) return problem;
 
     // Both screens stay double buffered (the gfxInit default). Citro3D presents
     // the top one; the lower one is drawn and swapped by bottom_begin() and
     // bottom_present() below.
-    gfxInit(GSP_BGR8_OES, GSP_RGB565_OES, false);
-    gfx_ready = true;
+    if(!gfx_ready)
+    {
+        gfxInit(GSP_BGR8_OES, GSP_RGB565_OES, false);
+        gfx_ready = true;
+    }
     if(R_SUCCEEDED(gspLcdInit()))
     {
         lcd_ready = R_SUCCEEDED(GSPLCD_GetBrightness(GSPLCD_SCREEN_TOP, &original_brightness));
@@ -2414,6 +2545,59 @@ void ac3ds_show_startup_report(const char *const *lines, int count)
     }
     controls_dirty = true;
 }
+
+#ifdef AC3DS_FIRSTRUN
+void ac3ds_text_page(const Ac3dsTextPage &page)
+{
+    // Software-drawn with the console font, like the startup report: usable
+    // before any game data exists.
+    u16 *screen = bottom_begin(true);
+    if(!screen) return;
+    fill_rect(screen, 0, 0, touch_width, touch_height, background);
+    fill_rect(screen, 0, 0, touch_width, 29, surface);
+    fill_rect(screen, 0, 28, touch_width, 29, border);
+    draw_label(screen, 10, 10, page.title, text);
+    for(int i = 0; i < page.count && i < Ac3dsTextPage::max_lines; ++i)
+    {
+        const char *line = page.lines[i];
+        // A full 40-column line (a web address) starts at the screen edge.
+        draw_label(screen, strlen(line) > 39 ? 0 : 8, 38 + i * 12, line, page.bright & (1u << i) ? text : muted);
+    }
+    if(page.percent >= 0)
+    {
+        const int x0 = 8, x1 = touch_width - 8, y0 = 180, y1 = 194, percent = min(100, page.percent);
+        fill_rect(screen, x0, y0, x1, y1, border);
+        fill_rect(screen, x0 + 2, y0 + 2, x1 - 2, y1 - 2, background);
+        fill_rect(screen, x0 + 2, y0 + 2, x0 + 2 + (x1 - x0 - 4) * percent / 100, y1 - 2, accent);
+    }
+    if(page.footer)
+    {
+        fill_rect(screen, 0, 212, touch_width, touch_height, surface);
+        fill_rect(screen, 0, 212, touch_width, 213, border);
+        draw_label(screen, 8, 222, page.footer, accent);
+    }
+    bottom_present(screen, true);
+}
+
+void ac3ds_blank_top_screen()
+{
+    // Nothing draws the upper screen until the renderer starts; without this
+    // it would show whatever the memory held. Both buffers, so the picture is
+    // black whichever one the LCD takes.
+    if(!gfx_ready) return;
+    for(int pass = 0; pass < 2; ++pass)
+    {
+        u16 width = 0, height = 0;
+        u8 *top = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &width, &height);
+        if(!top) return;
+        const size_t bytes = size_t(width) * height * 3; // BGR8
+        memset(top, 0, bytes);
+        GSPGPU_FlushDataCache(top, bytes);
+        gfxScreenSwapBuffers(GFX_TOP, false);
+        gspWaitForVBlank();
+    }
+}
+#endif
 
 int ac3ds_set_brightness(int percent)
 {

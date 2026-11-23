@@ -1,6 +1,6 @@
 # Building on Apple Silicon
 
-Use a complete devkitPro 3DS SDK with devkitARM, libctru, Citro3D, Picasso, 3dsxtool, smdhtool, and the 3DS zlib, Tremor and Ogg portlibs. Install Git, CMake 3.20 or later and Python 3 on the host. Ninja is optional. Follow the [devkitPro installation guide](https://devkitpro.org/wiki/Getting_Started).
+Use a complete devkitPro 3DS SDK with devkitARM, libctru, Citro3D, Picasso, 3dsxtool, smdhtool, and the 3DS zlib, Tremor, Ogg, Mbed TLS 2.28 and bzip2 portlibs (`3ds-mbedtls` and `3ds-bzip2` are for the [first-run download](first-run-download.md); `-DAC3DS_FIRSTRUN=OFF` builds without them). Install Git, CMake 3.20 or later and Python 3 on the host. Ninja is optional. Follow the [devkitPro installation guide](https://devkitpro.org/wiki/Getting_Started).
 
 Set `DEVKITPRO` to your SDK root. Set `DEVKITARM` if the compiler lives outside `$DEVKITPRO/devkitARM`. With the exact Lockdown Edition archive downloaded, run the commands below from the repository root.
 

@@ -42,6 +42,8 @@ constexpr int AC3DS_SERVER_JOIN_EVENT = 0x4144;
 void ac3ds_dispatch_server_join(unsigned context, unsigned id);
 
 const char *ac3ds_system_init();
+// Where the game data is read from, for the log.
+const char *ac3ds_asset_source();
 void ac3ds_system_shutdown();
 void ac3ds_show_error(const char *message);
 bool ac3ds_main_loop();

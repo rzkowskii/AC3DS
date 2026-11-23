@@ -51,7 +51,19 @@ All captured in the Azahar emulator in New 3DS mode, with the top and bottom scr
 
 You need a New Nintendo 3DS, New 3DS XL or New 2DS XL running the Homebrew Launcher (for example with Luma3DS). The original 3DS and 2DS are not supported, because the port needs the New models' extra memory and CPU. For sound, the console needs the usual `sdmc:/3ds/dspfirm.cdc` DSP dump. [Audio setup](docs/audio-3ds.md)
 
-AssaultCube's game content (maps, textures, models and sounds) may only be shared inside the unmodified official package, unless a file carries its own license. So the release here is the game engine for the 3DS, and you add the game files from the official download. It takes a couple of minutes:
+AssaultCube's game content (maps, textures, models and sounds) may only be shared inside the unmodified official package, unless a file carries its own license. So the release here is the game engine for the 3DS, and the game files come from the official download. There are two ways to get them.
+
+### On the console: first-run download
+
+1. Download the latest `AC-3DS0v….zip` from [Releases](https://github.com/rzkowskii/AC3DS/releases) and copy its `assaultcube.3dsx` to `/3ds/assaultcube/assaultcube.3dsx` on the SD card.
+2. Connect the console to Wi-Fi and open **AC-3DS0** in the Homebrew Launcher.
+3. With no game data on the card, the lower screen offers to fetch it. Press **A**. The console downloads the official AssaultCube 1.3.0.2 package (about 52 MB) straight from the [AssaultCube release](https://assault.cubers.net/download.html), checks it against a pinned SHA-256, unpacks the game's data folders into one file, `/3ds/assaultcube/assets.romfs`, and starts the game. **B** cancels at any time and leaves nothing half-installed.
+
+You need about 70 MB free on the SD card; the offer shows the exact figure. To remove the game data later, delete `assets.romfs`; the next start offers the download again. A card that already has the game's loose folders, from the script below or from an earlier build's download, keeps working as it is. This project hosts and redistributes none of the game data: the file is the unmodified official package, fetched by your console from the official release, free for non-commercial use under the [AssaultCube licence](https://assault.cubers.net/docs/license.html). What is fetched, what is verified and what a failed download leaves behind are in [First-run download](docs/first-run-download.md). The one-file layout has been run in the Azahar emulator only. On a console, the earlier download into loose folders (build 24) worked but took half an hour, which is why it now writes one file; the new layout has not yet been run on a console.
+
+### On a computer: stage the files yourself
+
+This gives the same files, and it is the route to take without Wi-Fi.
 
 1. Download the latest `AC-3DS0v….zip` from [Releases](https://github.com/rzkowskii/AC3DS/releases) and unzip it. It contains `assaultcube.3dsx` and `stage-assets.py`.
 2. Download the official [AssaultCube v1.3.0.2 Lockdown Edition RC1 (tar.bz2)](https://github.com/assaultcube/AC/releases/download/v1.3.0.2/AssaultCube_v1.3.0.2_LockdownEdition_RC1.tar.bz2). Keep the archive as it is.
@@ -65,6 +77,15 @@ AssaultCube's game content (maps, textures, models and sounds) may only be share
 5. Open **AC-3DS0** (the title carries the version, for example AC-3DS0v1.0) in the Homebrew Launcher. Pick **Singleplayer** for a bot match, or **Multiplayer** to browse servers.
 
 Settings, screenshots, demos and logs go to `/3ds/assaultcube/profile/`. To update, replace `assaultcube.3dsx` and keep everything else.
+
+### One file instead of loose folders
+
+If you would rather copy a single file, the builder joins the release's `assaultcube.3dsx` with the official archive on your own computer. Nothing is uploaded, and no devkitPro install is needed.
+
+- **In a browser:** open `tools/builder/index.html` (double-click it), drop the `.tar.bz2` and the release's `assaultcube.3dsx` on the page, press Build and save the result. It works straight from disk in current Chrome, Firefox and Edge.
+- **In a terminal:** `python3 scripts/make-3dsx.py AssaultCube_v1.3.0.2_LockdownEdition_RC1.tar.bz2 assaultcube.3dsx out/assaultcube.3dsx`
+
+Copy the result to `/3ds/assaultcube/assaultcube.3dsx`. It contains the game's media, so keep it for your own console and don't share it. It cannot make a `.cia`. To update later, build again with the new release: copying a release's small `assaultcube.3dsx` over a built one removes the game data from it. [How the builder works](docs/builder.md)
 
 Optional: the script can also convert progressive JPEG textures to baseline JPEG, which keeps the pixels identical. In a host test those textures decoded about twice as fast, so maps should load a little quicker. You need `jpegtran` (libjpeg-turbo) and a C compiler installed, and you pass SDL_image's `stb_image.h` with `--stb-image`. A source build passes `--stb-image` for you, so it only needs `jpegtran` and a C compiler.
 
@@ -153,7 +174,7 @@ Open **Handheld controls** from the main menu to rebind buttons and tune aiming.
 
 The source build embeds the game files in the `.3dsx`, so the result is a single file. It is for your own use. Don't redistribute it.
 
-1. Install [devkitPro's 3DS tools](https://devkitpro.org/wiki/Getting_Started): devkitARM, libctru, Citro3D, Picasso, 3dsxtool, smdhtool, and the 3DS zlib, Tremor and Ogg portlibs. You also need Git, CMake 3.20 or later, and Python 3. Set `DEVKITPRO` to the SDK root.
+1. Install [devkitPro's 3DS tools](https://devkitpro.org/wiki/Getting_Started): devkitARM, libctru, Citro3D, Picasso, 3dsxtool, smdhtool, and the 3DS zlib, Tremor, Ogg, Mbed TLS and bzip2 portlibs. You also need Git, CMake 3.20 or later, and Python 3. Set `DEVKITPRO` to the SDK root.
 2. Download the official [Lockdown Edition RC1 tar.bz2](https://github.com/assaultcube/AC/releases/download/v1.3.0.2/AssaultCube_v1.3.0.2_LockdownEdition_RC1.tar.bz2).
 3. Build:
 
@@ -175,7 +196,9 @@ To build the engine-only `.3dsx` used for releases, add `-DAC3DS_EMBED_ASSETS=OF
 ## Documentation
 
 - [Controls and remapping](docs/controls-3ds.md)
+- [One-file builder](docs/builder.md)
 - [Network play, hosting a server, and SD storage](docs/network-storage.md)
+- [First-run download of the game data](docs/first-run-download.md)
 - [Audio and DSP setup](docs/audio-3ds.md)
 - [3DS hardware notes](docs/3ds-hardware.md)
 - [Development status and measurements](docs/port-status.md)
@@ -187,7 +210,7 @@ To build the engine-only `.3dsx` used for releases, add `-DAC3DS_EMBED_ASSETS=OF
 I deliberately do not distribute a packaged build: no `.cia`, no `.3ds`, and no `.3dsx` with the game data inside. As I read AssaultCube's [license](docs/upstream/license.html), its media may only be redistributed inside the unmodified official package, and a 3DS package would be a modified one.
 
 - **What is here.** The source: the 1.3.0.2 code under its zlib-style license, with the notices kept and the changes marked as a port. The release adds an engine-only `.3dsx` with no maps, textures, models, sounds or configs in it.
-- **Where the game files come from.** You download the official v1.3.0.2 archive from [assaultcube/AC](https://github.com/assaultcube/AC) yourself. A small script checks its SHA-256 and copies the data folders to the SD card.
+- **Where the game files come from.** The official v1.3.0.2 archive from [assaultcube/AC](https://github.com/assaultcube/AC), unmodified. Either your console fetches it from the official release on first run, after asking, or you download it yourself and a small script copies the data folders to the SD card. Both check its SHA-256. Nothing of it is hosted or mirrored here.
 - **Same game.** It is the stock 1.3.0.2 game: same rules, physics, netcode and protocol. The changes are platform ones only: OpenGL translated to the 3DS GPU through Citro3D, NDSP audio, button and touch input, and memory and loading work to fit the console. There is no aim assist or anything else gameplay-side, in line with the fair-play note in [source/README.txt](source/README.txt).
 - **Free and unofficial.** It is free and non-commercial, credits Rabid Viper Productions and the Cube authors, and is not an official port.
 
@@ -197,5 +220,5 @@ If you are from the AssaultCube team and read any of this differently, or want s
 
 AC-3DS is a port by [rzkowskii](https://github.com/rzkowskii). AssaultCube was created by Rabid Viper Productions and its contributors, building on the Cube engine by Wouter van Oortmerssen. This port is not affiliated with or endorsed by the AssaultCube team or Nintendo.
 
-- **Source code:** AssaultCube's source code is under its zlib-style license, which this repository keeps ([source/README.txt](source/README.txt), [source/README_CUBEENGINE.txt](source/README_CUBEENGINE.txt)). ENet, SDL, libctru, Citro3D, Tremor and zlib keep their own licenses ([third-party notices](docs/third-party-notices.md)).
+- **Source code:** AssaultCube's source code is under its zlib-style license, which this repository keeps ([source/README.txt](source/README.txt), [source/README_CUBEENGINE.txt](source/README_CUBEENGINE.txt)). ENet, SDL, libctru, Citro3D, Tremor, zlib, Mbed TLS and bzip2 keep their own licenses ([third-party notices](docs/third-party-notices.md)).
 - **Game content:** maps, textures, models and sounds are not in this repository or the release. They come from your own copy of the official package, under [AssaultCube's terms](docs/upstream/license.html). AssaultCube is freeware and may not be used commercially.

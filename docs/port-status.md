@@ -273,3 +273,19 @@ Result, 30-map rotations with eight bots on the final binary: the rotation that 
 *Report.* Build 22 on the New 2DS XL froze 45 frames in, on the menu. `stall.txt` gives the phase as "GPU aim acquire frame queue" with the GPU idle, 223 GX commands submitted and the last one a command list that returned success. The frame-start wait for the previous frame's queue never returned. The build 14 hang during online play (phase "system events", GPU idle) had the same wait inside it, so this is taken to be the same fault. Why a finished command's completion does not reach the queue on the handheld is not known; Azahar has never shown it.
 
 *Change.* The wait is bounded. After two seconds with the GPU idle the queue is stopped and cleared and the frame starts; the rest of the stuck frame is dropped. Each recovery writes an `AC3DS_QUEUE` line to the log and is counted in the `AC3DS_DIAG` line. Azahar: a two-map bot match ran with no recoveries and no report; the recovery path itself cannot be triggered there and is untested.
+
+**First-run download and one-file builder (builds 24 to 26, 2026-11-24)**
+
+*Aim.* A player with only a console, or only a browser, should get the full game without the project distributing AssaultCube's data.
+
+*First-run download.* An engine-only build that finds no game data offers to fetch the official AssaultCube 1.3.0.2 package from its release, checks the size and SHA-256, and unpacks it on the console. See [first-run download](first-run-download.md).
+
+*Handheld, build 24 (New 2DS XL).* The download completed, verified, installed 1,979 files and the game then ran and loaded three maps in 2.5 to 4 seconds each. It took 1,881 seconds: 1,416 in SD card calls, 377 decoding and hashing, about 84 for network and TLS. Creating many small files on the card was the cost, not the network.
+
+*Build 25.* Each folder is created once and each file with one call instead of three; the socket receive buffer is 32 KiB. Azahar: 272 seconds before, 172 after, same files. Not run on the handheld.
+
+*Build 26.* The download now writes one RomFS image, `assets.romfs`, which the engine mounts; decoding runs on a second core. Loose folders from earlier installs are still read. Azahar: installed in 74 seconds as one 59,588,112-byte file, 226 SD writes; the release build then mounted it and loaded three maps; the asset-embedded build is unaffected. Handheld timing is not known yet.
+
+*One-file builder.* `tools/builder/` is a page that runs in a browser with nothing to install: drop the official archive and the engine-only `assaultcube.3dsx`, and save one file with the data attached. `scripts/make-3dsx.py` does the same from a command line and produces a byte-identical file. See [builder](builder.md). A built file booted and loaded maps in Azahar; none has run on the handheld, and Safari itself was not tested.
+
+*Emulator.* The test runner now uses Azahar 2126.2 and sets the update check where Azahar reads it.

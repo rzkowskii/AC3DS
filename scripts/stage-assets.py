@@ -272,6 +272,14 @@ def stage(archive, destination, stb_image=None):
         # invoking the staging command. Accept it only if completely empty.
         if not destination.is_dir() or any(destination.iterdir()):
             raise SystemExit(f"Will not replace an unmanaged asset directory: {destination}")
+    if destination.is_dir():
+        # The marker also sits in a console's game folder after a first-run
+        # download, beside the program and the profile. Only replace a folder
+        # that holds nothing but staged data.
+        foreign = sorted(entry.name for entry in destination.iterdir()
+                         if entry.name not in ROOTS and entry.name != ".assaultcube-assets")
+        if foreign:
+            raise SystemExit(f"Will not replace {destination}: it also holds {', '.join(foreign[:5])}")
     with tempfile.TemporaryDirectory(prefix=".ac-stage-", dir=destination.parent) as temp:
         staged = pathlib.Path(temp) / "romfs"
         staged.mkdir()
