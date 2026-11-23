@@ -82,6 +82,49 @@ void CWaypointClass::Clear()
 //fixme
 TLinkedList<node_s *>::node_s *testx;
 
+#ifdef __3DS__
+// How many waypoints a version 2 file really holds: data is everything after
+// the header. A file is a node record per waypoint (origin, flags, trigger,
+// yaw: 20 bytes), then a path record per waypoint in the same order (count,
+// the waypoint's own origin, then that many target origins).
+//
+// Eight stock files (ac_alcove, ac_dusk, ac_kazemat, ac_lotus, ac_nocturne,
+// ac_origin, ac_rampart, ac_toxic) give a count four to fourteen times the
+// records they hold: they were saved after their flood-filled waypoints had
+// been filtered, with the count from before. Read as written, the loader
+// runs off the end of the file and builds thousands of waypoints and paths
+// from whatever is on the stack (ac_toxic: 8,611 waypoints and, on some
+// loads, 184,000 path links from a file that holds 893 and 5,086). The
+// right count is the one whose records end exactly at the end of the file.
+// Returns -1 if no count does.
+static int waypointrecordcount(const uchar *data, int len, int headercount)
+{
+     enum { NODEBYTES = 20, PATHBYTES = 14, VECBYTES = 12 };
+     const int most = len / (NODEBYTES + PATHBYTES);
+     auto fits = [&](int n)
+     {
+          if (n <= 0 || n > most) return false;
+          int at = n * NODEBYTES;
+          loopi(n)
+          {
+               if (at + PATHBYTES > len) return false;
+               short num;
+               memcpy(&num, data + at, sizeof(num));
+               if (num < 0 || memcmp(data + at + sizeof(num), data + i * NODEBYTES, VECBYTES)) return false;
+               at += PATHBYTES;
+               if (num > (len - at) / VECBYTES) return false;
+               at += num * VECBYTES;
+          }
+          return at == len;
+     };
+     if (fits(headercount)) return headercount;
+     // The first path record follows the last node and repeats the first node's origin.
+     for (int n = 1; n <= most; n++)
+          if (!memcmp(data + n * NODEBYTES + sizeof(short), data, VECBYTES) && fits(n)) return n;
+     return -1;
+}
+#endif
+
 // returns true if waypoints succesfull loaded
 bool CWaypointClass::LoadWaypoints()
 {
@@ -188,6 +231,26 @@ bool CWaypointClass::LoadWaypoints()
                     }
                     else if (header.iFileVersion == 2)
                     {
+#ifdef __3DS__
+                         // Take the count from the records, not from the header.
+                         {
+                              vector<uchar> records;
+                              uchar chunk[4096];
+                              for (int got; (got = bfp->read(chunk, sizeof(chunk))) > 0;) records.put(chunk, got);
+                              const int count = waypointrecordcount(records.getbuf(), records.length(), header.iWPCount);
+                              delete bfp;
+                              bfp = count > 0 ? openfile(filename, "rb") : NULL;
+                              if (!bfp || bfp->read(&header, sizeof(header)) != int(sizeof(header)))
+                              {
+                                   conoutf("Waypoint file for map %s is damaged; not using it", m_szMapName);
+                                   delete bfp;
+                                   return false;
+                              }
+                              if (count != header.iWPCount)
+                                   conoutf("Waypoint file for map %s lists %d waypoints and holds %d", m_szMapName, header.iWPCount, count);
+                              header.iWPCount = count;
+                         }
+#endif
                          m_iWaypointCount = header.iWPCount;
 
                          for (i=0; i < header.iWPCount; i++)
@@ -2759,8 +2822,7 @@ waypoint_s *CBot::GetWPFromNode(node_s *pNode)
      if (!pNode) return NULL;
 
 #ifdef __3DS__
-     waypoint_s **indexed = m_WaypointByNode.access(uint(size_t(pNode)));
-     return indexed ? *indexed : NULL;
+     return m_WaypointIndex.Find(pNode);
 #else
      short x, y;
      WaypointClass.GetNodeIndexes(pNode->v_origin, &x, &y);
@@ -2884,16 +2946,111 @@ waypoint_s *CBot::GetNearestTriggerWaypoint(vec v_src, float flRange)
      return pNearest;
 }
 
+#ifdef __3DS__
+typedef TLinkedList<waypoint_s *>::node_s botwaypointlink_s;
+
+// Releases the bot's waypoint records: the block from SyncWaypoints() and
+// any record or link added one at a time since.
+void CBot::FreeWaypoints()
+{
+     m_WaypointIndex.Clear();
+     for (int x=0;x<MAX_MAP_GRIDS;x++)
+     {
+          for (int y=0;y<MAX_MAP_GRIDS;y++)
+          {
+               TLinkedList<waypoint_s *> &list = m_WaypointList[x][y];
+               for (botwaypointlink_s *p = list.GetFirst(), *next; p; p = next)
+               {
+                    next = p->next;
+                    if (!InWaypointBlock(p->Entry)) delete p->Entry;
+                    if (!InWaypointBlock(p)) delete p;
+               }
+               list.Reset();
+          }
+     }
+     delete[] m_pWaypointBlock;
+     m_pWaypointBlock = NULL;
+     m_iWaypointBlockBytes = 0;
+}
+
+// One waypoint added while the bot exists.
+void CBot::AddWaypointRecord(node_s *pNode)
+{
+     short x, y;
+     WaypointClass.GetNodeIndexes(pNode->v_origin, &x, &y);
+     waypoint_s *pWP = new waypoint_s;
+     pWP->pNode = pNode;
+     m_WaypointList[x][y].AddNode(pWP);
+     m_WaypointIndex.Add(pWP);
+}
+
+void CBot::DelWaypointRecord(node_s *pNode)
+{
+     short x, y;
+     WaypointClass.GetNodeIndexes(pNode->v_origin, &x, &y);
+     TLinkedList<waypoint_s *> &list = m_WaypointList[x][y];
+     for (botwaypointlink_s *p = list.GetFirst(); p; p = p->next)
+     {
+          if (p->Entry->pNode != pNode) continue;
+          waypoint_s *pWP = p->Entry;
+          m_WaypointIndex.Remove(pNode);
+          if (InWaypointBlock(p))
+          {    // the link is part of the bot's block: unlink it, nothing to free
+               if (p->prev) p->prev->next = p->next; else list.pNodeList = p->next;
+               if (p->next) p->next->prev = p->prev; else list.pLastNode = p->prev;
+               p->next = p->prev = NULL;
+               list.iNodeCount--;
+          }
+          else list.DeleteNode(p);
+          if (!InWaypointBlock(pWP)) delete pWP;
+          break;
+     }
+}
+#endif
+
 // Makes a waypoint list for this bot based on the list from WaypointClass
 void CBot::SyncWaypoints()
 {
      short x, y;
      TLinkedList<node_s *>::node_s *p;
 
-     // Clean everything first
 #ifdef __3DS__
-     m_WaypointByNode.clear();
+     // Same lists in the same order as below, from one allocation.
+     FreeWaypoints();
+     int count = 0;
+     for (x=0;x<MAX_MAP_GRIDS;x++)
+          for (y=0;y<MAX_MAP_GRIDS;y++)
+               for (p = WaypointClass.m_Waypoints[x][y].GetFirst(); p; p = p->next) count++;
+     if (!count) return;
+     m_iWaypointBlockBytes = size_t(count) * (sizeof(waypoint_s) + sizeof(botwaypointlink_s));
+     m_pWaypointBlock = new char[m_iWaypointBlockBytes];
+     waypoint_s *records = reinterpret_cast<waypoint_s *>(m_pWaypointBlock);
+     botwaypointlink_s *links = reinterpret_cast<botwaypointlink_s *>(m_pWaypointBlock + size_t(count) * sizeof(waypoint_s));
+     m_WaypointIndex.Reserve(count);
+     int n = 0;
+     for (x=0;x<MAX_MAP_GRIDS;x++)
+     {
+          for (y=0;y<MAX_MAP_GRIDS;y++)
+          {
+               TLinkedList<waypoint_s *> &list = m_WaypointList[x][y];
+               for (p = WaypointClass.m_Waypoints[x][y].GetFirst(); p && n < count; p = p->next, n++)
+               {
+                    waypoint_s *pWP = new (&records[n]) waypoint_s;
+                    pWP->pNode = p->Entry;
+                    botwaypointlink_s *link = new (&links[n]) botwaypointlink_s;
+                    link->Entry = pWP;
+                    link->prev = list.pLastNode;
+                    if (list.pLastNode) list.pLastNode->next = link; else list.pNodeList = link;
+                    list.pLastNode = link;
+                    list.iNodeCount++;
+                    m_WaypointIndex.Add(pWP);
+               }
+          }
+     }
+     return;
 #endif
+
+     // Clean everything first
      for (x=0;x<MAX_MAP_GRIDS;x++)
      {
           for (y=0;y<MAX_MAP_GRIDS;y++)
@@ -2914,9 +3071,6 @@ void CBot::SyncWaypoints()
                     waypoint_s *pWP = new waypoint_s;
                     pWP->pNode = p->Entry;
                     m_WaypointList[x][y].AddNode(pWP);
-#ifdef __3DS__
-                    m_WaypointByNode.access(uint(size_t(p->Entry)), pWP);
-#endif
 
 #ifndef RELEASE_BUILD
                     if (!GetWPFromNode(p->Entry)) condebug("Error adding bot wp!");

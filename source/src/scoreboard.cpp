@@ -5,6 +5,9 @@
 
 void *scoremenu = NULL;
 bool needscoresreorder = true;
+#ifdef __3DS__
+Ac3dsScoreDisplay ac3ds_score_display{};
+#endif
 
 void showscores(bool on)
 {
@@ -280,11 +283,18 @@ void reorderscorecolumns()
 
 void renderscores(void *menu, bool init)
 {
-    if(needscoresreorder) reorderscorecolumns();
-    static string modeline, serverline;
+    if(needscoresreorder)
+    {
+        reorderscorecolumns();
+#ifdef __3DS__
+        ++ac3ds_score_display.layoutRevision;
+#endif
+    }
+    static string modeline, serverline, outcome;
 
     modeline[0] = '\0';
     serverline[0] = '\0';
+    outcome[0] = '\0';
     scorelines.shrink(0);
 
     vector<playerent *> scores;
@@ -356,22 +366,21 @@ void renderscores(void *menu, bool init)
         {
             concatstring(modeline, ", intermission");
 
-            if (m_teammode) // Add in the winning team
+            if (m_teammode)
             {
                 switch(winner)
                 {
-                    case TEAM_CLA: concatstring(modeline, ", \f3CLA wins!"); break;
-                    case TEAM_RVSF: concatstring(modeline, ", \f1RVSF wins!"); break;
+                    case TEAM_CLA: copystring(outcome, "\f3CLA wins!"); break;
+                    case TEAM_RVSF: copystring(outcome, "\f1RVSF wins!"); break;
                     case -1:
                     default:
-                        concatstring(modeline, ", \f2it's a tie!");
-                    break;
+                        copystring(outcome, "\f2it's a tie!"); break;
                 }
             }
-            else // Add the winning player
+            else
             {
-                if (winner < 0) concatstring(modeline, ", \f2it's a tie!");
-                else concatformatstring(modeline, ", \f1%s wins!", scores[0]->name);
+                if (winner < 0) copystring(outcome, "\f2it's a tie!");
+                else formatstring(outcome)("\f1%s wins!", scores[0]->name);
             }
         }
         else
@@ -405,8 +414,48 @@ void renderscores(void *menu, bool init)
         }
     }
 
+#ifdef __3DS__
+    // The menu items borrow their text. Keep it in a separate array that
+    // only grows after the old items are gone, and update score changes in
+    // place so a clock or ping update does not rebuild the menu.
+    struct DisplayedScore { string text; };
+    static vector<DisplayedScore> displayed;
+    gmenu &scoresMenu = *static_cast<gmenu *>(menu);
+    const int rowCount = scorelines.length();
+    bool reuse = scoresMenu.items.length() == rowCount && displayed.length() == rowCount;
+    for(int i = 0; reuse && i < rowCount; ++i)
+        reuse = scoresMenu.items[i]->gettext() == displayed[i].text;
+    bool layoutChanged = !reuse;
+    if(reuse)
+    {
+        loopv(scorelines)
+        {
+            sline &line = scorelines[i];
+            const char *text = line.getcols();
+            if(strcmp(displayed[i].text, text))
+            {
+                copystring(displayed[i].text, text);
+                layoutChanged = true;
+            }
+            scoresMenu.items[i]->bgcolor = line.bgcolor;
+            scoresMenu.items[i]->greyedout = mitem::menugreyedout;
+        }
+    }
+    else
+    {
+        menureset(menu);
+        displayed.setsize(0);
+        loopv(scorelines) copystring(displayed.add().text, scorelines[i].getcols());
+        loopv(scorelines) menuimagemanual(menu, NULL, "radaricons", displayed[i].text, NULL, scorelines[i].bgcolor);
+    }
+    if(layoutChanged) ++ac3ds_score_display.layoutRevision;
+    copystring(ac3ds_score_display.summary, modeline);
+    copystring(ac3ds_score_display.outcome, outcome);
+#else
     menureset(menu);
     loopv(scorelines) menuimagemanual(menu, NULL, "radaricons", scorelines[i].getcols(), NULL, scorelines[i].bgcolor);
+#endif
+    if(*outcome) concatformatstring(modeline, ", %s", outcome);
     menuheader(menu, modeline, serverline);
 
     // update server stats

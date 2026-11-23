@@ -131,6 +131,14 @@ struct mapareastats_s
 #define SMALLEST_FACTOR 6               // determines number of mips there can be
 #define DEFAULT_FACTOR 8
 #define LARGEST_FACTOR 11               // 10 is already insane
+#ifdef __3DS__
+// Largest map the handheld loads: 512-square, a 5.6 MB world array that stays
+// allocated. Size 10 needs 22.5 MB for the array alone plus about as much
+// again in per-map tables, which does not fit the 72 MB heap.
+#define CLIENTMAXMAPFACTOR 9
+#else
+#define CLIENTMAXMAPFACTOR LARGEST_FACTOR
+#endif
 #define MAXENTITIES 65535
 #define MAXHEADEREXTRA (1<<20)
 #define SOLID(x) ((x)->type==SOLID)

@@ -1,10 +1,12 @@
 #include "ac3ds_gl.h"
+#include "crash_3ds.h"
 #include "performance.h"
 
 #include <3ds.h>
 #include <citro3d.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -14,24 +16,37 @@
 #include <vector>
 
 void ac3dsRecordGpu(float drawingMs, float processingMs); // rendergl.cpp profiler
-unsigned ac3dsCommandDumps = 0;
+unsigned ac3dsCommandDumps = 0, ac3dsCommandDumpIndex = 0;
 const u32 *ac3dsLastList = nullptr;
-u32 ac3dsLastListBytes = 0;
+std::atomic<u32> ac3dsLastListBytes{0};
 // High half: GX commands handed to GSP. Low half: the last command id.
-u32 ac3dsGxSubmit = 0, ac3dsGxResult = 0;
+std::atomic<u32> ac3dsGxSubmit{0}, ac3dsGxResult{0};
 extern "C" {
 extern const unsigned char cube_vertex_shbin[];
 extern const unsigned int cube_vertex_shbin_size;
 Result __real_GX_ProcessCommandList(u32 *buffer, u32 bytes, u8 flags);
 
 Result __real_gspSubmitGxCommand(const u32 command[8]);
+// Citro3D keeps its GX queue private; remember it when it is bound so a queue
+// that stops advancing can be cleared.
+void __real_GX_BindQueue(gxCmdQueue_s *queue);
+gxCmdQueue_s *ac3dsGxQueue = nullptr;
+std::atomic<u32> ac3dsQueueRecoveries{0};
+void __wrap_GX_BindQueue(gxCmdQueue_s *queue)
+{
+    ac3dsGxQueue = queue;
+    __real_GX_BindQueue(queue);
+}
 
 Result __wrap_gspSubmitGxCommand(const u32 command[8])
 {
     // Record what GSP answered for the startup report.
     const Result result = __real_gspSubmitGxCommand(command);
-    ac3dsGxSubmit = (ac3dsGxSubmit & 0xffff0000) + 0x10000 + (command[0] & 0xff);
-    ac3dsGxResult = u32(result);
+    ac3dsGxResult.store(u32(result), std::memory_order_relaxed);
+    u32 previous = ac3dsGxSubmit.load(std::memory_order_relaxed);
+    u32 next;
+    do { next = (previous & 0xffff0000) + 0x10000 + (command[0] & 0xff); }
+    while(!ac3dsGxSubmit.compare_exchange_weak(previous, next, std::memory_order_relaxed));
     return result;
 }
 
@@ -42,7 +57,7 @@ Result __wrap_GX_ProcessCommandList(u32 *buffer, u32 bytes, u8 flags)
     if(ac3dsCommandDumps)
     {
         char path[96];
-        std::snprintf(path,sizeof(path),"sdmc:/3ds/assaultcube/profile/gpu-list-%u.bin",6-ac3dsCommandDumps);
+        std::snprintf(path,sizeof(path),"sdmc:/3ds/assaultcube/profile/gpu-list-%u.bin",ac3dsCommandDumpIndex++);
         if(FILE *f = std::fopen(path,"wb"))
         {
             std::fwrite(buffer,1,bytes,f);
@@ -51,7 +66,7 @@ Result __wrap_GX_ProcessCommandList(u32 *buffer, u32 bytes, u8 flags)
         --ac3dsCommandDumps;
     }
     ac3dsLastList = buffer;
-    ac3dsLastListBytes = bytes;
+    ac3dsLastListBytes.store(bytes, std::memory_order_relaxed);
     return __real_GX_ProcessCommandList(buffer,bytes,flags);
 }
 }
@@ -96,6 +111,8 @@ struct Vertex
 };
 static_assert(sizeof(Vertex) == 44, "PICA vertex layout");
 constexpr size_t vertexArenaBytes = sizeof(Vertex)*vertexCapacity;
+constexpr size_t pixelsBytes = 256*256*4 + screenW*screenH*4; // readback staging buffer
+constexpr size_t worldCacheReserveBytes = 2*1024*1024; // linear memory world caches leave free
 constexpr size_t projectedVertexStride = 28;
 constexpr size_t worldVertexStride = 24;
 constexpr size_t modelVertexStride = 20;
@@ -196,9 +213,26 @@ struct FrameProfile
 };
 FrameProfile profile;
 bool gameplayFrame = false;
-bool lateVblankRequested = false, lateVblankFrame = false;
+bool lateVblankRequested = false, lateVblankFrame = false, presentGuard = true;
 bool frameHasVblank = false, lastGameplayLate = false;
 bool readOkay = true, fullFlush = false;
+// Frame recorder (diagnostic): copies the right half of the finished top
+// picture, as the GPU left it, for a run of consecutive frames. The copy is a
+// queued GX command between the last command list and the display transfer,
+// like the aim-depth tile. The CPU reads the image after the last copy drains.
+constexpr unsigned burstTileRows = 25, burstFirstTileRow = 25, burstHeaderBytes = 4096;
+constexpr size_t burstFrameBytes = size_t(burstTileRows)*(screenH/8)*256;
+struct BurstMeta { u32 ms, barriers, presentWaits, vblank; };
+struct Burst
+{
+    u8 *data = nullptr;
+    unsigned frames = 0, captured = 0;
+    Ac3dsBurstState state = Ac3dsBurstState::Idle;
+    const char *failure = nullptr;
+    Result result = 0;
+    u64 startTick = 0;
+};
+Burst burst;
 C3D_Tex dummyUnit1{};
 size_t vused = 0, iused = 0, vflushed = 0, iflushed = 0;
 struct ModelVertexUpload
@@ -271,6 +305,7 @@ VertexLayout appliedLayout = VertexLayout::Count;
 const void *appliedBuffer = nullptr;
 bool vertexBufferValid = false;
 bool fastVertexOffsets = false;
+bool shareWorldVertices = false;
 bool joinedWaterCommands = false;
 float appliedUV1[3]{};
 bool fixedUV1Valid = false;
@@ -301,17 +336,37 @@ struct FogTable
     int kind = 0; // 0 ortho, 1 hyperbolic Z-buffer, 2 linear W-buffer
     bool valid = false;
 };
-// Perspective draws use the PICA W-buffer, so stored depth falls linearly
-// with eye distance e: depth = top - slope*e. The world spans 0.96 at the eye
-// to 0 at the far plane, and the hud gun gets the 0.96-1 band in front of it
-// (desktop Cube squeezes the gun's depth range for the same reason). The fog
-// LUT is indexed by this depth, so its 128 entries cover distance evenly and
-// reproduce desktop GL's linear fog. With the hyperbolic Z-buffer one entry
-// spanned everything from about 19 units to the far plane, which fogged
-// mid-distance walls and sky nearly flat grey. Ortho, oblique (water clip)
-// and other projections keep the Z-buffer, as before.
+// Optional (ac3dslineardepth 1): perspective draws use the PICA W-buffer, so
+// stored depth falls linearly with eye distance e: depth = top - slope*e. The
+// world spans 0.96 at the eye to 0 at the far plane, and the hud gun gets the
+// 0.96-1 band in front of it. Build 11 used it to give the GPU fog table even
+// resolution. A see-through-walls report on the New 2DS XL followed; whether
+// the W-buffer caused it was never isolated, but per-pixel fog (pixelFog
+// below) no longer needs it, so the default is the Z-buffer builds 1-10 used.
+// Ortho, oblique (water clip) and other projections always use the Z-buffer.
 constexpr float worldDepthTop = .96f, gunDepthSpan = 32.f;
-bool linearDepth = true, hudGunDepth = false;
+bool linearDepth = false, hudGunDepth = false, gunBand = true;
+// Per-pixel fog that does not read the depth buffer. The vertex shader writes
+// u = .5 + .5*(e - start)/(end - start) to texcoord2, e = eye distance (exact
+// under perspective-correct interpolation). The procedural texture unit maps
+// u through a fixed table, 0 up to .5 then a straight ramp to 1, into a grey
+// colour ramp, so its output is GL's linear fog amount; a combiner stage
+// after the texture stages mixes in the fog colour. Fog start and end live in
+// the per-draw uniform, so the tables are uploaded once. Depth testing can
+// then stay on the ordinary Z-buffer.
+bool pixelFog = true;
+int locFogCoord = -1;
+C3D_ProcTex fogProcTex{};
+C3D_ProcTexLut fogCurveLut{};
+C3D_ProcTexColorLut fogColorLut{};
+constexpr float fogCurveKnee = .5f;
+bool fogCurveReady = false;
+bool fogProcBound = false;
+// The hud gun pass takes no part in it: the gun is nearer than any fog start
+// AssaultCube produces, so the stage could only ever add zero, and leaving it
+// out removes the one thing builds 12-13 added to the gun's pixels.
+bool gunFog = false;
+bool pixelFogActive() { return fogOn && pixelFog && (gunFog || !hudGunDepth); }
 struct DepthMap
 {
     bool w = false, gun = false;
@@ -400,21 +455,83 @@ void retire()
     for(auto *v : retiredGeometry) linearFree(v);
     retiredGeometry.clear();
 }
-u32 waitTopVblank()
+std::atomic<u32> presentWaits{0}, observedTopVblank{0};
+u32 readTopVblank()
 {
+    const u32 slot = C3D_FrameCounter(0);
+    observedTopVblank.store(slot, std::memory_order_relaxed);
+    return slot;
+}
+u32 waitTopVblank(const char *description = "GPU frame start VBlank")
+{
+    Ac3dsPhaseScope phase(description);
     Ac3dsPhaseTimer wait(Ac3dsPhase::VBlankWait);
     u32 slot;
     // A vblank that arrives during the counter check is already pending in
     // GSP's event queue. Only the top-screen counter drives gameplay pace.
-    while((slot = C3D_FrameCounter(0)) == lastTopVblank) gspWaitForAnyEvent();
+    while((slot = readTopVblank()) == lastTopVblank) gspWaitForAnyEvent();
     return slot;
 }
-bool startFrame(bool sync)
+// The display transfer writes to the buffer the last present swapped away
+// from, and GSP only takes a present at a VBlank. If a late frame is followed
+// by a quick one, that buffer is still on screen when the quick frame's
+// transfer lands: the picture tears, and the late frame is never shown because
+// its present is replaced before the VBlank. So a finished frame waits here
+// for the previous one to be taken.
+//
+// A frame held this way is submitted on the VBlank, and the next one starts at
+// once: frames are then paced by this wait instead of the one at frame start.
+// That keeps one new picture per refresh when frames are close to a refresh
+// long, at the price of showing each a little later. Once frames have had time
+// to spare for a while that price buys nothing, so the next frame is put back
+// on the frame-start wait.
+unsigned heldRun = 0;
+void waitTopPresented()
+{
+    if(!presentGuard) return;
+    if(!gspIsPresentPending(GSP_SCREEN_TOP)) { heldRun = 0; return; }
+    Ac3dsPhaseScope phase("GPU previous present wait");
+    Ac3dsPhaseTimer wait(Ac3dsPhase::VBlankWait);
+    const u64 began = svcGetSystemTick();
+    const u32 slot = readTopVblank();
+    while(gspIsPresentPending(GSP_SCREEN_TOP) && readTopVblank() == slot) gspWaitForAnyEvent();
+    presentWaits.fetch_add(1, std::memory_order_relaxed);
+    // Idle for over a third of a refresh, eight frames running.
+    heldRun = svcGetSystemTick()-began > SYSCLOCK_ARM11/180 ? heldRun+1 : 0;
+    if(heldRun >= 8)
+    {
+        lastTopVblank = readTopVblank();
+        heldRun = 0;
+    }
+}
+bool startFrame(bool sync, const char *vblankPhase = "GPU frame start VBlank", const char *queuePhase = "GPU acquire frame queue")
 {
     if(!ready || frame) return frame;
-    if(sync) waitTopVblank();
+    // After HOME -> Close libctru neither reacquires the GPU right nor runs
+    // the restore hooks. A list submitted now would never complete, and the
+    // next wait for the queue would hang the exit.
+    if(!gspHasGpuRight()) return false;
+    if(sync) waitTopVblank(vblankPhase);
     Ac3dsPhaseTimer queue(Ac3dsPhase::QueueStart);
-    const bool started = C3D_FrameBegin(0);
+    bool started;
+    {
+        Ac3dsPhaseScope phase(queuePhase);
+        // On the handheld the queue has twice stopped advancing with the GPU
+        // idle (builds 14 and 22): a command finished and its completion never
+        // reached the queue, and the wait below then never returned. Give the
+        // queue two seconds; if the GPU is idle by then, drop what is left of
+        // that frame and carry on. One picture is lost instead of the game.
+        while(ac3dsGxQueue && !gxCmdQueueWait(ac3dsGxQueue, 2000000000LL))
+        {
+            u32 busy = 0;
+            if(R_SUCCEEDED(GSPGPU_ReadHWRegs(0x400034,&busy,sizeof(busy))) && (busy & 0xcc000000)) continue;
+            gxCmdQueueStop(ac3dsGxQueue);
+            gxCmdQueueClear(ac3dsGxQueue);
+            ac3ds_crash_note_event("gx queue cleared", int(ac3dsQueueRecoveries.fetch_add(1, std::memory_order_relaxed)+1));
+            break;
+        }
+        started = C3D_FrameBegin(0);
+    }
     queue.stop();
     if(!started) return false;
     // GPU time of the previous frame's command lists (Citro3D measures it from
@@ -423,9 +540,10 @@ bool startFrame(bool sync)
     {
         ac3dsRecordGpu(C3D_GetDrawingTime(), C3D_GetProcessingTime());
     }
-    if(sync) lastTopVblank = C3D_FrameCounter(0);
+    if(sync) lastTopVblank = readTopVblank();
     frameHasVblank = sync;
     frame = true;
+    if(burst.state == Ac3dsBurstState::Draining) burst.state = Ac3dsBurstState::Ready;
     retire();
     // APT restore can dirty Citro3D's saved loader state. Re-establish the
     // complete buffer description before using offset-only updates.
@@ -475,6 +593,43 @@ void splitFrame()
 {
     flushData();
     C3D_FrameSplit(submitFlags);
+}
+void reserveCommands();
+void queueBurstFrame()
+{
+    if(burst.state != Ac3dsBurstState::Recording || target != top) return;
+    u8 *out = burst.data+burstHeaderBytes+burst.captured*burstFrameBytes;
+    const auto *color = static_cast<const u32 *>(top->frameBuf.colorBuf);
+    const size_t offset = size_t(burstFirstTileRow)*(screenH/8)*64;
+    // Close the list first so the copy sees the whole frame.
+    reserveCommands();
+    splitFrame();
+    queuedGx += 2;
+    Result result;
+    {
+        Ac3dsPhaseScope phase("GPU gunburst cache flush");
+        result = GSPGPU_FlushDataCache(out,burstFrameBytes);
+    }
+    const char *operation = "cache flush";
+    if(R_SUCCEEDED(result))
+    {
+        operation = "texture copy";
+        result = GX_TextureCopy(const_cast<u32 *>(color+offset),0,reinterpret_cast<u32 *>(out),0,burstFrameBytes,GX_TRANSFER_RAW_COPY(1));
+    }
+    if(R_FAILED(result))
+    {
+        burst.failure = operation;
+        burst.result = result;
+        burst.state = Ac3dsBurstState::Draining;
+        return;
+    }
+    BurstMeta meta;
+    meta.ms = u32((svcGetSystemTick()-burst.startTick)*1000/SYSCLOCK_ARM11);
+    meta.barriers = currentCounters.barriers;
+    meta.presentWaits = presentWaits.load(std::memory_order_relaxed);
+    meta.vblank = readTopVblank();
+    std::memcpy(burst.data+64+burst.captured*sizeof(BurstMeta),&meta,sizeof(meta));
+    if(++burst.captured == burst.frames) burst.state = Ac3dsBurstState::Draining;
 }
 void recycleFrame()
 {
@@ -672,6 +827,28 @@ void applyTex()
         C3D_TexEnvColor(env, tevColor(u.color));
         ++stage;
     }
+    const bool fogStage = pixelFogActive() && stage < int(next.size());
+    if(fogStage)
+    {
+        // colour = fog*f + previous*(1-f), f = procedural texture alpha.
+        C3D_TexEnv *env = &next[stage];
+        C3D_TexEnvInit(env);
+        const GPU_TEVSRC previous = stage ? GPU_PREVIOUS : GPU_PRIMARY_COLOR;
+        C3D_TexEnvSrc(env, C3D_RGB, GPU_CONSTANT, previous, GPU_TEXTURE3);
+        C3D_TexEnvOpRgb(env, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_ALPHA);
+        C3D_TexEnvFunc(env, C3D_RGB, GPU_INTERPOLATE);
+        C3D_TexEnvSrc(env, C3D_Alpha, previous, previous, previous);
+        C3D_TexEnvFunc(env, C3D_Alpha, GPU_REPLACE);
+        C3D_TexEnvColor(env, fogColor|0xff000000u);
+        ++stage;
+    }
+    // Bound once and left on: the stage alone decides whether it is read, and
+    // the tables are not re-sent on every fog toggle.
+    if(fogStage && !fogProcBound)
+    {
+        C3D_ProcTexBind(2, &fogProcTex);
+        fogProcBound = true;
+    }
     for(int i = stage; i < int(next.size()); ++i)
     {
         C3D_TexEnv *env = &next[i];
@@ -706,8 +883,21 @@ DepthMap depthMapFor(const Mat &p)
     const float *a = p.a;
     // Only a plain glFrustum (optionally with a scaled z row, as the hud gun
     // uses): w = e, and PICA clip z' = alpha*e + beta.
-    if(!linearDepth || a[11] != -1.f || a[3] != 0 || a[7] != 0 || a[15] != 0 ||
+    if(a[11] != -1.f || a[3] != 0 || a[7] != 0 || a[15] != 0 ||
        a[2] != 0 || a[6] != 0 || a[14] == 0) return d;
+    if(!linearDepth)
+    {
+        // Z-buffer: the world keeps the default map. The gun's own depth,
+        // .25 to 1 under that map, is squeezed into the top band so nothing
+        // drawn with the world map can cover it short of the near plane.
+        if(hudGunDepth && gunBand)
+        {
+            d.gun = true;
+            d.scale = -(1.f-worldDepthTop);
+            d.offset = worldDepthTop;
+        }
+        return d;
+    }
     const float alpha = -(a[10]+1.f)*.5f, beta = a[14]*.5f;
     float slope, top;
     if(hudGunDepth)
@@ -829,7 +1019,7 @@ void applyRaster(bool clip)
                            u32(alphaOn)|(u32(alpha)<<1)|(u32(alphaThreshold)<<4),
                            u32(stencilOn)|(u32(test)<<1)|(stencilRef<<4)|(stencilReadMask<<12),
                            u32(fail)|(u32(zfail)<<3)|(u32(pass)<<6), u32(src)|(u32(dst)<<4),
-                           fogColor|(u32(fogOn)<<24)};
+                           fogColor|(u32(fogOn && !pixelFog)<<24)};
     if(!rasterStateValid || next.cull != appliedRaster.cull) C3D_CullFace(cull);
     if(!rasterStateValid || next.depth != appliedRaster.depth) C3D_DepthTest(depthOn,depth,mask);
     if(!rasterStateValid || next.alpha != appliedRaster.alpha) C3D_AlphaTest(alphaOn,alpha,alphaThreshold);
@@ -838,15 +1028,25 @@ void applyRaster(bool clip)
     if(!rasterStateValid || next.blend != appliedRaster.blend) C3D_AlphaBlend(GPU_BLEND_ADD,GPU_BLEND_ADD,src,dst,src,dst);
     if(!rasterStateValid || next.fog != appliedRaster.fog)
     {
-        C3D_FogGasMode(fogOn ? GPU_FOG : GPU_NO_FOG, GPU_PLAIN_DENSITY, false);
+        C3D_FogGasMode(fogOn && !pixelFog ? GPU_FOG : GPU_NO_FOG, GPU_PLAIN_DENSITY, false);
         C3D_FogColor(fogColor);
     }
     appliedRaster = next;
     rasterStateValid = true;
 }
+void applyPixelFogTable()
+{
+    if(fogCurveReady) return;
+    float in[129];
+    for(int i = 0; i <= 128; ++i) in[i] = sat((i/128.f-fogCurveKnee)/(1.f-fogCurveKnee));
+    ProcTexLut_FromArray(&fogCurveLut,in);
+    C3D_ProcTexLutBind(GPU_LUT_RGBMAP,&fogCurveLut);
+    fogCurveReady = true;
+}
 void applyFog()
 {
     if(!fogOn) return;
+    if(pixelFog) { applyPixelFogTable(); return; }
     const Mat &p = projection.current;
     int kind;
     float near, far;
@@ -921,6 +1121,22 @@ void apply(bool clip)
     }
     if(uvDirty) applyTextureMatrices();
     if(fogDirty) { applyFog(); fogDirty = false; }
+    if(pixelFogActive())
+    {
+        // u = knee + k*(e - start), e = -z_eye, k = (1-knee)/(end-start).
+        // If start exceeds end-start, u goes negative near the eye and the
+        // unit mirrors it; that stays under the knee (no fog) while
+        // start < 2*(end-start), which AssaultCube's (fog+64)/8 to fog meets
+        // for any fog above 15. Clip-space draws (lines; identity transform)
+        // carry clip w in the position, not 1, and have no eye space: a zero
+        // row gives them u = 0, no fog.
+        const float k = (1.f-fogCurveKnee)/std::max(fogFar-fogNear,.0001f);
+        float row[4] = {0,0,0,clip ? 0.f : fogCurveKnee-k*fogNear};
+        if(!clip) for(int i = 0; i < 4; ++i) row[i] -= model.current.at(2,i)*k;
+        const C3D_FVec &value = C3D_FVUnif[GPU_VERTEX_SHADER][locFogCoord];
+        if(value.x != row[0] || value.y != row[1] || value.z != row[2] || value.w != row[3])
+            C3D_FVUnifSet(GPU_VERTEX_SHADER,locFogCoord,row[0],row[1],row[2],row[3]);
+    }
 }
 void useBuffer(const void *v, VertexLayout layout = VertexLayout::Full, const float *fixedUV1 = current.uv[1],
                bool fixedColor = true)
@@ -1321,7 +1537,7 @@ void enable(GLenum key,bool on)
     else
     {
         dirtyRaster();
-        if(key == GL_FOG) fogDirty = true;
+        if(key == GL_FOG) { fogDirty = true; tevDirty = true; }
         if(v == &offsetOn) transformDirty = true;
     }
     *v = on;
@@ -1385,8 +1601,12 @@ WorldStripPlan planWorldStrips(const Ac3dsWorldStrips &strips, int begin)
         ++end;
     }
     while(end < strips.draws && nv+strips.count[end] <= multiBatchVertices);
-    // Azahar streams the whole min-to-max range per indexed draw.
-    return {end,nv,ni,high-low <= 2*nv};
+    // A dense batch draws straight from one shared upload of the world array;
+    // a sparse one is repacked strip by strip, because Azahar streams the
+    // whole min-to-max range per indexed draw. The PICA fetches vertices by
+    // index, so on the handheld sharing every batch (ac3dssharedworldverts 1)
+    // saves the repacking and a second copy of the same vertices.
+    return {end,nv,ni,shareWorldVertices || high-low <= 2*nv};
 }
 void writeWorldStrips(const Ac3dsWorldStrips &strips, int begin, int end, u8 *packed, u16 *out)
 {
@@ -1552,9 +1772,13 @@ void outputPixel(u8 *p,GLenum f,u32 c)
 }
 bool readTarget(C3D_RenderTarget *source)
 {
+    // A tiled-to-linear transfer under 64x16 is not valid on hardware (the
+    // emulator copies it anyway), and the staging buffer has a fixed size.
+    if(!source || !pixels || source->frameBuf.width < 64 || source->frameBuf.height < 16 ||
+       size_t(source->frameBuf.width)*source->frameBuf.height*4 > pixelsBytes) return false;
     const bool wasOpen = frame;
     submitPending();
-    if(!source || !pixels || !startFrame(false)) return false;
+    if(!startFrame(false)) return false;
     reserveCommands();
     // PICA color target and DMA destination are both RGBA8; this untwiddles
     // the GPU framebuffer. Keep this outside the normal gameplay hot path.
@@ -1594,7 +1818,7 @@ bool ac3ds_gl_init()
             fontIndices = nullptr;
         }
     }
-    pixels = static_cast<u32 *>(linearAlloc(256*256*4 + screenW*screenH*4));
+    pixels = static_cast<u32 *>(linearAlloc(pixelsBytes));
     shader = DVLB_ParseFile(reinterpret_cast<u32 *>(const_cast<unsigned char *>(cube_vertex_shbin)),cube_vertex_shbin_size);
     if(!top || !vertices || !indices || !pixels || !aimTile || !shader || !C3D_TexInit(&dummyUnit1,8,8,GPU_RGBA8))
     {
@@ -1625,6 +1849,7 @@ bool ac3ds_gl_init()
     locTex[0] = shaderInstanceGetUniformLocation(vsh,"tex0");
     locTex[1] = shaderInstanceGetUniformLocation(vsh,"tex1");
     locColorScale = shaderInstanceGetUniformLocation(vsh,"colorScale");
+    locFogCoord = shaderInstanceGetUniformLocation(vsh,"fogCoord");
     locColor = shaderInstanceGetUniformLocation(vsh,"flatColor");
     locProbeTransform = shaderInstanceGetUniformLocation(programs[ProbeProgram].vertexShader,"transform");
     if(locTransform < 0 || locTex[0] < 0 || locTex[1] < 0 || locColorScale < 0 || locColor < 0 || locProbeTransform < 0 ||
@@ -1632,6 +1857,7 @@ bool ac3ds_gl_init()
        locTex[0] != shaderInstanceGetUniformLocation(projective,"tex0") ||
        locTex[1] != shaderInstanceGetUniformLocation(projective,"tex1") ||
        locColorScale != shaderInstanceGetUniformLocation(projective,"colorScale") ||
+       locFogCoord < 0 || locFogCoord != shaderInstanceGetUniformLocation(projective,"fogCoord") ||
        locColor != shaderInstanceGetUniformLocation(projective,"flatColor"))
     {
         ac3ds_gl_shutdown();
@@ -1639,6 +1865,7 @@ bool ac3ds_gl_init()
     }
     flatColorActive = true;
     useVertexColor();
+    C3D_FVUnifSet(GPU_VERTEX_SHADER,locFogCoord,0,0,0,0);
     auto &full = attributes[size_t(VertexLayout::Full)];
     AttrInfo_Init(&full);
     AttrInfo_AddLoader(&full,0,GPU_FLOAT,4);
@@ -1695,6 +1922,24 @@ bool ac3ds_gl_init()
     C3D_DepthMap(true,-1.f,0.f);
     depthMapValid = false;
     C3D_EarlyDepthTest(false,GPU_EARLYDEPTH_GREATER,0);
+    // Fog procedural texture: u from texcoord2, clamped to [0,1], mapped by
+    // the fog curve (applyPixelFogTable) into a 128-entry grey ramp, so every
+    // channel of the result is the fog amount. Bound on first fog use.
+    C3D_ProcTexInit(&fogProcTex,0,128);
+    C3D_ProcTexClamp(&fogProcTex,GPU_PT_CLAMP_TO_EDGE,GPU_PT_CLAMP_TO_EDGE);
+    C3D_ProcTexCombiner(&fogProcTex,false,GPU_PT_U,GPU_PT_U);
+    C3D_ProcTexNoiseEnable(&fogProcTex,false);
+    C3D_ProcTexShift(&fogProcTex,GPU_PT_NONE,GPU_PT_NONE);
+    C3D_ProcTexFilter(&fogProcTex,GPU_PT_LINEAR);
+    {
+        u32 colors[128];
+        for(int i = 0; i < 128; ++i) { const u32 c = u32(i*255/127); colors[i] = c|(c<<8)|(c<<16)|(c<<24); }
+        ProcTexColorLut_Write(&fogColorLut,colors,0,128);
+    }
+    C3D_ProcTexColorLutBind(&fogColorLut);
+    fogCurveReady = false;
+    fogProcBound = false;
+    C3D_ProcTexBind(2,nullptr);
     C3D_FrameRate(60.f);
     pending.reserve(8192);
     pendingFont.reserve(fontQuadCapacity*4);
@@ -1740,11 +1985,15 @@ void ac3ds_gl_shutdown()
     activeProgram = DefaultProgram; forceProjective = false; unit0Binding = 0; unit1Bound = false;
     textureWasActive[0] = textureWasActive[1] = false;
     dummyUnit1 = {}; aimTile = nullptr; aimQueued = false; shadowTargets.fill(nullptr);
+    if(burst.data) linearFree(burst.data);
+    burst = {};
     texUnit[0] = Unit{}; texUnit[1] = Unit{}; active = client = 0;
     model = MatrixStack{}; projection = MatrixStack{}; matrixMode = GL_MODELVIEW;
     depthOn = blendOn = stencilOn = cullOn = alphaOn = fogOn = scissorOn = false;
     writeDepth = true; colorMask = 15; wireframe = offsetOn = false;
     boundFogTable = nullptr;
+    fogCurveReady = false;
+    fogProcBound = false;
     depthMapValid = hudGunDepth = false;
     tevInitialized = false;
     viewportValid = false;
@@ -1758,6 +2007,7 @@ void ac3ds_gl_set_late_vblank(bool enabled)
 {
     lateVblankRequested = enabled;
 }
+void ac3ds_gl_set_shared_world_vertices(bool enabled) { shareWorldVertices = enabled; }
 void ac3ds_gl_set_fast_vertex_offsets(bool enabled)
 {
     if(fastVertexOffsets == enabled) return;
@@ -1795,7 +2045,8 @@ void ac3ds_gl_startup_clear()
 
 void ac3ds_gl_set_command_dumps(unsigned count)
 {
-    ac3dsCommandDumps = std::min(count,6u);
+    ac3dsCommandDumps = std::min(count,8u);
+    ac3dsCommandDumpIndex = 0;
 }
 
 void ac3ds_gl_set_projective(bool allowed)
@@ -1864,26 +2115,39 @@ void ac3ds_gl_probe_projective()
     ac3ds_gl_startup_draw();
     forceProjective = false;
 }
+void ac3ds_gl_probe_fog() { ac3ds_gl_startup_draw(true); }
 
 void ac3ds_gl_startup_state(uint32_t out[6])
 {
     // GX submissions and the last GSP result, the last list, and the GPU busy bits.
-    out[0] = ac3dsGxSubmit;
-    out[1] = ac3dsGxResult;
+    out[0] = ac3dsGxSubmit.load(std::memory_order_relaxed);
+    out[1] = ac3dsGxResult.load(std::memory_order_relaxed);
     out[2] = ac3dsLastList ? osConvertVirtToPhys(ac3dsLastList) : 0;
-    out[3] = ac3dsLastListBytes;
+    out[3] = ac3dsLastListBytes.load(std::memory_order_relaxed);
     out[4] = 0xffffffff;
     GSPGPU_ReadHWRegs(0x400034,&out[4],sizeof(u32));
     out[5] = osGetMemRegionFree(MEMREGION_APPLICATION);
 }
 
-void ac3ds_gl_startup_draw()
+uint32_t ac3ds_gl_queue_recoveries() { return ac3dsQueueRecoveries.load(std::memory_order_relaxed); }
+void ac3ds_gl_runtime_state(uint32_t out[5])
+{
+    out[0] = ac3dsGxSubmit.load(std::memory_order_relaxed);
+    out[1] = ac3dsGxResult.load(std::memory_order_relaxed);
+    out[2] = ac3dsLastListBytes.load(std::memory_order_relaxed);
+    out[3] = observedTopVblank.load(std::memory_order_relaxed);
+    out[4] = presentWaits.load(std::memory_order_relaxed);
+}
+
+void ac3ds_gl_startup_draw(bool fog)
 {
     // Exercise the normal vertex input and shader before binding a texture.
+    // With fog, the same list also binds the procedural texture unit, uploads
+    // its tables and adds the fog combiner stage (the triangle reads fog 0).
     glDisable(GL_TEXTURE_2D);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
-    glDisable(GL_FOG);
+    if(fog) glEnable(GL_FOG); else glDisable(GL_FOG);
     glColor4ub(0, 0, 0, 255);
     Vertex triangle[3];
     triangle[0].p[0] = triangle[0].p[1] = -.5f;
@@ -1934,7 +2198,9 @@ void ac3ds_gl_end_frame()
     submitPending();
     flushData();
     top->used = true;
-    if(gameplayFrame && lateVblankFrame) lastTopVblank = waitTopVblank();
+    if(gameplayFrame) queueBurstFrame();
+    if(gameplayFrame && lateVblankFrame) lastTopVblank = waitTopVblank("GPU late submission VBlank");
+    else if(gameplayFrame) waitTopPresented();
     if(gameplayFrame && lateVblankFrame != lastGameplayLate)
     {
         // A profile can be armed before a toggle. Its next frame becomes a
@@ -1965,12 +2231,24 @@ void ac3ds_gl_end_frame()
         profile.haveBaseline = true;
     }
     gameplayFrame = false;
-    C3D_FrameEnd(fullFlush ? 0 : submitFlags);
+    {
+        Ac3dsPhaseScope phase("GPU submit frame");
+        C3D_FrameEnd(fullFlush ? 0 : submitFlags);
+    }
     lastCounters = currentCounters;
     currentCounters = {};
     frame = false;
     frameHasVblank = false;
     target = top;
+    // Under memory pressure give the world caches back. They are freed by
+    // retire() at the next frame start, once this frame's queue has drained;
+    // the views they served draw through the frame arena like a moving one.
+    if(linearSpaceFree() < worldCacheReserveBytes)
+    {
+        activeWorldGeometry = nullptr;
+        for(size_t i = 0; i < worldGeometryCaches.size(); ++i)
+            if(worldGeometryCaches[i].data) ac3ds_gl_discard_world_cache(int(i));
+    }
     // Deleting a render target drains the preceding queue. Only do it on
     // actual resource disposal, never at the normal frame boundary.
     for(auto i = retiredTextures.begin(); i != retiredTextures.end();)
@@ -2118,6 +2396,10 @@ void ac3ds_gl_build_world_cache(int slot, const Ac3dsWorldStrips *batches, int c
     constexpr size_t maxWorldCacheBytes = 1024*1024;
     const size_t bytes = vertexBytes+indexBytes;
     if(!bytes || bytes > maxWorldCacheBytes) return;
+    // A cache only saves time for a still view. Textures and skins loaded
+    // later in the match need the memory more; attempted stays set, so a
+    // refused slot is not planned again every frame.
+    if(linearSpaceFree() < bytes+worldCacheReserveBytes) return;
     u8 *data = static_cast<u8 *>(linearAlloc(bytes));
     if(!data) return;
     if(shared) std::memcpy(data,worldSource,worldBytes);
@@ -2457,7 +2739,7 @@ void glFogfv(GLenum key,const GLfloat *f)
 {
     if(key != GL_FOG_COLOR) return;
     const u32 c = tevColor(rgba(f[0],f[1],f[2],f[3]))&0xffffff;
-    if(fogColor != c) { dirtyRaster(); fogColor = c; }
+    if(fogColor != c) { dirtyRaster(); tevDirty = true; fogColor = c; }
 }
 void glViewport(GLint x,GLint y,GLsizei w,GLsizei h)
 {
@@ -3214,12 +3496,26 @@ void ac3ds_gl_set_linear_depth(bool enabled)
     if(ready) dirtyTransform();
     linearDepth = enabled;
 }
+void ac3ds_gl_set_pixel_fog(bool enabled)
+{
+    if(pixelFog == enabled) return;
+    if(ready) { submitPending(); rasterDirty = fogDirty = tevDirty = true; }
+    pixelFog = enabled;
+}
 void ac3ds_gl_set_hud_gun_depth(bool on)
 {
     if(hudGunDepth == on) return;
-    if(ready) dirtyTransform();
+    if(ready) { dirtyTransform(); tevDirty = true; }
     hudGunDepth = on;
 }
+void ac3ds_gl_set_gun_isolation(bool fog, bool band)
+{
+    if(gunFog == fog && gunBand == band) return;
+    if(ready) { dirtyTransform(); tevDirty = true; }
+    gunFog = fog;
+    gunBand = band;
+}
+void ac3ds_gl_set_present_guard(bool enabled) { presentGuard = enabled; }
 bool ac3ds_gl_queue_aim_depth()
 {
     aimQueued = false;
@@ -3243,9 +3539,12 @@ bool ac3ds_gl_queue_aim_depth()
 }
 bool ac3ds_gl_take_aim_depth(float &depth)
 {
-    if(!aimQueued || !startFrame(!lateVblankRequested)) return false;
+    if(!aimQueued || !startFrame(!lateVblankRequested, "GPU aim VBlank", "GPU aim acquire frame queue")) return false;
     aimQueued = false;
-    if(R_FAILED(GSPGPU_InvalidateDataCache(aimTile,256))) return false;
+    {
+        Ac3dsPhaseScope phase("GPU aim cache invalidate");
+        if(R_FAILED(GSPGPU_InvalidateDataCache(aimTile,256))) return false;
+    }
     const u32 value = aimTile[morton(screenH/2,screenW/2)]&0xffffff;
     if(aimDepthMap.w && value)
     {
@@ -3260,12 +3559,71 @@ bool ac3ds_gl_take_aim_depth(float &depth)
 }
 
 bool ac3ds_gl_read_ok() { return readOkay; }
+unsigned ac3ds_gl_burst_start(unsigned frames)
+{
+    if(!ready || burst.state != Ac3dsBurstState::Idle) return 0;
+    static_assert(64+96*sizeof(BurstMeta) <= burstHeaderBytes, "burst header too small");
+    frames = std::min(frames,96u);
+    // Leave the world caches their reserve and a margin. Try a shorter take
+    // if the full buffer won't fit, including when free memory is fragmented.
+    for(; frames; frames /= 2)
+    {
+        const size_t bytes = burstHeaderBytes + frames*burstFrameBytes;
+        if(linearSpaceFree() < bytes + 2*worldCacheReserveBytes) continue;
+        burst.data = static_cast<u8 *>(linearMemAlign(bytes,0x1000));
+        if(burst.data) break;
+    }
+    if(!burst.data) return 0;
+    std::memset(burst.data,0,burstHeaderBytes);
+    burst.frames = frames;
+    burst.startTick = svcGetSystemTick();
+    burst.state = Ac3dsBurstState::Recording;
+    return frames;
+}
+Ac3dsBurstState ac3ds_gl_burst_state() { return burst.state; }
+Ac3dsBurstReadout ac3ds_gl_burst_data()
+{
+    if(burst.state != Ac3dsBurstState::Ready) return {};
+    Ac3dsBurstReadout readout{nullptr, 0, burst.captured, burst.frames, burst.failure, uint32_t(burst.result)};
+    if(!burst.captured) return readout;
+    const size_t payloadBytes = burst.captured*burstFrameBytes;
+    {
+        Ac3dsPhaseScope phase("GPU gunburst cache invalidate");
+        const Result result = GSPGPU_InvalidateDataCache(burst.data+burstHeaderBytes,payloadBytes);
+        if(R_FAILED(result))
+        {
+            readout.failure = "cache invalidate";
+            readout.result = uint32_t(result);
+            return readout;
+        }
+    }
+    const u32 header[8] = { 0x42473341u /* "A3GB" */, 1, burst.captured, burstTileRows, u32(screenH/8), burstFirstTileRow,
+                            u32(screenH), u32(screenW) };
+    std::memcpy(burst.data,header,sizeof(header));
+    readout.bytes = unsigned(burstHeaderBytes+payloadBytes);
+    readout.data = burst.data;
+    return readout;
+}
+void ac3ds_gl_burst_free()
+{
+    // The active queue may still refer to the buffer until Ready.
+    if(burst.state != Ac3dsBurstState::Ready) return;
+    linearFree(burst.data);
+    burst = {};
+}
 void ac3ds_gl_profile_start(unsigned intervals)
 {
     profile.count = profile.vblanks = profile.missed = profile.over20ms = 0;
     profile.ticks = 0;
     profile.haveBaseline = profile.report = false;
     profile.requested = std::min<unsigned>(intervals, profile.intervals.size());
+}
+// Close a profile that is still collecting: report the intervals it has.
+void ac3ds_gl_profile_finish()
+{
+    if(!profile.requested || profile.report) return;
+    if(profile.count) { profile.requested = profile.count; profile.report = true; }
+    else profile.requested = 0;
 }
 bool ac3ds_gl_profile_take(unsigned &intervals, unsigned long long &ticks,
                            unsigned long long &p99Ticks, unsigned long long &maxTicks,

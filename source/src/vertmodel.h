@@ -455,7 +455,18 @@ struct vertmodel : model
             d->upload = uploadserial();
 #endif
 
-            if(cachelen >= owner->model->cachelimit) lightcache.removelast();
+#ifdef __3DS__
+            // Map models are drawn in entity order every pass and a hit does
+            // not refresh its place in the list, so once a model has more
+            // visible instances than the limit (8 by default) every instance
+            // misses on every draw, is relit and uploaded again. Stock maps
+            // place one vertex-lit model up to 49 times.
+            const bool statentry = !(owner->numframes > 1 || as.anim&ANIM_DYNALLOC);
+            const int lightlimit = statentry ? max(owner->model->cachelimit, 64) : owner->model->cachelimit;
+#else
+            const int lightlimit = owner->model->cachelimit;
+#endif
+            if(cachelen >= lightlimit) lightcache.removelast();
             lightcache.addfirst(d);
             d->lastcalclight = lastcalclight;
             d->pos = modelpos;
@@ -502,7 +513,7 @@ struct vertmodel : model
             {
                 GLuint id = tex < 0 ? -tex : skin->id;
 #ifdef __3DS__
-                if(!tex && !id) id = reloadtexture(*skin) ? skin->id : notexture->id;
+                if(!tex && !id) id = (!skin->loadfailed && reloadtexture(*skin)) ? skin->id : notexture->id;
 #endif
                 if(tex > 0) id = lookuptexture(tex)->id;
 #ifdef __3DS__
@@ -544,7 +555,7 @@ struct vertmodel : model
                 xtraverts += statlen;
                 return;
             }
-            else if(stenciling==1)
+            else if(stenciling)
             {
                 bb curbb;
                 getcurbb(curbb, as, cur, prev, ai_t);
@@ -1148,6 +1159,9 @@ struct vertmodel : model
             if(filename && loadshadows(filename)) return;
 
             int aasize = 1<<(dynshadowsize + aadynshadow);
+#ifdef __3DS__
+            aasize = max(aasize, 64); // smallest render target the GPU can read back
+#endif
             while(aasize > screenw || aasize > screenh) aasize /= 2;
 #ifdef __3DS__
             if(!ac3ds_gl_begin_shadow_target(aasize)) return;

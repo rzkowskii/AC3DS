@@ -103,16 +103,21 @@ void computeraytable(float vx, float vy, float fov)
     if(!ocull) { disableraytable(); return; }
 #ifdef __3DS__
     // Rays depend on horizontal position, view, fog, and the map's solids.
-    // Editing can change the grid without moving the camera.
+    // Solids only change without a map load in edit mode and coop edit (every
+    // remote edit is coop-only), so the table is also reused on a server.
+    extern int ac3dsworldcache;
+    extern unsigned ac3ds_world_geometry_generation();
     static float lastX, lastY, lastYaw, lastPitch, lastFov;
     static int lastFog;
-    const bool fixedWorld = !editmode && !multiplayer(NULL);
+    static unsigned lastGeometry;
+    const unsigned geometry = ac3ds_world_geometry_generation();
+    const bool fixedWorld = ac3dsworldcache && !editmode && !m_coop;
     const bool sameAngles = camera1->yaw == lastYaw && camera1->pitch == lastPitch && fov == lastFov;
     // Above 45 degrees the legacy table always traces every ray. Rotation
     // cannot change the result until pitch returns to the partial-ray range.
     const bool fullRayTable = fabsf(camera1->pitch) > 45.f && fabsf(lastPitch) > 45.f;
     if(raytableValid && fixedWorld && vx == lastX && vy == lastY &&
-       (sameAngles || fullRayTable) && fog == lastFog) return;
+       (sameAngles || fullRayTable) && fog == lastFog && geometry == lastGeometry) return;
     ++raytableGeneration;
     lastX = vx;
     lastY = vy;
@@ -120,6 +125,7 @@ void computeraytable(float vx, float vy, float fov)
     lastPitch = camera1->pitch;
     lastFov = fov;
     lastFog = fog;
+    lastGeometry = geometry;
     raytableValid = fixedWorld;
 #endif
     odist = fog * 1.5f;

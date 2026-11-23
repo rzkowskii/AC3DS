@@ -143,6 +143,8 @@ namespace
     unsigned worldBatchUseSerial;
     CachedWorldBatch refractionWorld;
     CachedWorldBatch *activeWorldBatch = nullptr;
+    // The active batch was captured from verts this frame, not restored.
+    bool activeWorldBatchCaptured = false;
     CachedWorldBatch *pendingWorldBatch = nullptr;
     CachedWorldBatch *heldRefractionWorld = nullptr;
     float worldSkyFloor = 1e16f;
@@ -396,6 +398,7 @@ bool ac3ds_restore_world_batch(int pass, const Ac3dsWorldBatchKey &key)
     countworldbatch(pass, true, false);
     batch.lastUse = ++worldBatchUseSerial;
     activeWorldBatch = &batch;
+    activeWorldBatchCaptured = false;
     verts.swapstorage(batch.vertices);
     nquads = batch.quads;
     skyfloor = min(skyfloor, batch.skyfloor);
@@ -424,8 +427,37 @@ void ac3ds_report_world_batches()
     }
 }
 
+// The cache is an optimisation and must never be what runs the heap out: it
+// only takes memory while the heap keeps this much unclaimed, and gives its
+// batches back when that is no longer so (see ac3ds_world_batches_frame_end).
+// The linear-memory side has the same rule in ac3ds_gl.cpp. In KB; raising
+// it far enough is how the give-back path is exercised in testing.
+VAR(ac3dsheapreserve, 256, 2048, 65536);
+#define worldBatchHeapReserve (size_t(ac3dsheapreserve) * 1024)
+// The working vertex buffer keeps room for this many vertices (3 MB) for the
+// life of the process. Sized per map it was grown by doubling at every map
+// start, a 1.5 MB and then a 3 MB block wherever one fitted.
+static const int worldVertsBase = 131072;
+
+extern size_t ac3ds_heap_unclaimed();
+
+// Decided from figures, not by trying: room for bytes above the reserve at
+// the top of the heap. It ignores free blocks further down, so close to the
+// limit a view that would have fitted in one is not cached.
+static bool heapcantake(size_t bytes)
+{
+    const size_t unclaimed = ac3ds_heap_unclaimed();
+    return unclaimed >= worldBatchHeapReserve && unclaimed - worldBatchHeapReserve >= bytes;
+}
+
+// Test aid: put the reserve this many KB below the heap's unclaimed figure, so
+// admission still passes and a vertex copy larger than that is refused.
+COMMANDF(ac3dsheapwindow, "i", (int *kb) { setvar("ac3dsheapreserve", int(ac3ds_heap_unclaimed() / 1024) - *kb); });
+
 void ac3ds_begin_world_dependencies(bool record)
 {
+    // No room to keep a batch: do not record for one either.
+    if(record && admitWorldBatch && ac3ds_heap_unclaimed() < worldBatchHeapReserve) admitWorldBatch = false;
     recordWorldLights = record && admitWorldBatch;
     recordWorldSurfaces = recordWorldLights && ac3dsreplayworldsurfaces;
     if(!recordWorldLights) return;
@@ -458,6 +490,7 @@ void ac3ds_record_world_defer(const sqr *cube)
 void ac3ds_save_world_batch(const Ac3dsWorldBatchKey &key)
 {
     if(!admitWorldBatch || !worldLightDependenciesComplete) return;
+    if(ac3ds_heap_unclaimed() < worldBatchHeapReserve) return;
     pendingWorldBatch = admittedWorldBatch;
     pendingWorldBatch->lastUse = ++worldBatchUseSerial;
     pendingWorldBatch->key = key;
@@ -533,6 +566,9 @@ static void captureworldbatch(CachedWorldBatch &batch)
     loopi(renderedtexs) clearslots(stripbatches[i]);
     renderedtexs = 0;
     activeWorldBatch = &batch;
+    // The refraction hold is taken every frame while refraction is on; it
+    // keeps trading buffers with verts. Only a cache slot gets its own copy.
+    activeWorldBatchCaptured = &batch != &refractionWorld;
 }
 
 static void finishworldbatch()
@@ -555,7 +591,8 @@ static void finishworldbatch()
     if(worldSurfacesComplete) batch.surfaces.swapstorage(worldSurfaces);
     sortlightdependencies(batch.lights.color, batch.lights.colorEnds);
     sortlightdependencies(batch.lights.defer, batch.lights.deferEnds);
-    // The old batch's buffers become scratch storage for the next miss.
+    // The old batch's strip buffers become scratch storage for the next
+    // miss; its vertices are replaced by an exact-size copy in resetcubes().
     captureworldbatch(batch);
     batch.valid = true;
 }
@@ -574,7 +611,15 @@ bool ac3ds_reuse_refraction_world()
 {
     if(!reflecting || !refracting || !heldRefractionWorld || !ac3ds_same_refraction_world_view()) return false;
     resetcubes();
+    // resetcubes() may have refused a newly captured slot its vertex copy
+    // (here or in the reflection pass): it then has nothing to replay.
+    if(heldRefractionWorld != &refractionWorld && !heldRefractionWorld->valid)
+    {
+        heldRefractionWorld = nullptr;
+        return false;
+    }
     activeWorldBatch = heldRefractionWorld;
+    activeWorldBatchCaptured = false;
     verts.swapstorage(activeWorldBatch->vertices);
     nquads = activeWorldBatch->quads;
     skyfloor = min(skyfloor, activeWorldBatch->skyfloor);
@@ -585,6 +630,134 @@ bool ac3ds_reuse_refraction_world()
 }
 
 void ac3ds_release_refraction_world() { heldRefractionWorld = nullptr; }
+
+// Frees the storage a vector holds, not just its contents.
+template<class T> static void releasestorage(vector<T> &v)
+{
+    v.setsize(0);
+    vector<T> empty;
+    v.swapstorage(empty);
+}
+
+static void releasestrips(stripbatch &batch)
+{
+    for(strips *s : { &batch.tris, &batch.tristrips, &batch.quads })
+    {
+        releasestorage(s->first);
+        releasestorage(s->count);
+    }
+}
+
+// Map change: drop every cached world batch and this file's scratch vectors
+// that were sized for the previous map (worldrender.cpp's tables go in
+// ac3ds_release_world_tables). None of them shrink on their own, so a
+// session kept the high-water mark of the largest map it had visited (over
+// 10 MB after ac_venison), and the heap eventually ran out.
+void ac3ds_release_world_batches()
+{
+    // Nothing of the old map is kept, so do not let resetcubes() copy a
+    // captured batch first.
+    activeWorldBatch = pendingWorldBatch = heldRefractionWorld = admittedWorldBatch = nullptr;
+    activeWorldBatchCaptured = false;
+    // The base vertex buffer may be out on loan: a slot replayed in the last
+    // frame holds it (verts has that slot's copy), and a refraction hold
+    // trades it with refractionWorld every frame. Bring it home first.
+    auto bringhome = [](CachedWorldBatch &batch)
+    {
+        if(verts.capacity() != worldVertsBase && batch.vertices.capacity() == worldVertsBase) verts.swapstorage(batch.vertices);
+    };
+    for(CachedWorldBatch &batch : worldBatches) bringhome(batch);
+    bringhome(refractionWorld);
+    resetcubes();
+    auto release = [&](CachedWorldBatch &batch)
+    {
+        batch.valid = false;
+        batch.textureCount = batch.quads = 0;
+        // Strip lists trade places between the slots and the working set and
+        // grow where they happen to be; kept across maps they were the blocks
+        // that held most holes in the heap open.
+        releasestrips(batch.sky);
+        for(stripbatch &texture : batch.textures) releasestrips(texture);
+        releasestorage(batch.vertices);
+        releasestorage(batch.lights.color);
+        releasestorage(batch.lights.defer);
+        releasestorage(batch.lights.colorEnds);
+        releasestorage(batch.lights.deferEnds);
+        releasestorage(batch.lightRegions);
+        releasestorage(batch.surfaces);
+    };
+    for(CachedWorldBatch &batch : worldBatches) release(batch);
+    release(refractionWorld);
+    for(WorldBatchAdmission &admission : worldBatchAdmissions) admission = {};
+    releasestrips(skystrips);
+    for(stripbatch &texture : stripbatches) releasestrips(texture);
+    if(verts.capacity() != worldVertsBase)
+    {
+        releasestorage(verts);
+        verts.reserve(worldVertsBase);
+    }
+    releasestorage(worldLightDependencies.color);
+    releasestorage(worldLightDependencies.defer);
+    releasestorage(changedWorldLightRegions);
+    releasestorage(worldSurfaces);
+    releasestorage(worldLightRecorded);
+    releasestorage(worldLightTouched);
+}
+
+// The whole-map minimap render can grow verts past what any frame needs.
+void ac3ds_trim_world_vertices()
+{
+    if(!activeWorldBatch && verts.capacity() > worldVertsBase)
+    {
+        releasestorage(verts);
+        verts.reserve(worldVertsBase);
+    }
+}
+
+// Once a frame, between frames: with the heap's reserve gone, give every
+// cached batch back (and its copy in linear memory). The views they served
+// are drawn by traversal again, as on a miss, and are cached again when
+// there is room.
+void ac3ds_world_batches_frame_end()
+{
+    const size_t unclaimed = ac3ds_heap_unclaimed();
+    if(unclaimed >= worldBatchHeapReserve) return;
+    bool holding = false;
+    for(CachedWorldBatch &batch : worldBatches)
+        holding = holding || batch.valid || batch.vertices.capacity() || batch.textureCount ||
+                  batch.lights.color.capacity() || batch.lights.defer.capacity() ||
+                  batch.lights.colorEnds.capacity() || batch.lights.deferEnds.capacity() ||
+                  batch.lightRegions.capacity() || batch.surfaces.capacity();
+    if(!holding) return;
+    // A slot replayed this frame lent its vertices to verts: trade them back first.
+    if(activeWorldBatch && !activeWorldBatchCaptured) verts.swapstorage(activeWorldBatch->vertices);
+    activeWorldBatch = pendingWorldBatch = heldRefractionWorld = admittedWorldBatch = nullptr;
+    activeWorldBatchCaptured = false;
+    loopi(Ac3dsWorldBatchSlots)
+    {
+        CachedWorldBatch &batch = worldBatches[i];
+        batch.valid = false;
+        releasestrips(batch.sky);
+        for(stripbatch &texture : batch.textures) releasestrips(texture);
+        batch.textureCount = batch.quads = 0;
+        releasestorage(batch.vertices);
+        releasestorage(batch.lights.color);
+        releasestorage(batch.lights.defer);
+        releasestorage(batch.lights.colorEnds);
+        releasestorage(batch.lights.deferEnds);
+        releasestorage(batch.lightRegions);
+        releasestorage(batch.surfaces);
+        ac3ds_gl_discard_world_cache(i);
+    }
+    for(WorldBatchAdmission &admission : worldBatchAdmissions) admission = {};
+    static int lastlogged = -1;
+    extern int ac3ds_load_generation;
+    if(lastlogged != ac3ds_load_generation)
+    {
+        lastlogged = ac3ds_load_generation;
+        clientlogf("memory: heap reserve reached (%u KB unclaimed), world cache given back", unsigned(unclaimed / 1024));
+    }
+}
 #endif
 
 static void renderstripbatch(strips &batch, GLenum type, bool world = false)
@@ -1090,8 +1263,31 @@ void resetcubes()
     clipMainWorldStrips = false;
     if(activeWorldBatch)
     {
-        verts.swapstorage(activeWorldBatch->vertices);
+        if(activeWorldBatchCaptured)
+        {
+            // A newly captured batch gets an exact-size copy of its vertices
+            // and verts keeps its buffer. Swapping instead left every slot
+            // holding a buffer grown for the largest view so far (up to 3 MB
+            // after a whole-map minimap render), seven slots deep.
+            vector<vertex> exact;
+            if(verts.length())
+            {
+                // Without room for the copy the view is simply not cached.
+                if(heapcantake(verts.length() * sizeof(vertex))) exact.put(verts.getbuf(), verts.length());
+                else
+                {
+                    // Not cached: a retry reuses this slot instead of the pass's other one.
+                    activeWorldBatch->valid = false;
+                    activeWorldBatch->lastUse = 0;
+                    worldBatchAdmissions[(activeWorldBatch - worldBatches) / 2] = {};
+                }
+            }
+            activeWorldBatch->vertices.setsize(0);
+            activeWorldBatch->vertices.swapstorage(exact);
+        }
+        else verts.swapstorage(activeWorldBatch->vertices);
         activeWorldBatch = nullptr;
+        activeWorldBatchCaptured = false;
     }
     pendingWorldBatch = nullptr;
     worldSkyFloor = 1e16f;

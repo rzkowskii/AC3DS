@@ -174,25 +174,53 @@ void ac3ds_gl_shutdown();
 void ac3ds_gl_begin_frame();
 void ac3ds_gl_end_frame();
 void ac3ds_gl_startup_clear();
-void ac3ds_gl_startup_draw();
+void ac3ds_gl_startup_draw(bool fog = false);
 void ac3ds_gl_end_startup_frame();
 void ac3ds_gl_probe_empty();
 void ac3ds_gl_probe_minimal();
 void ac3ds_gl_probe_projective();
+void ac3ds_gl_probe_fog();
 void ac3ds_gl_set_command_dumps(unsigned count);
 void ac3ds_gl_set_projective(bool allowed);
 void ac3ds_gl_startup_state(uint32_t out[6]);
+// Watchdog samples, without service calls: GX count/command id, GX result,
+// command-list bytes, last observed top VBlank and completed present waits.
+void ac3ds_gl_runtime_state(uint32_t out[5]);
+// Times a GX queue that stopped advancing with the GPU idle was cleared.
+uint32_t ac3ds_gl_queue_recoveries();
 bool ac3ds_gl_queue_readback_565(GLuint id, uint16_t **out, int *outw, int *outh);
 bool ac3ds_gl_drain_startup_frame(uint32_t &gpuStatus, int32_t &readResult);
 void ac3ds_gl_set_late_vblank(bool enabled);
+// Hold a frame back until the previous one has reached the screen, so a quick
+// frame after a late one neither tears nor replaces it unseen.
+void ac3ds_gl_set_present_guard(bool enabled);
+// Hud gun pass: whether it takes the per-pixel fog stage, and whether it gets
+// its own depth band in front of the world under the Z-buffer.
+void ac3ds_gl_set_gun_isolation(bool fog, bool band);
 void ac3ds_gl_set_fast_vertex_offsets(bool enabled);
+void ac3ds_gl_set_shared_world_vertices(bool enabled);
 void ac3ds_gl_set_joined_water_commands(bool enabled);
 void ac3ds_gl_collect_retired();
 void *ac3ds_gl_proc(const char *);
 bool ac3ds_gl_texture_ready(GLuint);
 bool ac3ds_gl_read_ok();
+// Diagnostic frame recorder: the right half of consecutive gameplay frames,
+// in the GPU's tile order. Ready means the GPU has finished using the buffer.
+enum class Ac3dsBurstState { Idle, Recording, Draining, Ready };
+struct Ac3dsBurstReadout
+{
+    const void *data = nullptr;
+    unsigned bytes = 0, captured = 0, planned = 0;
+    const char *failure = nullptr;
+    uint32_t result = 0;
+};
+unsigned ac3ds_gl_burst_start(unsigned frames);
+Ac3dsBurstState ac3ds_gl_burst_state();
+Ac3dsBurstReadout ac3ds_gl_burst_data();
+void ac3ds_gl_burst_free();
 void ac3ds_gl_stats(char *, unsigned);
 void ac3ds_gl_profile_start(unsigned intervals);
+void ac3ds_gl_profile_finish();
 bool ac3ds_gl_profile_take(unsigned &intervals, unsigned long long &ticks,
                            unsigned long long &p99Ticks, unsigned long long &maxTicks,
                            unsigned &over20ms, unsigned &vblanks, unsigned &missedVblanks);
@@ -296,9 +324,11 @@ void glVertex3fv(const GLfloat *);
 void glVertexPointer(GLint, GLenum, GLsizei, const GLvoid *);
 void glViewport(GLint, GLint, GLsizei, GLsizei);
 
-// Perspective draws store linear (W-buffer) depth so fog matches desktop GL.
+// Diagnostic: store linear (W-buffer) depth for perspective draws, as build 11 did.
 void ac3ds_gl_set_linear_depth(bool enabled);
-// The hud gun draws in a depth band in front of the world.
+// Fog per pixel through the procedural texture unit (default), or the GPU fog table.
+void ac3ds_gl_set_pixel_fog(bool enabled);
+// With linear depth, the hud gun draws in a depth band in front of the world.
 void ac3ds_gl_set_hud_gun_depth(bool on);
 bool ac3ds_gl_queue_aim_depth();
 bool ac3ds_gl_take_aim_depth(float &depth);

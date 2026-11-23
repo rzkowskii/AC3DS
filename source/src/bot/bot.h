@@ -164,6 +164,73 @@ struct unreachable_ent_s
      unreachable_ent_s(entity *e, int t) : ent(e), time(t) { };
 };
 
+#ifdef __3DS__
+// node_s -> a bot's own waypoint_s record. One array of pointers with open
+// addressing; the record carries its key (pNode).
+class BotWaypointIndex
+{
+     waypoint_s **slots = NULL;
+     int mask = -1, used = 0; // used: occupied slots, removed ones included
+
+     static waypoint_s *removed() { return reinterpret_cast<waypoint_s *>(size_t(1)); }
+     static unsigned hash(const node_s *node)
+     {
+          unsigned h = unsigned(size_t(node)) >> 3;
+          h ^= h >> 15; h *= 0x2c1b3c6dU; h ^= h >> 12;
+          return h;
+     }
+     void rebuild(int capacity) // a power of two
+     {
+          waypoint_s **old = slots;
+          const int oldmask = mask;
+          slots = new waypoint_s *[capacity];
+          memset(slots, 0, capacity * sizeof(*slots));
+          mask = capacity - 1;
+          used = 0;
+          for(int i = 0; i <= oldmask; i++) if(old[i] && old[i] != removed()) Add(old[i]);
+          delete[] old;
+     }
+
+public:
+     ~BotWaypointIndex() { delete[] slots; }
+     void Clear() { delete[] slots; slots = NULL; mask = -1; used = 0; }
+     void Reserve(int count) // room for count records without growing
+     {
+          int capacity = 64;
+          while(capacity * 2 < count * 3) capacity *= 2;
+          if(capacity > mask + 1) rebuild(capacity);
+     }
+     waypoint_s *Find(const node_s *node) const
+     {
+          if(mask < 0) return NULL;
+          for(unsigned i = hash(node) & mask;; i = (i + 1) & mask)
+          {
+               waypoint_s *wp = slots[i];
+               if(!wp) return NULL;
+               if(wp != removed() && wp->pNode == node) return wp;
+          }
+     }
+     void Add(waypoint_s *wp) // its node must not be in the index yet
+     {
+          if((used + 1) * 4 > (mask + 1) * 3) rebuild(max(64, (mask + 1) * 2));
+          unsigned i = hash(wp->pNode) & mask;
+          while(slots[i] && slots[i] != removed()) i = (i + 1) & mask;
+          if(!slots[i]) used++;
+          slots[i] = wp;
+     }
+     void Remove(const node_s *node)
+     {
+          if(mask < 0) return;
+          for(unsigned i = hash(node) & mask;; i = (i + 1) & mask)
+          {
+               waypoint_s *wp = slots[i];
+               if(!wp) return;
+               if(wp != removed() && wp->pNode == node) { slots[i] = removed(); return; }
+          }
+     }
+};
+#endif
+
 class CBot
 {
 public:
@@ -215,7 +282,21 @@ public:
      // Waypoint variabeles
      TLinkedList<waypoint_s *> m_WaypointList[MAX_MAP_GRIDS][MAX_MAP_GRIDS];
 #ifdef __3DS__
-     hashtable<uint, waypoint_s *> m_WaypointByNode;
+     // Every bot keeps a record and a grid-list link per waypoint. As separate
+     // heap blocks that was two blocks per waypoint per bot, 138,000 on
+     // ac_toxic with eight bots. SyncWaypoints() takes them from one block per
+     // bot; only waypoints added later (waypoint editing, flooding) get their
+     // own.
+     BotWaypointIndex m_WaypointIndex;
+     char *m_pWaypointBlock = NULL;
+     size_t m_iWaypointBlockBytes = 0;
+     bool InWaypointBlock(const void *p) const
+     {
+          return m_pWaypointBlock && static_cast<const char *>(p) >= m_pWaypointBlock && static_cast<const char *>(p) < m_pWaypointBlock + m_iWaypointBlockBytes;
+     }
+     void FreeWaypoints(void);
+     void AddWaypointRecord(node_s *pNode);
+     void DelWaypointRecord(node_s *pNode);
 #endif
      float m_iWaypointTime;
      waypoint_s *m_pCurrentWaypoint;

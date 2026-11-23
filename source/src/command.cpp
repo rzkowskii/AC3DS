@@ -970,6 +970,12 @@ bool execfile(const char *cfgfile)
     delete[] buf;
     resetcontext();
     persistidents = oldpersist;
+#if defined(__3DS__) && !defined(STANDALONE)
+    // Apply the handheld defaults again when the stock scripts are reloaded.
+    if(!currentcontextisolated && (!strcmp(s, "config/scripts.cfg") || !strcmp(s, "romfs:/config/scripts.cfg") ||
+                                   !strcmp(s, "sdmc:/3ds/assaultcube/config/scripts.cfg")))
+        ac3ds_install_default_scope_action();
+#endif
     return true;
 }
 

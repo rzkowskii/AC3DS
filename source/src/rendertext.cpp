@@ -1,6 +1,9 @@
 // rendertext.cpp: font rendering
 
 #include "cube.h"
+#ifdef __3DS__
+#include <3ds/console.h>
+#endif
 
 int VIRTW;
 bool ignoreblinkingbit = false; // for remote-n-temp override of '\fb'
@@ -88,6 +91,70 @@ void popfont()
 {
     if(!fontstack.empty()) curfont = fontstack.pop();
 }
+
+#ifdef __3DS__
+namespace
+{
+Texture pixelFontTexture{};
+font pixelFont{};
+bool pixelFontAttempted = false;
+}
+
+void ac3ds_reset_pixel_font()
+{
+    if(pixelFontTexture.id) glDeleteTextures(1, &pixelFontTexture.id);
+    pixelFontTexture.id = 0;
+    pixelFont.chars.setsize(0);
+    pixelFontAttempted = false;
+}
+
+bool ac3ds_push_pixel_font()
+{
+    if(!pixelFontAttempted)
+    {
+        pixelFontAttempted = true;
+        // Use the same 8x8 glyphs as the lower-screen controls. Nearest
+        // sampling at integral screen coordinates preserves their edges.
+        constexpr int glyphSize = 8, atlasSize = 128;
+        const ConsoleFont &source = consoleGetDefault()->font;
+        uchar *pixels = new uchar[atlasSize * atlasSize * 2];
+        memset(pixels, 0, atlasSize * atlasSize * 2);
+        pixelFont.tex = &pixelFontTexture;
+        pixelFont.defaultw = glyphSize + 1;
+        pixelFont.defaulth = glyphSize;
+        pixelFont.skip = '!';
+        for(int code = '!'; code <= 255; ++code)
+        {
+            const int x = (code % 16) * glyphSize, y = (code / 16) * glyphSize;
+            int index = code - source.asciiOffset;
+            if(index < 0 || index >= source.numChars) index = '?' - source.asciiOffset;
+            if(index >= 0 && index < source.numChars)
+            {
+                const uchar *glyph = source.gfx + glyphSize * index;
+                loopj(glyphSize) loopi(glyphSize)
+                {
+                    uchar *texel = pixels + ((y + j) * atlasSize + x + i) * 2;
+                    texel[0] = 255;
+                    texel[1] = glyph[j] & (0x80 >> i) ? 255 : 0;
+                }
+            }
+            pixelFont.chars.add({glyphSize, glyphSize, float(x) / atlasSize, float(x + glyphSize) / atlasSize,
+                                float(y) / atlasSize, float(y + glyphSize) / atlasSize});
+        }
+        pixelFontTexture.xs = pixelFontTexture.ys = atlasSize;
+        pixelFontTexture.bpp = 32; // straight-alpha blending in draw_text
+        glGenTextures(1, &pixelFontTexture.id);
+        createtexture(pixelFontTexture.id, atlasSize, atlasSize, pixels, 3, false, false, GL_LUMINANCE_ALPHA);
+        delete[] pixels;
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    }
+    if(!ac3ds_gl_texture_ready(pixelFontTexture.id)) return false;
+    fontstack.add(curfont);
+    curfont = &pixelFont;
+    return true;
+}
+#endif
 
 int text_width(const char *str)
 {

@@ -799,6 +799,9 @@ void resetgl()
 #endif
 
     loadingscreen();
+#ifdef __3DS__
+    ac3ds_reset_pixel_font();
+#endif
 
     extern void cleanupparticles();
     extern void cleanupmodels();
@@ -868,6 +871,9 @@ void limitfps(int &millis, int curmillis)
         }
         if(delay > 0)
         {
+#ifdef __3DS__
+            Ac3dsPhaseScope phase("frame limiter: SDL delay");
+#endif
             SDL_Delay(delay);
             millis += delay;
         }
@@ -928,8 +934,10 @@ void ac3ds_discard_pending_input()
 {
     for(int i = events.length()-1; i >= 0; --i)
     {
-        if(events[i].type == SDL_KEYDOWN || events[i].type == SDL_MOUSEMOTION)
-            events.remove(i);
+        const SDL_Event &event = events[i];
+        if(event.type == SDL_KEYDOWN || event.type == SDL_MOUSEMOTION ||
+           (event.type == SDL_USEREVENT &&
+            (event.user.code == AC3DS_MENU_TOUCH_EVENT || event.user.code == AC3DS_SERVER_JOIN_EVENT))) events.remove(i);
     }
 }
 #endif
@@ -938,10 +946,12 @@ bool interceptkey(int sym)
 {
 #ifdef __3DS__
     if(!ac3ds_main_loop()) return sym == SDLK_ESCAPE;
-    ac3ds_poll_input();
 #endif
     static int lastintercept = SDLK_UNKNOWN;
     int len = lastintercept == sym ? events.length() : 0;
+#ifdef __3DS__
+    ac3ds_poll_input(); // after len: the button events queued here are the ones to scan below
+#endif
     SDL_Event event;
     while(SDL_PollEvent(&event)) switch(event.type)
     {
@@ -1051,6 +1061,8 @@ void checkinput()
                 if(event.user.code == AC3DS_MENU_TOUCH_EVENT)
                     ac3ds_menu_touch(event.user.windowID, int(reinterpret_cast<intptr_t>(event.user.data1)),
                                      Ac3dsMenuTouch(reinterpret_cast<intptr_t>(event.user.data2)));
+                else if(event.user.code == AC3DS_SERVER_JOIN_EVENT)
+                    ac3ds_dispatch_server_join(event.user.windowID, unsigned(reinterpret_cast<uintptr_t>(event.user.data1)));
                 break;
 #endif
             case SDL_KEYDOWN:
@@ -1227,6 +1239,10 @@ void checkinput()
 
 VARF(gamespeed, 10, 100, 1000, if(multiplayer()) gamespeed = 100);
 VARF(paused, 0, 0, 1, if(multiplayer()) paused = 0);
+
+#ifdef __3DS__
+bool ac3ds_offline_match_paused() { return paused && !multiplayer(NULL) && !watchingdemo; }
+#endif
 
 bool inmainloop = false;
 static int clockrealbase = 0, clockvirtbase = 0;
@@ -1415,7 +1431,14 @@ int main(int argc, char **argv)
 {
 #ifdef __3DS__
     ac3ds_crash_install("main");
-    if(const char *error = ac3ds_system_init()) fatal("%s", error);
+    if(const char *error = ac3ds_system_init())
+    {
+        if(*error) fatal("%s", error);
+        // The first-run download was declined or did not finish, and its own
+        // screen has said so. Nothing else has started yet.
+        ac3ds_system_shutdown();
+        return EXIT_SUCCESS;
+    }
     ac3ds_read_launch_arguments(argc, argv);
 #endif
     DEBUGCODE(sanitychecks());
@@ -1474,6 +1497,9 @@ int main(int argc, char **argv)
 #endif
 
     if(*stream_capabilities()) clientlogf("info: %s", stream_capabilities());
+#ifdef __3DS__
+    clientlogf("game data: %s", ac3ds_asset_source());
+#endif
 
     bool waitforauth = false;
     initing = INIT_RESET;
@@ -1701,7 +1727,7 @@ int main(int argc, char **argv)
         while(aptMainLoop()) svcSleepThread(100000000);
         return false;
     };
-    ac3ds_gl_set_command_dumps(6);
+    ac3ds_gl_set_command_dumps(8);
     ac3ds_gl_startup_clear();
     if(!awaitStartupGpu("clear","Screen clear did not finish.")) return EXIT_FAILURE;
     ac3ds_draw_controls();
@@ -1711,25 +1737,56 @@ int main(int argc, char **argv)
     if(!awaitStartupGpu("minimal draw","A plain triangle does not complete.")) return EXIT_FAILURE;
     ac3ds_gl_startup_draw();
     if(!awaitStartupGpu("game shader draw","The game vertex path stalls.")) return EXIT_FAILURE;
+    // Optional GPU features get a guarded check. The marker file reads
+    // "pending" while the check runs; if a launch stops inside it, the next
+    // launch finds that, records "off" and runs with the fallback. Deleting
+    // the marker retries the check. A pass is recorded with the build number
+    // and only trusted by that build, since a new build can change what the
+    // check draws.
+    auto guardedCheck = [&](const char *marker, void (*probe)(), const char *stage, const char *meaning) -> int
     {
-        // The projection program is only needed for water. If a launch stops
-        // inside its check, the next launch runs without it.
-        const char *marker = "sdmc:/3ds/assaultcube/profile/gpu-projective.txt";
         char previous[16] = "";
         if(FILE *f = fopen(marker,"r")) { if(!fgets(previous,sizeof(previous),f)) previous[0] = 0; fclose(f); }
         auto mark = [marker](const char *state) { if(FILE *f = fopen(marker,"w")) { fputs(state,f); fclose(f); } };
         if(!strncmp(previous,"pending",7) || !strncmp(previous,"off",3))
         {
             if(previous[0] == 'p') mark("off");
+            return 0;
+        }
+        defformatstring(passed)("ok %d", AC3DS_BUILD_NUMBER);
+        const bool known = !strcmp(previous, passed);
+        if(!known) mark("pending");
+        probe();
+        if(!awaitStartupGpu(stage,meaning)) return -1;
+        if(!known) mark(passed);
+        return 1;
+    };
+    // The projection program is only needed for water.
+    switch(guardedCheck("sdmc:/3ds/assaultcube/profile/gpu-projective.txt", ac3ds_gl_probe_projective,
+                        "projection draw", "Restart: water will use the fallback."))
+    {
+        case -1: return EXIT_FAILURE;
+        case 0:
             ac3ds_gl_set_projective(false);
             clientlogf("init: projection textures disabled after an earlier stalled check");
-        }
-        else
+            break;
+    }
+    // Per-pixel fog uses the procedural texture unit, which nothing else in
+    // the port touches. The fallback is build 11's rendering: the GPU fog
+    // table over linear depth.
+    switch(guardedCheck("sdmc:/3ds/assaultcube/profile/gpu-pixelfog.txt", ac3ds_gl_probe_fog,
+                        "fog draw", "Restart: fog will use the GPU table."))
+    {
+        case -1: return EXIT_FAILURE;
+        case 0:
         {
-            if(strncmp(previous,"ok",2)) mark("pending");
-            ac3ds_gl_probe_projective();
-            if(!awaitStartupGpu("projection draw","Restart: water will use the fallback.")) return EXIT_FAILURE;
-            if(strncmp(previous,"ok",2)) mark("ok");
+            extern int ac3dspixelfog, ac3dslineardepth;
+            ac3dspixelfog = 0;
+            ac3dslineardepth = 1;
+            ac3ds_gl_set_pixel_fog(false);
+            ac3ds_gl_set_linear_depth(true);
+            clientlogf("init: per-pixel fog disabled after an earlier stalled check (delete profile/gpu-pixelfog.txt to retry)");
+            break;
         }
     }
 #endif
@@ -1808,6 +1865,9 @@ int main(int argc, char **argv)
         exec("config/defaults.cfg");
         bootstrapentropy += 5 + rnd(7);
     }
+#ifdef __3DS__
+    ac3ds_upgrade_scope_binding();
+#endif
     autostartscripts("_aftersaved_");
     exechook(HOOK_SP_MP, "afterinit", "");
     if(waitforauth)
@@ -1875,11 +1935,14 @@ int main(int argc, char **argv)
     for(;;)
     {
 #ifdef __3DS__
-        AC3DS_PHASE("system events");
+        AC3DS_PHASE("frame tick");
         ac3ds_crash_tick();
+        AC3DS_PHASE("system events");
         if(!ac3ds_main_loop()) break;
         if(ac3ds_take_clock_reset())
         {
+            Ac3dsPhaseScope phase("APT: reset frame clock");
+            ac3ds_crash_note_event("clock reset");
             clockreset();
             ac3ds_audio_service();
         }
@@ -1887,7 +1950,11 @@ int main(int argc, char **argv)
         // player is not dropped straight back into a firefight.
         if(ac3ds_take_resume() && !multiplayer(NULL) && !watchingdemo && *getclientmap() &&
            ac3ds_menu_panel() == Ac3dsMenu::None && !getcurcommand(NULL))
+        {
+            Ac3dsPhaseScope phase("APT: reopen offline pause menu");
             execute("ac3ds_pause_menu");
+        }
+        AC3DS_PHASE("frame clock");
 #endif
         static int frames = 0;
         static float fps = 10.0f;
@@ -1898,6 +1965,9 @@ int main(int argc, char **argv)
         limitfps(millis, totalmillis);
         int elapsed = millis-totalmillis;
         entropy_add_byte(elapsed);
+#ifdef __3DS__
+        const int frameGameMillis = lastmillis;
+#endif
         if(multiplayer(NULL))
         {
             if(ispaused) curtime = 0;
@@ -1923,6 +1993,7 @@ int main(int argc, char **argv)
 
 #ifdef __3DS__
         extern void ac3ds_resolve_aim();
+        AC3DS_PHASE("aim: resolve previous depth");
         ac3ds_resolve_aim();
         Ac3dsPhaseTimer updatePhase(Ac3dsPhase::Update);
         AC3DS_PHASE("input");
@@ -1930,7 +2001,18 @@ int main(int argc, char **argv)
         checkinput();
 
 #ifdef __3DS__
+        // The pause menu can open during input. Keep the elapsed wall time
+        // for UI and audio, but discard this simulation step before either
+        // the client or the local server can act on it.
+        const bool offlineMatchPaused = ac3ds_offline_match_paused();
         AC3DS_PHASE("update world");
+        if(offlineMatchPaused)
+        {
+            lastmillis = frameGameMillis;
+            curtime = 0;
+            gets2c(); // a pending online connection still needs its events
+        }
+        else
 #endif
         if(lastmillis) updateworld(curtime, lastmillis);
 
@@ -1938,6 +2020,7 @@ int main(int argc, char **argv)
 
 #ifdef __3DS__
         AC3DS_PHASE("server slice");
+        if(!offlineMatchPaused)
 #endif
         serverslice(0);
 #ifdef __3DS__
@@ -1956,6 +2039,46 @@ int main(int argc, char **argv)
         audioPhase.stop();
         Ac3dsPhaseTimer rayPhase(Ac3dsPhase::Rays);
         AC3DS_PHASE("ray table");
+        {
+            // A benchmark never runs on a server: put its settings back at once.
+            extern bool ac3dsbenchleft();
+            extern void ac3dsbenchend(const char *how);
+            if(ac3dsbenchleft()) ac3dsbenchend("cancelled");
+            extern void ac3dsburstframe();
+            ac3dsburstframe();
+            // Benchmark aid: turn the view by a fixed step every frame.
+            extern float ac3dsautoturn;
+            extern int ac3dsautomove, ac3dsautostrafe;
+            if(ac3dsautoturn && !offlineMatchPaused && !multiplayer(NULL) && player1->state == CS_ALIVE)
+            {
+                extern float ac3dsturnjitter;
+                player1->yaw += ac3dsautoturn + ((frames&1) ? ac3dsturnjitter : 0);
+                while(player1->yaw >= 360) player1->yaw -= 360;
+            }
+            extern int ac3dsautofire;
+            static bool autofiring = false;
+            if(ac3dsautofire && !offlineMatchPaused && !multiplayer(NULL) && player1->state == CS_ALIVE) player1->attacking = autofiring = true;
+            else if(autofiring) player1->attacking = autofiring = false;
+            static bool automoving = false;
+            if((ac3dsautomove || ac3dsautostrafe) && !offlineMatchPaused && !multiplayer(NULL) && player1->state == CS_ALIVE)
+            {
+                player1->move = ac3dsautomove;
+                player1->strafe = ac3dsautostrafe;
+                automoving = true;
+            }
+            else if(automoving)
+            {
+                player1->move = player1->strafe = 0;
+                automoving = false;
+            }
+        }
+        // Pick this frame's camera before tracing occlusion rays from it.
+        // gl_drawframe() only switches to the death, follow or fly camera
+        // later, so the table used to describe the previous viewpoint: one
+        // frame without the facing walls on every death and respawn, and a
+        // band of missing world while a followed player turns.
+        extern void recomputecamera();
+        recomputecamera();
 #endif
         computeraytable(camera1->o.x, camera1->o.y, dynfov());
 #ifdef __3DS__
@@ -2005,6 +2128,10 @@ int main(int argc, char **argv)
 #endif
 #ifdef __3DS__
         AC3DS_PHASE("frame end");
+        {
+            extern void ac3ds_world_batches_frame_end();
+            ac3ds_world_batches_frame_end();
+        }
         if(frames <= 6)
         {
             // Progress marks for handheld runs, flushed so a hang leaves a trace.
@@ -2015,7 +2142,7 @@ int main(int argc, char **argv)
         {
             // The first seconds of a match (bot spawn, waypoint flood, first
             // draws): flushed, so a crash there is pinned down.
-            char memory[128];
+            char memory[224];
             ac3ds_memory_line(memory, sizeof(memory));
             clientlogf("frame %d done (%d ms) after load: %s", frames, elapsed, memory);
             if(clientlogfile) clientlogfile->fflush();
@@ -2024,9 +2151,18 @@ int main(int argc, char **argv)
         {
             // Every 30 s: progress and memory, flushed so a crash mid-match
             // leaves the last state on the SD card (one small write).
-            char memory[128];
+            char memory[224];
             ac3ds_memory_line(memory, sizeof(memory));
             clientlogf("frame %d done (%d ms) %s %s", frames, elapsed, getclientmap(), memory);
+            extern void ac3dsdiag();
+            ac3dsdiag();
+            if(clientlogfile) clientlogfile->fflush();
+        }
+        static uint32_t queueRecoveries = 0;
+        if(ac3ds_gl_queue_recoveries() != queueRecoveries)
+        {
+            queueRecoveries = ac3ds_gl_queue_recoveries();
+            clientlogf("AC3DS_QUEUE cleared a stuck GX queue at frame %d (%u so far)", frames, unsigned(queueRecoveries));
             if(clientlogfile) clientlogfile->fflush();
         }
 #endif
@@ -2052,8 +2188,9 @@ COMMANDF(ac3dstap, "ii", (int *x, int *y) { extern void ac3ds_qa_tap(int, int); 
 // QA: put the player at x y z (a negative x keeps the position) facing yaw pitch.
 COMMANDF(ac3dspose, "fffff", (float *x, float *y, float *z, float *yaw, float *pitch)
 {
+    if(multiplayer("ac3dspose")) return; // QA teleports never run on a server
     if(*x >= 0) { player1->o = vec(*x, *y, *z); player1->vel = vec(0, 0, 0); player1->resetinterp(); }
-    player1->yaw = *yaw;
+    player1->yaw = *yaw - 360*floorf(*yaw/360); // the world LOD rectangle assumes 0..360
     player1->pitch = *pitch;
     clientlogf("qa: pose %.1f %.1f %.1f yaw %.0f pitch %.0f", player1->o.x, player1->o.y, player1->o.z, player1->yaw, player1->pitch);
 });

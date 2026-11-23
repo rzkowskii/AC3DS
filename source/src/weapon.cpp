@@ -1048,6 +1048,20 @@ void weapon::attackphysics(vec &from, vec &to) // physical fx to the owner
 
 VARP(righthanded, 0, 1, 1); // flowtron 20090727
 
+#ifdef __3DS__
+// 0: the kick pulls the gun along this frame's view direction, as on desktop,
+// where the aim point is never a frame behind. 1 is the behaviour up to build 21.
+VAR(ac3dsgunaim, 0, 0, 1);
+Ac3dsGunTrace ac3dsGunTrace = { 0, 0, 0, 0, 0 };
+void ac3dsgunstat()
+{
+    conoutf("AC3DS_GUN jump %d/1000 at depth %d/1000, weapon %d, %d ms after a shot, aim off %.2f deg",
+        ac3dsGunTrace.jump, ac3dsGunTrace.depth, ac3dsGunTrace.weapon, ac3dsGunTrace.sinceShot, ac3dsGunTrace.aimoff);
+    ac3dsGunTrace = Ac3dsGunTrace();
+}
+COMMAND(ac3dsgunstat, "");
+#endif
+
 void weapon::renderhudmodel(int lastaction, int index)
 {
     playerent *p = owner;
@@ -1055,8 +1069,46 @@ void weapon::renderhudmodel(int lastaction, int index)
     float dist = worldpos.dist(p->o, unitv);
     unitv.div(dist);
 
+#ifdef __3DS__
+    // The aim point is a frame old on this port (it is read back from the
+    // previous frame's depth), and the kick after a shot pulls the gun along
+    // the direction to it: while turning, the gun then jumps from frame to
+    // frame. Use the view direction of this frame instead.
+    const float yawr = RAD*(p->yaw-90), pitchr = RAD*p->pitch;
+    const vec forward(cosf(yawr)*cosf(pitchr), sinf(yawr)*cosf(pitchr), sinf(pitchr));
+    const vec side(cosf(yawr-PI/2), sinf(yawr-PI/2), 0);
+    const float aimoff = acosf(clamp(unitv.dot(forward), -1.0f, 1.0f))/RAD;
+    if(!ac3dsgunaim) unitv = forward;
+#endif
     weaponmove wm;
     if(!intermission || !ispaused) wm.calcmove(unitv, lastaction, p);
+#ifdef __3DS__
+    {
+        // How far the gun moved across the view since the last frame.
+        static vec lastoffset(0, 0, 0);
+        static int lasttime = 0;
+        vec offset(wm.pos);
+        offset.sub(p->o);
+        vec up;
+        up.cross(side, forward);
+        const vec view(offset.dot(side), offset.dot(up), offset.dot(forward));
+        if(lastmillis-lasttime <= 100)
+        {
+            const float dx = view.x-lastoffset.x, dy = view.y-lastoffset.y;
+            const int jump = int(sqrtf(dx*dx+dy*dy)*1000);
+            if(jump > ac3dsGunTrace.jump)
+            {
+                ac3dsGunTrace.jump = jump;
+                ac3dsGunTrace.weapon = type;
+                ac3dsGunTrace.sinceShot = lastmillis-lastaction;
+                ac3dsGunTrace.depth = int(view.z*1000);
+            }
+        }
+        if(aimoff > ac3dsGunTrace.aimoff) ac3dsGunTrace.aimoff = aimoff;
+        lastoffset = view;
+        lasttime = lastmillis;
+    }
+#endif
     defformatstring(path)("weapons/%s", info.modelname);
     bool emit = (wm.anim&ANIM_INDEX)==ANIM_GUN_SHOOT && (lastmillis - lastaction) < flashtime();
     rendermodel(path, wm.anim|ANIM_DYNALLOC|(righthanded==index ? ANIM_MIRROR : 0)|(emit ? ANIM_PARTICLE : 0), 0, -1, wm.pos, 0, p->yaw+90, p->pitch+wm.k_rot, 40.0f, wm.basetime, NULL, NULL, 1.28f);
@@ -1505,7 +1557,7 @@ void sniperrifle::attackfx(const vec &from, const vec &to, int millis)
 bool sniperrifle::reload(bool autoreloaded)
 {
     bool r = weapon::reload(autoreloaded);
-    if(owner==player1 && r) { scoped = false; player1->scoping = false; }
+    if(owner==player1 && r) clearscope();
     return r;
 }
 
@@ -1524,9 +1576,9 @@ int sniperrifle::dynspread()
 }
 float sniperrifle::dynrecoil() { return scoped && lastmillis - scoped_since > SCOPESETTLETIME ? info.recoil / 3 : info.recoil; }
 bool sniperrifle::selectable() { return weapon::selectable() && !m_noprimary && this == owner->primweap; }
-void sniperrifle::onselecting(bool sound) { weapon::onselecting(sound); scoped = false; player1->scoping = false; }
-void sniperrifle::ondeselecting() { scoped = false; owner->scoping = false; }
-void sniperrifle::onownerdies() { shots = 0; scoped = false; owner->scoping = false; }
+void sniperrifle::onselecting(bool sound) { weapon::onselecting(sound); clearscope(); }
+void sniperrifle::ondeselecting() { clearscope(); }
+void sniperrifle::onownerdies() { shots = 0; clearscope(); }
 void sniperrifle::renderhudmodel() { if(!scoped) weapon::renderhudmodel(); }
 
 void sniperrifle::renderaimhelp(bool teamwarning)
@@ -1539,15 +1591,50 @@ void sniperrifle::renderaimhelp(bool teamwarning)
     else drawcrosshair(owner, CROSSHAIR_EDIT);
 }
 
+bool sniperrifle::scope_available() const
+{
+    return this == owner->weaponsel && !reloading && owner->state == CS_ALIVE;
+}
+
 void sniperrifle::setscope(bool enable)
 {
-    if(this == owner->weaponsel && !reloading && owner->state == CS_ALIVE)
-    {
-        if(scoped == false && enable == true) scoped_since = lastmillis;
-        if(enable != scoped) owner->scoping = enable;
-        scoped = enable;
-    }
+    if(!enable) { clearscope(); return; }
+    if(!scope_available()) return;
+#ifdef __3DS__
+    if(intermission) return;
+    scope_latched = true;
+#endif
+    applyscope(true);
 }
+
+void sniperrifle::applyscope(bool enable)
+{
+    if(enable && !scoped) scoped_since = lastmillis;
+    owner->scoping = scoped = enable;
+}
+
+void sniperrifle::clearscope()
+{
+#ifdef __3DS__
+    scope_held = scope_latched = false;
+#endif
+    applyscope(false);
+}
+
+#ifdef __3DS__
+void sniperrifle::set_scope_hold(bool enable)
+{
+    if(enable && (!scope_available() || intermission)) return;
+    scope_held = enable;
+    applyscope(scope_held || scope_latched);
+}
+
+void sniperrifle::toggle_scope_latch()
+{
+    scope_latched = !scope_latched;
+    applyscope(scope_held || scope_latched);
+}
+#endif
 
 // carbine
 
@@ -1668,14 +1755,54 @@ void knife::attackfx(const vec &from, const vec &to, int millis) { attacksound()
 void knife::renderstats() { }
 
 
-void setscope(bool enable)
+void clearscope()
 {
-    if(player1->weaponsel->type != GUN_SNIPER) return;
-    sniperrifle *sr = (sniperrifle *)player1->weaponsel;
-    sr->setscope(enable);
+    if(!player1 || !player1->weaponsel) return;
+    static_cast<sniperrifle *>(player1->weapons[GUN_SNIPER])->clearscope();
 }
 
-COMMANDF(setscope, "i", (int *on) { setscope(*on != 0); });
+COMMANDF(setscope, "i", (int *on)
+{
+    if(player1 && player1->weaponsel)
+        static_cast<sniperrifle *>(player1->weapons[GUN_SNIPER])->setscope(*on != 0);
+});
+
+#ifdef __3DS__
+COMMANDF(ac3ds_scope_hold, "i", (int *on)
+{
+    if(player1 && player1->weaponsel)
+        static_cast<sniperrifle *>(player1->weapons[GUN_SNIPER])->set_scope_hold(*on != 0);
+});
+
+void ac3ds_install_default_scope_action()
+{
+    // Keep altaction and its bindings intact so profile scripts can remap
+    // them. The stock sniper action releases only the shoulder hold.
+    defformatstring(name)("altaction_%d", GUN_SNIPER);
+    const char *action = getalias(name);
+    if(action && !strcmp(action, " setscope 1; onrelease [ setscope 0 ] "))
+        alias(name, "ac3ds_scope_hold 1; onrelease [ac3ds_scope_hold 0]");
+}
+
+bool ac3ds_can_toggle_scope()
+{
+    const weapon *selected = player1 ? player1->weaponsel : NULL;
+    return selected && selected->type == GUN_SNIPER && player1->state == CS_ALIVE &&
+           !player1->weaponchanging && !selected->reloading && !editmode && !watchingdemo &&
+           !ispaused && !intermission && !ac3ds_offline_match_paused() && *getclientmap();
+}
+
+bool ac3ds_scope_latched()
+{
+    const weapon *selected = player1 ? player1->weaponsel : NULL;
+    return selected && selected->type == GUN_SNIPER && static_cast<const sniperrifle *>(selected)->is_scope_latched();
+}
+
+COMMANDF(ac3ds_scope_toggle, "", ()
+{
+    if(ac3ds_can_toggle_scope()) static_cast<sniperrifle *>(player1->weaponsel)->toggle_scope_latch();
+});
+#endif
 
 void shoot(playerent *p, vec &targ)
 {
@@ -1760,6 +1887,10 @@ void checkakimbo()
 
 void checkweaponstate()
 {
+#ifdef __3DS__
+    // A network team change can enter spectator mode without going through deathstate().
+    if(player1->scoping && player1->state != CS_ALIVE) clearscope();
+#endif
     checkweaponswitch();
     checkakimbo();
 }

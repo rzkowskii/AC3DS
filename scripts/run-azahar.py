@@ -234,8 +234,9 @@ def profile_config(args):
         'Renderer': {'graphics_api': {'software': '0', 'opengl': '1', 'vulkan': '2'}[args.renderer],
                      'resolution_factor': '1'},
         'Layout': {'render_3d': '0'},
-        'UI': {'first_start': 'false', 'confirmClose': 'false', 'check_for_update_on_start': 'false'},
-        'Miscellaneous': {'enable_telemetry': 'false'},
+        'UI': {'first_start': 'false', 'confirmClose': 'false'},
+        # Azahar reads the update check from Miscellaneous; under UI it is ignored.
+        'Miscellaneous': {'enable_telemetry': 'false', 'check_for_update_on_start': 'false'},
     }
     if args.touch_key:
         code, x, y = args.touch_key

@@ -524,7 +524,9 @@ bool startasyncworker()
         svcGetThreadPriority(&priority, CUR_THREAD_HANDLE);
         // Below the game and the audio mixer, on core 2.
         asyncstop = false;
-        asyncworker = threadCreate(asyncworkermain, NULL, 64 * 1024, min(int(priority) + 2, 0x3F), 2, false);
+        // The decode path uses about 50 KiB of stack before Tremor's own
+        // per-codebook allocas, and thread stacks have no guard page.
+        asyncworker = threadCreate(asyncworkermain, NULL, 128 * 1024, min(int(priority) + 2, 0x3F), 2, false);
     }
     // A failed start (memory, thread limit) is retried two seconds later.
     asyncretrytick = asyncworker ? 0 : now + 2 * u64(SYSCLOCK_ARM11);
@@ -540,8 +542,8 @@ void freejob(asyncsound *job)
 }
 
 // Main thread. The job is out of asyncjobs and not cancelled. Installs the
-// decoded sample in its buffer, or loads the buffer synchronously if the
-// decode failed.
+// decoded sample in its buffer. If the worker could not even open the file,
+// the buffer is loaded synchronously instead.
 bool adoptjob(asyncsound *job)
 {
     sbuffer *buf = job->buf;
@@ -559,9 +561,15 @@ bool adoptjob(asyncsound *job)
             else alDeleteBuffers(1, &id);
         }
     }
+    // rate is set once the worker has opened the file and begun decoding. A
+    // decode that then failed (memory, damaged stream) would fail the same way
+    // here, as a full blocking decode on the game thread in the middle of a
+    // match. Only a file the worker could not open gets the synchronous
+    // loader, which also tries the other name variants.
+    const bool attempted = job->rate != 0;
     freejob(job);
     buf->pending = false;
-    if(!adopted && !buf->id && !buf->load()) conoutf("\f3failed to load sample %s", buf->name);
+    if(!adopted && !buf->id && (attempted || !buf->load())) conoutf("\f3failed to load sample %s", buf->name);
     return adopted;
 }
 }

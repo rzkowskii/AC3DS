@@ -920,7 +920,7 @@ extern bool havehomedir();
 extern void addpackagedir(const char *dir);
 #ifdef __3DS__
 extern thread_local int findfilelocation;
-extern bool installfile3ds(const char *name, stream *source, int maxsize);
+extern bool installfile3ds(const char *name, stream *source, int maxsize, bool replaceable = false, bool (*cancel)() = NULL);
 #else
 extern int findfilelocation;
 #endif
@@ -937,6 +937,8 @@ extern stream *opengzfile(const char *filename, const char *mode, stream *file =
 extern char *loadfile(const char *fn, int *size, const char *mode = NULL);
 extern int streamcopy(stream *dest, stream *source, int maxlen = INT_MAX);
 #ifdef __3DS__
+extern bool recovermapfiles3ds(const char *map, const char *cfg);
+extern bool installmapfiles3ds(const char *map, const char *cfg, const char *backup, stream *mapsource, stream *cfgsource);
 extern void filerotate(const char *basename, const char *ext, int keepold, const char *oldformat = NULL, bool keepcurrent = false);
 #else
 extern void filerotate(const char *basename, const char *ext, int keepold, const char *oldformat = NULL);

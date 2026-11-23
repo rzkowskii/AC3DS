@@ -26,11 +26,24 @@ int lastupdatemaster = 0;
 vector<char> masterout, masterin;
 int masteroutpos = 0, masterinpos = 0;
 
+#ifdef __3DS__
+static void *masterLookup = NULL, *masterConnect = NULL;
+static ENetSocket pendingMasterSocket = ENET_SOCKET_NULL;
+static enet_uint32 masterConnectStart;
+static constexpr enet_uint32 masterConnectLimit = 20000;
+#endif
+
 void disconnectmaster()
 {
+#ifdef __3DS__
+    if(masterLookup) enet_3ds_resolve_abandon(masterLookup);
+    if(masterConnect) enet_3ds_connect_abandon(masterConnect); // owns pendingMasterSocket
+    masterLookup = masterConnect = NULL;
+    pendingMasterSocket = ENET_SOCKET_NULL;
+#else
     if(mastersock == ENET_SOCKET_NULL) return;
-
-    enet_socket_destroy(mastersock);
+#endif
+    if(mastersock != ENET_SOCKET_NULL) enet_socket_destroy(mastersock);
     mastersock = ENET_SOCKET_NULL;
 
     masterout.setsize(0);
@@ -43,6 +56,17 @@ void disconnectmaster()
     //lastupdatemaster = 0;
 }
 
+static ENetSocket openmastersocket()
+{
+    ENetSocket sock = enet_socket_create(ENET_SOCKET_TYPE_STREAM);
+    if(sock != ENET_SOCKET_NULL && serveraddress.host != ENET_HOST_ANY && enet_socket_bind(sock, &serveraddress) < 0)
+    {
+        enet_socket_destroy(sock);
+        return ENET_SOCKET_NULL;
+    }
+    return sock;
+}
+
 ENetSocket connectmaster()
 {
     if(!mastername[0] || !usemaster) return ENET_SOCKET_NULL;
@@ -53,12 +77,7 @@ ENetSocket connectmaster()
         masteraddress.port = masterport;
         if(!resolverwait(mastername, &masteraddress)) return ENET_SOCKET_NULL;
     }
-    ENetSocket sock = enet_socket_create(ENET_SOCKET_TYPE_STREAM);
-    if(sock != ENET_SOCKET_NULL && serveraddress.host != ENET_HOST_ANY && enet_socket_bind(sock, &serveraddress) < 0)
-    {
-        enet_socket_destroy(sock);
-        sock = ENET_SOCKET_NULL;
-    }
+    ENetSocket sock = openmastersocket();
     if(sock == ENET_SOCKET_NULL || connectwithtimeout(sock, mastername, masteraddress) < 0)
     {
         xlog(ACLOG_WARNING, sock==ENET_SOCKET_NULL ? "could not open socket" : "could not connect");
@@ -69,12 +88,71 @@ ENetSocket connectmaster()
     return sock;
 }
 
+#ifdef __3DS__
+static void pollmasterconnection()
+{
+    if(!masterLookup && !masterConnect) return;
+    if(enet_time_get() - masterConnectStart >= masterConnectLimit)
+    {
+        xlog(ACLOG_WARNING, "master registration connection timed out");
+        disconnectmaster();
+        return;
+    }
+    if(masterLookup)
+    {
+        const int resolved = enet_3ds_resolve_poll(masterLookup, &masteraddress, 0);
+        if(resolved > 0) return;
+        masterLookup = NULL;
+        if(resolved == 0)
+        {
+            pendingMasterSocket = openmastersocket();
+            if(pendingMasterSocket != ENET_SOCKET_NULL)
+                masterConnect = enet_3ds_connect_begin(pendingMasterSocket, &masteraddress);
+        }
+        if(!masterConnect)
+        {
+            if(pendingMasterSocket != ENET_SOCKET_NULL) enet_socket_destroy(pendingMasterSocket);
+            xlog(ACLOG_WARNING, resolved < 0 ? "could not resolve master server" : "could not start master connection");
+            disconnectmaster();
+            return;
+        }
+    }
+
+    const int connected = enet_3ds_connect_poll(masterConnect, 0);
+    if(connected > 0) return;
+    masterConnect = NULL;
+    mastersock = pendingMasterSocket;
+    pendingMasterSocket = ENET_SOCKET_NULL;
+    if(connected < 0 || enet_socket_set_option(mastersock, ENET_SOCKOPT_NONBLOCK, 1) < 0)
+    {
+        xlog(ACLOG_WARNING, "could not connect to master server");
+        disconnectmaster();
+    }
+}
+#endif
+
 bool requestmaster(const char *req)
 {
     if(mastersock == ENET_SOCKET_NULL)
     {
+#ifdef __3DS__
+        if(!masterLookup && !masterConnect)
+        {
+            if(!mastername[0] || !usemaster) return false;
+            xlog(ACLOG_INFO, "looking up %s:%d...", mastername, masterport);
+            masteraddress.port = masterport;
+            masterConnectStart = enet_time_get();
+            masterLookup = enet_3ds_resolve_begin(mastername);
+            if(!masterLookup)
+            {
+                xlog(ACLOG_WARNING, "could not start master server lookup");
+                return false;
+            }
+        }
+#else
         mastersock = connectmaster();
         if(mastersock == ENET_SOCKET_NULL) return false;
+#endif
     }
 
     masterout.put(req, strlen(req));
@@ -125,7 +203,7 @@ void processmasterinput()
 
 void flushmasteroutput()
 {
-    if(masterout.empty()) return;
+    if(mastersock == ENET_SOCKET_NULL || masterout.empty()) return;
 
     ENetBuffer buf;
     buf.data = &masterout[masteroutpos];
@@ -190,6 +268,9 @@ void ac3ds_close_server_sockets()
 
 void serverms(int mode, int numplayers, int minremain, char *smapname, int millis, const ENetAddress &localaddr, int *mnum, int *msend, int *mrec, int *cnum, int *csend, int *crec, int protocol_version, const char *servdesccur, int _interm)
 {
+#ifdef __3DS__
+    pollmasterconnection();
+#endif
     flushmasteroutput();
     updatemasterserver(millis, localaddr.port, _interm);
 

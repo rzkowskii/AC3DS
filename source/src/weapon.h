@@ -116,6 +116,19 @@ struct sniperrifle : gun
     void renderhudmodel();
     void renderaimhelp(bool teamwarning);
     void setscope(bool enable);
+    void clearscope();
+#ifdef __3DS__
+    void set_scope_hold(bool enable);
+    bool is_scope_latched() const { return scope_latched; }
+    void toggle_scope_latch();
+#endif
+
+private:
+    bool scope_available() const;
+    void applyscope(bool enable);
+#ifdef __3DS__
+    bool scope_held = false, scope_latched = false;
+#endif
 };
 
 

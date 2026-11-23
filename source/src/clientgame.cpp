@@ -3,6 +3,8 @@
 #include "cube.h"
 #ifdef __3DS__
 #include "performance.h"
+#include "system.h"
+static void invalidate_player_menu_touch();
 #endif
 #include "bot/bot.h"
 
@@ -443,7 +445,7 @@ void deathstate(playerent *pl)
     if(pl==player1)
     {
         if(showscoresondeath) showscores(true);
-        setscope(false);
+        clearscope();
         if(editmode) toggleedit(true);
         if(pl->team == TEAM_SPECT) spectatemode(SM_FLY);
         else if(team_isspect(pl->team)) spectatemode(SM_FOLLOW1ST);
@@ -458,7 +460,7 @@ void spawnstate(playerent *d)              // reset player state not persistent 
     d->spawnstate(gamemode);
     if(d==player1)
     {
-        setscope(false);
+        clearscope();
     }
     if(d->deaths==0) d->resetstats();
 }
@@ -488,6 +490,9 @@ botent *newbotent()                 // create a new blank player
         loopv(players) if(!used && players[i]) if(players[i]->clientnum==nextcn) used = true;
         if(!used) lukin = false; else nextcn++;
     }
+#ifdef __3DS__
+    invalidate_player_menu_touch();
+#endif
     loopv(players) if(i!=getclientnum() && !players[i])
     {
         players[i] = d;
@@ -504,6 +509,9 @@ void freebotent(botent *d)
 {
     loopv(players) if(players[i]==d)
     {
+#ifdef __3DS__
+        invalidate_player_menu_touch();
+#endif
         DELETEP(players[i]);
         players.remove(i);
     }
@@ -512,6 +520,9 @@ void freebotent(botent *d)
 VAR(lastpm, 1, -1, 0);
 void zapplayer(playerent *&d)
 {
+#ifdef __3DS__
+    if(d) invalidate_player_menu_touch();
+#endif
     if(d && d->clientnum == lastpm) lastpm = -1;
     if(d == (playerent *)camera1) resetcamera();
     DELETEP(d);
@@ -617,6 +628,11 @@ int lastspawnattempt = 0;
 void showrespawntimer()
 {
     if(intermission || ispaused || spawnpermission > SP_OK_NUM) return;
+#ifdef __3DS__
+    // The respawn prompt (respawnstatus) counts down for a dead player; the
+    // dotted line would only repeat it. Survivors of an arena round keep it.
+    if(player1->state == CS_DEAD || player1->state == CS_SPECTATE) return;
+#endif
     if(m_arena)
     {
         if(!arenaintermission) return;
@@ -661,7 +677,14 @@ void resetsleep(bool force)
     sleepssemaphore->post();
 }
 
-COMMANDF(resetsleeps, "", (void) { resetsleep(true); });
+COMMANDF(resetsleeps, "", (void)
+{
+    resetsleep(true);
+#ifdef __3DS__
+    extern void ac3dsbenchend(const char *how); // the benchmark's queued steps are gone: put its settings back
+    ac3dsbenchend("cancelled");
+#endif
+});
 
 void updateworld(int curtime, int lastmillis)        // main game update loop
 {
@@ -796,7 +819,7 @@ void respawnself()
             addmsg(SV_SWITCHTEAM, "ri", m_teammode ? teamatoi(BotManager.GetBotTeam()) : rnd(2));
         }
         showscores(false);
-        setscope(false);
+        clearscope();
         lasthit = 0;
         spawnplayer(player1);
         player1->lifesequence++;
@@ -826,6 +849,9 @@ int waiting_permission = 0;
 
 bool tryrespawn()
 {
+#ifdef __3DS__
+    if(ac3ds_offline_match_paused()) return false;
+#endif
     if(spawnpermission > SP_OK_NUM)
     {
         hudeditf(HUDMSG_TIMER, "\f%s", spawn_message());
@@ -845,8 +871,12 @@ bool tryrespawn()
                 player1->attacking = false;
                 if(m_arena)
                 {
+#ifdef __3DS__
+                    lastspawnattempt = lastmillis; // the respawn prompt already says to wait: flash it
+#else
                     if(!arenaintermission) hudeditf(HUDMSG_TIMER, "waiting for new round to start...");
                     else lastspawnattempt = lastmillis;
+#endif
                     return false;
                 }
                 if (lastmillis > waiting_permission)
@@ -862,6 +892,33 @@ bool tryrespawn()
     }
     return false;
 }
+
+#ifdef __3DS__
+// What fire would do for player1 now, for the respawn prompt on both screens.
+// Mirrors the checks in attack() and tryrespawn(); keep the three in step.
+int respawnstatus(int &secs)
+{
+    secs = 0;
+    if(intermission || ispaused || editmode || watchingdemo || ac3ds_offline_match_paused()) return RS_NONE;
+    if(player1->state != CS_DEAD && player1->state != CS_SPECTATE) return RS_NONE;
+    if(spawnpermission > SP_OK_NUM) return RS_BLOCKED;
+    if(team_isspect(player1->team)) return RS_JOIN;
+    if(m_arena)
+    {
+        if(!arenaintermission) return RS_ROUND;
+        secs = clamp((arenaintermission + 5000 - lastmillis + 999) / 1000, 1, 5);
+        return RS_NEXTROUND;
+    }
+    const int left = player1->lastdeath + (m_flags_ ? 5000 : 2000) - lastmillis;
+    if(left >= 0)
+    {
+        secs = max(1, (left + 999) / 1000);
+        return RS_WAIT;
+    }
+    // Only a request that goes to a server can be left waiting for an answer.
+    return m_mp(gamemode) && lastmillis <= waiting_permission ? RS_SENT : RS_READY;
+}
+#endif
 
 VARP(hitsound, 0, 0, 2);
 
@@ -1017,13 +1074,16 @@ void timeupdate(int milliscur, int millismax)
     static int lastgametimedisplay = 0;
 
     silenttimeupdate(milliscur, millismax);
-    int lastdisplay = lastmillis - lastgametimedisplay;
-    if(lastdisplay >= 0 && lastdisplay <= 1000) return; // avoid double-output
-    lastgametimedisplay = lastmillis;
 
     if(!minutesremaining)
     {
+        // The server can end the match between ordinary clock updates.
+        if(intermission) return;
+        lastgametimedisplay = lastmillis;
         intermission = true;
+#ifdef __3DS__
+        clearscope();
+#endif
         extern bool needsautoscreenshot;
         if(autoscreenshot) needsautoscreenshot = true;
         player1->attacking = false;
@@ -1035,6 +1095,10 @@ void timeupdate(int milliscur, int millismax)
     }
     else
     {
+        int lastdisplay = lastmillis - lastgametimedisplay;
+        if(lastdisplay >= 0 && lastdisplay <= 1000) return; // avoid double-output
+        lastgametimedisplay = lastmillis;
+
         extern int gametimedisplay; // only output to console if no hud-clock with game time is being shown
         int sec = 60 - ( (gametimecurrent + ( lastmillis - lastgametimeupdate ) ) / 1000) % 60;
         if(minutesremaining==1)
@@ -1058,6 +1122,9 @@ playerent *newclient(int cn)   // ensure valid entity
     while(cn>=players.length()) players.add(NULL);
     playerent *d = players[cn];
     if(d) return d;
+#ifdef __3DS__
+    invalidate_player_menu_touch();
+#endif
     d = newplayerent();
     players[cn] = d;
     d->clientnum = cn;
@@ -1139,6 +1206,8 @@ void resetmap(bool mrproper)
 #ifdef __3DS__
     extern void ac3ds_invalidate_raytable();
     ac3ds_invalidate_raytable();
+    extern void ac3ds_reset_map_targets();
+    ac3ds_reset_map_targets();
 #endif
     resetsleep();
     resetzones();
@@ -1169,9 +1238,16 @@ void startmap(const char *name, bool reset, bool norespawn)   // called just aft
     extern bool canceldownloads;
     canceldownloads = false;
     copystring(clientmap, name);
+#ifdef __3DS__
+    extern void ac3ds_crash_set_map(const char *name);
+    ac3ds_crash_set_map(name); // also covers newmap and xmap_restore
+#endif
 
     if(norespawn) return;
 
+#ifdef __3DS__
+    clearscope();
+#endif
     sendmapidenttoserver = true;
     if(m_botmode) BotManager.BeginMap(name);
     else kickallbots();
@@ -1693,20 +1769,43 @@ static vector<mline> mlines;
 
 void *kickmenu = NULL, *banmenu = NULL, *forceteammenu = NULL, *giveadminmenu = NULL;
 
+#ifdef __3DS__
+static void invalidate_player_menu_touch()
+{
+    const void *menu = ac3ds_menu_identity();
+    // The client number and display name can be reused before the next draw.
+    if(menu == kickmenu || menu == banmenu || menu == forceteammenu || menu == giveadminmenu)
+        ac3ds_invalidate_menu_touch(menu);
+}
+#endif
+
 void refreshsopmenu(void *menu, bool init)
 {
-    menureset(menu);
     mlines.shrink(0);
     mlines.reserve(players.length());
+    const char *command = menu == kickmenu ? "kick" : menu == banmenu ? "ban" : menu == forceteammenu ? "forceteam" : "giveadmin";
+    const bool kick_or_ban = menu == kickmenu || menu == banmenu;
+    string reason = "";
+    if(const char *alias = getalias("_kickbanreason")) formatstring(reason)(" [ %s ]", alias);
     loopv(players) if(players[i])
     {
         mline &m = mlines.add();
         copystring(m.name, colorname(players[i]));
-        string kbr;
-        if(getalias("_kickbanreason")!=NULL) formatstring(kbr)(" [ %s ]", getalias("_kickbanreason")); // leading space!
-        formatstring(m.cmd)("%s %d%s", menu==kickmenu ? "kick" : (menu==banmenu ? "ban" : (menu==forceteammenu ? "forceteam" : "giveadmin")), i, (menu==kickmenu||menu==banmenu)?(strlen(kbr)>8?kbr:" NONE"):""); // 8==3 + "format-extra-chars"
-        menuitemmanual(menu, m.name, m.cmd);
+        formatstring(m.cmd)("%s %d%s", command, i, kick_or_ban ? (strlen(reason) > 8 ? reason : " NONE") : "");
     }
+
+    const vector<mitem *> &items = static_cast<gmenu *>(menu)->items;
+    bool reuse = !init && items.length() == mlines.length();
+    for(int i = 0; reuse && i < items.length(); ++i)
+    {
+        const char *text = items[i]->gettext(), *action = items[i]->getaction();
+        reuse = text && action && !strcmp(text, mlines[i].name) && !strcmp(action, mlines[i].cmd) &&
+                items[i]->greyedout == mitem::menugreyedout;
+    }
+    if(reuse) return;
+
+    menureset(menu);
+    loopv(mlines) menuitemcopy(menu, mlines[i].name, mlines[i].cmd);
 }
 
 extern bool watchingdemo;

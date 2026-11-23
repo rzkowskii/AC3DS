@@ -381,6 +381,97 @@ enet_socket_destroy (ENetSocket socket)
 }
 
 #ifdef __3DS__
+typedef struct
+{
+    char name [256];
+    LightLock lock;
+    enet_uint32 host;
+    int state, abandoned;
+} Enet3dsResolve;
+
+static int enet_3ds_resolvers;
+
+static void
+enet_3ds_resolve_main (void * arg)
+{
+    Enet3dsResolve * lookup = (Enet3dsResolve *) arg;
+    ENetAddress address = { ENET_HOST_ANY, ENET_PORT_ANY };
+    int result = enet_address_set_host (& address, lookup -> name);
+    int abandoned;
+    LightLock_Lock (& lookup -> lock);
+    lookup -> host = address.host;
+    lookup -> state = result == 0 && address.host != ENET_HOST_ANY ? 1 : -1;
+    abandoned = lookup -> abandoned;
+    LightLock_Unlock (& lookup -> lock);
+    __atomic_sub_fetch (& enet_3ds_resolvers, 1, __ATOMIC_ACQ_REL);
+    if (abandoned) free (lookup);
+}
+
+void *
+enet_3ds_resolve_begin (const char * name)
+{
+    Enet3dsResolve * lookup;
+    size_t length = strlen (name);
+    int active;
+    s32 priority = 0x30;
+    if (! length || length >= sizeof (lookup -> name)) return NULL;
+    lookup = (Enet3dsResolve *) calloc (1, sizeof (Enet3dsResolve));
+    if (! lookup) return NULL;
+    LightLock_Init (& lookup -> lock);
+    if (inet_pton (AF_INET, name, & lookup -> host) == 1)
+    {
+        lookup -> state = lookup -> host == ENET_HOST_ANY ? -1 : 1;
+        return lookup;
+    }
+
+    /* Keep abandoned lookups in the budget until the service returns. */
+    active = __atomic_load_n (& enet_3ds_resolvers, __ATOMIC_ACQUIRE);
+    while (active < 4 && ! __atomic_compare_exchange_n (& enet_3ds_resolvers, & active, active + 1, 0,
+                                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {}
+    if (active >= 4) { free (lookup); return NULL; }
+    memcpy (lookup -> name, name, length + 1);
+    svcGetThreadPriority (& priority, CUR_THREAD_HANDLE);
+    if (! threadCreate (enet_3ds_resolve_main, lookup, 32 * 1024, priority, -2, true))
+    {
+        __atomic_sub_fetch (& enet_3ds_resolvers, 1, __ATOMIC_ACQ_REL);
+        free (lookup);
+        return NULL;
+    }
+    return lookup;
+}
+
+int
+enet_3ds_resolve_poll (void * handle, ENetAddress * address, unsigned timeout)
+{
+    Enet3dsResolve * lookup = (Enet3dsResolve *) handle;
+    for (;;)
+    {
+        int state;
+        unsigned interval;
+        LightLock_Lock (& lookup -> lock);
+        state = lookup -> state;
+        if (state > 0) address -> host = lookup -> host;
+        LightLock_Unlock (& lookup -> lock);
+        if (state) { free (lookup); return state > 0 ? 0 : -1; }
+        if (! timeout) return 1;
+        interval = timeout < 10 ? timeout : 10;
+        svcSleepThread (interval * 1000000LL);
+        timeout -= interval;
+    }
+}
+
+void
+enet_3ds_resolve_abandon (void * handle)
+{
+    Enet3dsResolve * lookup = (Enet3dsResolve *) handle;
+    int finished;
+    LightLock_Lock (& lookup -> lock);
+    finished = lookup -> state != 0;
+    lookup -> abandoned = 1;
+    LightLock_Unlock (& lookup -> lock);
+    if (finished) free (lookup);
+}
+
 /* SOC has sendto/recvfrom, but no scatter/gather message calls. ENet protocol
    writes must still produce a single datagram. */
 static size_t

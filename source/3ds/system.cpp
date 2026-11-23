@@ -3,12 +3,16 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <atomic>
+#include "romfs_image.h"
 
 #include "cube.h"
 #include "audio_3ds.h"
 #include "system.h"
 #include "crash_3ds.h"
 #include "ac3ds_servers.h"
+#ifdef AC3DS_FIRSTRUN
+#include "firstrun_3ds.h"
+#endif
 
 extern void pushevent(const SDL_Event &event);
 
@@ -42,6 +46,13 @@ namespace
     LightEvent netkeep_wake;
     Thread netkeep_thread = NULL;
     std::atomic<bool> netkeep_active{false};
+    u64 netkeep_started = 0; // written before netkeep_active is set, read after it is seen
+    // ENet queues every packet that arrives while nobody dispatches events, with
+    // no cap. Past this long in the HOME menu or the software keyboard the
+    // keepalive stops and the server times the client out as it would a
+    // closed lid, instead of the game replaying minutes of backlog (or
+    // running out of heap) on return.
+    constexpr u64 netkeep_budget_ms = 3 * 60 * 1000;
 
     void netkeep_main(void *)
     {
@@ -49,6 +60,11 @@ namespace
         {
             LightEvent_WaitTimeout(&netkeep_wake, 50000000LL); // 50 ms
             if(!netkeep_active.load(std::memory_order_acquire)) continue;
+            if(osGetTime() - netkeep_started > netkeep_budget_ms)
+            {
+                netkeep_active.store(false, std::memory_order_release);
+                continue;
+            }
             LightLock_Lock(&netkeep_lock);
             if(netkeep_active.load(std::memory_order_acquire)) c2skeepalive();
             LightLock_Unlock(&netkeep_lock);
@@ -57,6 +73,7 @@ namespace
 
     void netkeep_begin()
     {
+        Ac3dsPhaseScope phase("APT: start network keepalive");
         if(!netkeep_thread)
         {
             LightLock_Init(&netkeep_lock);
@@ -68,6 +85,7 @@ namespace
             if(!netkeep_thread) netkeep_thread = threadCreate(netkeep_main, NULL, 16 * 1024, lower, 0, true);
             if(!netkeep_thread) return;
         }
+        netkeep_started = osGetTime();
         netkeep_active.store(true, std::memory_order_release);
         LightEvent_Signal(&netkeep_wake);
     }
@@ -77,6 +95,7 @@ namespace
         if(!netkeep_thread) return;
         netkeep_active.store(false, std::memory_order_release);
         // Wait out a keepalive in progress before the main thread uses ENet.
+        Ac3dsPhaseScope phase("APT: wait for network keepalive");
         LightLock_Lock(&netkeep_lock);
         LightLock_Unlock(&netkeep_lock);
     }
@@ -165,8 +184,8 @@ namespace
         KEYCODE_FLAG, KEYCODE_SCREENSHOT, KEYCODE_WEAPONS, KEYCODE_NEXT,
         KEYCODE_PREV, KEYCODE_UNDO, KEYCODE_REDO, KEYCODE_DELETE, KEYCODE_EDITMENU,
         KEYCODE_RELOAD, KEYCODE_GRENADE, KEYCODE_SCOPE, KEYCODE_NEXTWEAPON,
-        KEYCODE_MATCHMENU, KEYCODE_SCORES, KEYCODE_JUMP,
-        KEYCODE_LAST = KEYCODE_JUMP
+        KEYCODE_MATCHMENU, KEYCODE_SCORES, KEYCODE_JUMP, KEYCODE_RESPAWN,
+        KEYCODE_LAST = KEYCODE_RESPAWN
     };
 
     struct Control
@@ -213,11 +232,12 @@ namespace
         {KEYCODE_EDITMENU, "3DS_TOUCH_EDITMENU", "", "editkey_show_menu", ""},
         {KEYCODE_RELOAD, "3DS_TOUCH_RELOAD", "reload", "", ""},
         {KEYCODE_GRENADE, "3DS_TOUCH_GRENADE", "quicknadethrow", "", ""},
-        {KEYCODE_SCOPE, "3DS_TOUCH_SCOPE", "altaction", "", ""},
+        {KEYCODE_SCOPE, "3DS_TOUCH_SCOPE", "ac3ds_scope_toggle", "", ""},
         {KEYCODE_NEXTWEAPON, "3DS_TOUCH_WEAPON", "shiftweapon 1", "", ""},
         {KEYCODE_MATCHMENU, "3DS_TOUCH_MENU", "ac3ds_pause_menu", "", ""},
         {KEYCODE_SCORES, "3DS_TOUCH_SCORES", "key_showscores", "", ""},
-        {KEYCODE_JUMP, "3DS_TOUCH_JUMP", "jump", "", ""} // double-tap on the match screen
+        {KEYCODE_JUMP, "3DS_TOUCH_JUMP", "jump", "", ""}, // double-tap on the match screen
+        {KEYCODE_RESPAWN, "3DS_TOUCH_RESPAWN", "attack", "", ""} // RESPAWN on the match screen while dead
     };
     static_assert(sizeof(controls) / sizeof(controls[0]) == KEYCODE_LAST - KEYCODE_A + 1,
                   "The default control table follows the native key code order.");
@@ -278,8 +298,11 @@ namespace
                  SERVER_PANEL, SERVER_INFO_PANEL, FAVORITES_PANEL };
     constexpr int touch_width = 320, touch_height = 240;
     constexpr int panel_top = 131, cell_height = 32, cell_width = 78;
-    constexpr int menu_top = 33, menu_row_height = 27, menu_footer = 204;
+    constexpr int menu_top = 33, menu_row_height = 27, menu_tile_height = 25, menu_footer = 204;
+    constexpr int menu_footer_height = 33;
     constexpr int menu_minus = 224, menu_plus = 264;
+    constexpr int weapon_left = 8, weapon_top = 54, weapon_width = 148, weapon_height = 54;
+    constexpr int weapon_stride_x = 156, weapon_stride_y = 60;
     int drawn_panel = -1, drawn_bind_type = -1, touch_key = 0;
     Ac3dsMenuView drawn_menu;
     string drawn_status;
@@ -287,6 +310,18 @@ namespace
     Uint32 touch_key_context;
     u32 held_buttons, inhibited_buttons;
     bool touch_held, touch_aim, dedicated_display;
+    struct MenuTouchTarget
+    {
+        int index = -1;
+        Ac3dsMenuTouch action = Ac3dsMenuTouch::None;
+
+        bool operator==(const MenuTouchTarget &other) const { return index == other.index && action == other.action; }
+    };
+    struct MenuTouch
+    {
+        MenuTouchTarget target;
+        unsigned revision = 0;
+    } menu_touch;
     touchPosition last_touch;
     float aim_x, aim_y;
     Uint32 last_poll;
@@ -382,10 +417,31 @@ namespace
         bool active = false;
     } qa_touch;
 
+    // QA: a physical button held down by script until a deadline.
+    struct { u32 mask = 0; Uint32 until = 0; } qa_button;
+
+    void cancel_menu_touch()
+    {
+        if(!menu_touch.revision) return;
+        menu_touch = {};
+        controls_dirty = true;
+    }
+
+    struct { unsigned id = 0, context = 0; } server_join_touch;
+
+    void cancel_server_join()
+    {
+        if(!server_join_touch.id) return;
+        server_join_touch = {};
+        controls_dirty = true;
+    }
+
     void reset_physical_input()
     {
         // Physical edges queued for the old menu cannot act in the new one.
         if(!++button_context) ++button_context;
+        cancel_menu_touch();
+        cancel_server_join();
         inhibited_buttons |= held_buttons & ~KEY_TOUCH;
         held_buttons &= KEY_TOUCH;
         aim_x = aim_y = 0.0f;
@@ -400,6 +456,7 @@ namespace
 
     void release_input()
     {
+        Ac3dsPhaseScope phase("APT: release input");
         reset_physical_input();
         keym *binding = touch_key ? findbindc(touch_key) : NULL;
         if(binding && binding->pressed) keypress(touch_key, 0, false);
@@ -407,34 +464,51 @@ namespace
         held_buttons = 0;
         touch_key = 0;
         touch_held = touch_aim = false;
+        clearscope();
     }
 
     void apt_event(APT_HookType hook, void *)
     {
+        Ac3dsPhaseScope phase("APT: lifecycle hook");
         switch(hook)
         {
             case APTHOOK_ONSUSPEND:
+                ac3ds_crash_note_event("APT suspend", in_keyboard_applet);
                 netkeep_begin(); // HOME menu: stay connected
                 [[fallthrough]];
             case APTHOOK_ONSLEEP:
             {
+                if(hook == APTHOOK_ONSLEEP) ac3ds_crash_note_event("lid sleep");
                 // aptMainLoop runs this hook from the top of a frame on the main
                 // thread; save settings now in case the console is powered off
                 // from the HOME menu or while asleep.
-                if(inmainloop && !in_keyboard_applet) { writeinitcfg(); writecfg(); }
+                if(inmainloop && !in_keyboard_applet)
+                {
+                    {
+                        Ac3dsPhaseScope save("APT: save init config");
+                        writeinitcfg();
+                    }
+                    Ac3dsPhaseScope save("APT: save profile config");
+                    writecfg();
+                }
                 ac3ds_crash_pause(true); // the main loop legitimately stops
                 ac3ds_audio_lifecycle_event(true);
                 break;
             }
             case APTHOOK_ONEXIT:
+                ac3ds_crash_note_event("APT exit");
                 ac3ds_crash_pause(true); // the main loop legitimately stops
                 ac3ds_audio_lifecycle_event(true);
                 break;
             case APTHOOK_ONRESTORE:
             case APTHOOK_ONWAKEUP:
-                if(!in_keyboard_applet) resumed_from_suspend = true;
+                ac3ds_crash_note_event(hook == APTHOOK_ONRESTORE ? "APT restore" : "lid wakeup", in_keyboard_applet);
+                if(!in_keyboard_applet)
+                {
+                    resumed_from_suspend = true;
+                    ac3ds_crash_pause(false); // the resume handoff itself can stall
+                }
                 netkeep_end();
-                ac3ds_crash_pause(false);
                 ac3ds_audio_lifecycle_event(false);
                 clock_reset = true;
                 controls_dirty = true;
@@ -449,6 +523,75 @@ namespace
         struct stat info;
         return chdir(path) == 0 && stat("config/font.cfg", &info) == 0 && S_ISREG(info.st_mode) &&
                stat("packages/misc/notexture.jpg", &info) == 0 && S_ISREG(info.st_mode);
+    }
+
+    // Where the game data comes from, for the log, and why the game data file
+    // on the SD card was not used ("" when there is none or it is in use).
+    string asset_source = "", image_problem = "";
+
+    struct ImageFile final : romfsimage::Source
+    {
+        Handle handle = 0;
+
+        long long size() override
+        {
+            u64 bytes = 0;
+            return R_SUCCEEDED(FSFILE_GetSize(handle, &bytes)) ? (long long)bytes : -1;
+        }
+
+        bool read(long long offset, void *out, size_t bytes) override
+        {
+            u32 got = 0;
+            return R_SUCCEEDED(FSFILE_Read(handle, &got, u64(offset), out, u32(bytes))) && got == bytes;
+        }
+    };
+
+    // The game data as one file (romfs_image.h), mounted as romfs:, the device
+    // an asset-embedded build reads from: past this function the game cannot
+    // tell the two apart. libctru trusts the image's tables blindly, so the
+    // image is checked first. False with image_problem set: the file is there
+    // and cannot be used.
+    bool mount_image()
+    {
+        image_problem[0] = '\0';
+        defformatstring(path)("%s/%s", game_dir, romfsimage::file_name);
+        struct stat info;
+        if(stat(path, &info) != 0) return false;
+        ImageFile file;
+        // The handle stays with the mount, which closes it when unmounted.
+        const Result opened = FSUSER_OpenFileDirectly(&file.handle, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, ""),
+                                                      fsMakePath(PATH_ASCII, strchr(path, '/')), FS_OPEN_READ, 0);
+        if(R_FAILED(opened))
+        {
+            formatstring(image_problem)("the file could not be opened (%08lX)", (unsigned long)opened);
+            return false;
+        }
+        static const char *const sentinels[] = { "config/font.cfg", "packages/misc/notexture.jpg" };
+        romfsimage::Info image;
+        if(!romfsimage::check(file, sentinels, 2, image, image_problem, sizeof(image_problem)))
+        {
+            FSFILE_Close(file.handle);
+            return false;
+        }
+        const Result mounted = romfsMountFromFile(file.handle, 0, "romfs"); // closes the handle when it fails
+        if(R_FAILED(mounted))
+        {
+            formatstring(image_problem)("the file could not be mounted (%08lX)", (unsigned long)mounted);
+            return false;
+        }
+        romfs_ready = true;
+        if(!select_assets("romfs:/"))
+        {
+            chdir("sdmc:/");
+            romfsExit();
+            romfs_ready = false;
+            copystring(image_problem, "the file does not hold the game's files");
+            return false;
+        }
+        formatstring(asset_source)("%s on the SD card (%u files, %u folders, %u bytes; tables in memory %u bytes)", romfsimage::file_name,
+                                   image.files, image.directories, image.image_size,
+                                   image.dir_hash_size + image.dir_table_size + image.file_hash_size + image.file_table_size);
+        return true;
     }
 
     void add_cstick_aim(const circlePosition &stick, float speed, float &dx, float &dy)
@@ -469,6 +612,67 @@ namespace
             u16 *column = screen + x * touch_height;
             for(int y = y0; y < y1; ++y) column[touch_height - 1 - y] = color;
         }
+    }
+
+    // Lower-screen presentation. The screen is drawn on the CPU into libctru's
+    // two RGB565 buffers. A picture is always drawn into the buffer that is
+    // not on the LCD and then swapped in, which GSP does at the next VBlank,
+    // so the panel never scans out a half-drawn picture. Citro3D swaps only
+    // screens that have a render target linked to them, which is the top one;
+    // nothing here touches the top screen.
+    //
+    // The two buffers alternate, so the one bottom_begin() returns holds the
+    // picture from two presents ago, not the one on screen. Every caller
+    // therefore paints all 320x240 pixels before bottom_present(): menus, the
+    // loading screen and the reports start with a full fill, and the match
+    // screen starts with draw_radar(), which writes every pixel. There are no
+    // partial updates.
+    constexpr size_t bottom_bytes = touch_width * touch_height * sizeof(u16);
+    const u16 *bottom_shown = NULL; // the last picture handed to the LCD
+    u64 bottom_swap_tick = 0;
+    unsigned bottom_presents = 0;
+    // QA: fill each buffer with magenta, flushed, before it is drawn. Magenta
+    // in a capture means a path left pixels unpainted; a magenta flash on the
+    // console means a buffer was on the LCD while it was being drawn.
+    VAR(ac3dsbottomcheck, 0, 0, 1);
+
+    // The buffer to draw the next picture into, or NULL when it cannot be
+    // drawn yet. Until GSP has applied the last swap, the buffer libctru calls
+    // the back buffer is still the one on the LCD, so it is not handed out
+    // while that swap is pending. Per-frame callers leave their dirty state
+    // alone on NULL and try again next frame; callers that block anyway pass
+    // wait. A swap still pending after 100 ms is taken as lost (GSP applies
+    // none while the app is suspended) and drawing goes ahead.
+    u16 *bottom_begin(bool wait = false)
+    {
+        if(!gfx_ready) return NULL;
+        constexpr u64 patience = SYSCLOCK_ARM11 / 10;
+        while(gspIsPresentPending(GSP_SCREEN_BOTTOM) && svcGetSystemTick() - bottom_swap_tick < patience)
+        {
+            if(!wait) return NULL;
+            svcSleepThread(1000000LL);
+        }
+        u16 *screen = reinterpret_cast<u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
+        if(screen && ac3dsbottomcheck)
+        {
+            fill_rect(screen, 0, 0, touch_width, touch_height, RGB565(31, 0, 31));
+            GSPGPU_FlushDataCache(screen, bottom_bytes);
+        }
+        return screen;
+    }
+
+    // Hands a finished picture to the LCD. False if it could not be flushed
+    // out of the CPU cache: nothing is swapped then, and the caller redraws.
+    // A caller with no later frame to redraw in passes unflushed to swap anyway.
+    bool bottom_present(u16 *screen, bool unflushed = false)
+    {
+        const bool flushed = R_SUCCEEDED(GSPGPU_FlushDataCache(screen, bottom_bytes));
+        if(!flushed && !unflushed) return false;
+        gfxScreenSwapBuffers(GFX_BOTTOM, false);
+        bottom_shown = screen;
+        bottom_swap_tick = svcGetSystemTick();
+        ++bottom_presents;
+        return flushed;
     }
 
     void draw_label(u16 *screen, int x, int y, const char *label, u16 color,
@@ -511,6 +715,30 @@ namespace
     const u16 border = RGB565(7, 17, 11), text = RGB565(29, 60, 28);
     const u16 muted = RGB565(18, 39, 19), accent = RGB565(21, 52, 14);
 
+    // Raster the existing bitmap font at native pixel coordinates. The
+    // taller menu labels remain readable without texture filtering.
+    template<int Width = 9, int Height = 12>
+    void draw_menu_text(u16 *screen, int x, int y, const char *label, u16 color, int right = touch_width)
+    {
+        const ConsoleFont &font = consoleGetDefault()->font;
+        const int capacity = (right - x) / Width;
+        const bool clipped = int(strlen(label)) > capacity;
+        for(int i = 0; i < capacity && label[i]; ++i, x += Width)
+        {
+            const unsigned char c = clipped && i >= max(0, capacity - 3) ? '.' : label[i];
+            const int glyph = c - font.asciiOffset;
+            if(glyph < 0 || glyph >= font.numChars) continue;
+            const u8 *bits = font.gfx + 8 * glyph;
+            for(int col = 0; col < Width; ++col)
+            {
+                const u8 mask = 0x80 >> (col * 8 / Width);
+                u16 *pixel = screen + (x + col) * touch_height + touch_height - 1 - y;
+                for(int line = 0; line < Height; ++line)
+                    if(bits[line * 8 / Height] & mask) pixel[-line] = color;
+            }
+        }
+    }
+
     void draw_button(u16 *screen, int x, int y, int w, int h, const char *label, bool enabled = true)
     {
         fill_rect(screen, x, y, x + w, y + h, enabled ? border : surface);
@@ -523,7 +751,9 @@ namespace
     bool same_menu_view(const Ac3dsMenuView &a, const Ac3dsMenuView &b)
     {
         if(a.revision != b.revision || a.selection != b.selection || a.page != b.page ||
-           a.pages != b.pages || a.back != b.back || a.binding != b.binding || strcmp(a.title, b.title)) return false;
+           a.pages != b.pages || a.back != b.back || a.binding != b.binding ||
+           a.weapon_picker != b.weapon_picker || a.mode_loadout != b.mode_loadout ||
+           strcmp(a.title, b.title)) return false;
         for(int i = 0; i < Ac3dsMenuView::row_count; ++i)
         {
             const Ac3dsMenuRow &x = a.rows[i], &y = b.rows[i];
@@ -533,15 +763,60 @@ namespace
         return true;
     }
 
+    void draw_weapon_picker(u16 *screen, const Ac3dsMenuView &view)
+    {
+        fill_rect(screen, 0, 0, touch_width, 47, surface);
+        fill_rect(screen, 0, 46, touch_width, 47, border);
+        draw_menu_text<12, 16>(screen, 10, 7, "Primary weapon", text);
+        draw_menu_text(screen, 10, 29, view.mode_loadout ? "This mode sets your loadout" : "Applies on your next spawn", muted);
+
+        constexpr int columns = Ac3dsMenuView::weapon_columns;
+        for(int i = 0; i < Ac3dsMenuView::row_count; ++i)
+        {
+            const Ac3dsMenuRow &row = view.rows[i];
+            const int x = weapon_left + i % columns * weapon_stride_x;
+            const int y = weapon_top + i / columns * weapon_stride_y;
+            const bool back = row.index < 0;
+            const bool focused = !back && row.index == view.selection;
+            const MenuTouchTarget target = {row.index, back ? Ac3dsMenuTouch::Back : Ac3dsMenuTouch::Activate};
+            const bool held = menu_touch.revision == view.revision && menu_touch.target == target;
+            const char *label = back ? "BACK" : row.label;
+            fill_rect(screen, x, y, x + weapon_width, y + weapon_height, focused || held ? accent : border);
+            fill_rect(screen, x + 2, y + 2, x + weapon_width - 2, y + weapon_height - 2,
+                      held ? RGB565(10, 25, 13) : focused ? RGB565(8, 19, 11) : surface);
+            draw_label_large(screen, x + weapon_width / 2 - 8 * int(strlen(label)),
+                             y + (back ? 19 : 10), label, row.disabled ? muted : text);
+            if(!back)
+                draw_label(screen, x + weapon_width / 2 - 4 * int(strlen(row.value)), y + 34,
+                           row.value, !strcmp(row.value, "Selected") ? accent : muted, x + weapon_width - 4);
+        }
+    }
+
+    void draw_menu_footer_button(u16 *screen, const Ac3dsMenuView &view, int x, const char *key,
+                                 const char *label, Ac3dsMenuTouch action, bool enabled)
+    {
+        constexpr int width = 98;
+        const MenuTouchTarget target = {-1, action};
+        const bool held = menu_touch.revision == view.revision && menu_touch.target == target;
+        const u16 edge = held ? accent : border;
+        fill_rect(screen, x, menu_footer, x + width, menu_footer + menu_footer_height, edge);
+        fill_rect(screen, x + 1, menu_footer + 1, x + width - 1, menu_footer + menu_footer_height - 2, surface);
+        fill_rect(screen, x + 8, menu_footer + 8, x + 25, menu_footer + 24, enabled ? border : background);
+        draw_label(screen, x + 13, menu_footer + 12, key, enabled ? text : muted);
+        draw_menu_text(screen, x + 32, menu_footer + 10, label, enabled ? text : muted, x + width - 5);
+    }
+
     void draw_handheld_menu(u16 *screen, const Ac3dsMenuView &view)
     {
-        fill_rect(screen, 0, 0, touch_width, 29, surface);
-        fill_rect(screen, 0, 28, touch_width, 29, border);
-        draw_label(screen, 10, 10, view.title, text, view.pages > 1 ? 251 : 310);
+        fill_rect(screen, 0, 0, touch_width, 30, surface);
+        fill_rect(screen, 0, 28, touch_width, 30, border);
+        fill_rect(screen, 8, 7, 11, 23, accent);
+        draw_menu_text<12, 16>(screen, 17, 7, view.title, text, view.pages > 1 ? 257 : 312);
         if(view.pages > 1)
         {
             defformatstring(page)("%d/%d", view.page + 1, view.pages);
-            draw_label(screen, 310 - 8 * int(strlen(page)), 10, page, accent);
+            const int x = 311 - 9 * int(strlen(page));
+            draw_menu_text(screen, x, 9, page, accent);
         }
         for(int i = 0; i < Ac3dsMenuView::row_count; ++i)
         {
@@ -549,63 +824,85 @@ namespace
             if(row.index < 0) break;
             const int y = menu_top + i * menu_row_height;
             const bool selected = row.index == view.selection;
+            const bool held = menu_touch.revision == view.revision && menu_touch.target.index == row.index;
             const u16 color = row.disabled ? muted : text;
-            fill_rect(screen, 8, y, 312, y + 24, selected ? RGB565(8, 19, 11) : surface);
-            fill_rect(screen, 8, y, 11, y + 24, selected ? accent : border);
+            fill_rect(screen, 8, y, 312, y + menu_tile_height, selected || held ? accent : border);
+            fill_rect(screen, 10, y + 1, 311, y + menu_tile_height - 2,
+                      held ? RGB565(12, 28, 15) : selected ? RGB565(8, 19, 11) : surface);
             const int value_right = row.kind == Ac3dsMenuItem::Slider ? menu_minus - 4 : 302;
             const int value_length = min(int(strlen(row.value)), 12);
             const int value_left = value_right - 8 * value_length;
-            draw_label(screen, 18, y + 8, row.label, color,
-                       value_length ? value_left - 7 : value_right - 16);
+            draw_menu_text(screen, 17, y + 6, row.label, color,
+                           value_length ? value_left - 6 : value_right - 15);
             if(value_length) draw_label(screen, value_left, y + 8, row.value, row.disabled ? muted : accent, value_right);
             if(row.kind == Ac3dsMenuItem::Slider)
             {
-                draw_button(screen, menu_minus + 1, y, menu_plus - menu_minus - 3, 24, "-", !row.disabled);
-                draw_button(screen, menu_plus + 1, y, 312 - menu_plus - 1, 24, "+", !row.disabled);
+                draw_button(screen, menu_minus + 1, y + 2, menu_plus - menu_minus - 3, 20, "-", !row.disabled);
+                draw_button(screen, menu_plus + 1, y + 2, 309 - menu_plus, 20, "+", !row.disabled);
             }
             else if(row.kind == Ac3dsMenuItem::Action && !row.disabled)
                 draw_label(screen, 294, y + 8, ">", selected ? accent : muted);
         }
         if(view.binding)
-            draw_label(screen, 12, 218, "Press a button", accent);
-        else
+            draw_menu_text(screen, 12, 214, "Press a button", accent);
+        else if(view.pages > 1)
         {
-            draw_button(screen, 8, menu_footer, 98, 33, "L  Prev", view.page > 0);
-            draw_button(screen, 111, menu_footer, 98, 33, "R  Next", view.page + 1 < view.pages);
+            draw_menu_footer_button(screen, view, 8, "L", "Prev", Ac3dsMenuTouch::Previous, view.page > 0);
+            draw_menu_footer_button(screen, view, 111, "R", "Next", Ac3dsMenuTouch::Next, view.page + 1 < view.pages);
         }
-        draw_button(screen, 214, menu_footer, 98, 33, view.binding ? "Cancel" : view.back ? "B  Back" : "B  Close");
+        draw_menu_footer_button(screen, view, 214, "B", view.binding ? "Cancel" : view.back ? "Back" : "Close",
+                               Ac3dsMenuTouch::Back, true);
     }
 
-    void queue_menu_touch(const touchPosition &touch)
+    int weapon_touch_cell(const touchPosition &touch)
     {
-        if(!drawn_menu.revision || touch.px < 8 || touch.px >= 312) return;
-        int index = -1;
-        Ac3dsMenuTouch action = Ac3dsMenuTouch::Activate;
-        if(touch.py >= menu_footer)
-        {
-            if(touch.px >= 214) action = Ac3dsMenuTouch::Back;
-            else if(!drawn_menu.binding && touch.px < 106 && drawn_menu.page > 0) action = Ac3dsMenuTouch::Previous;
-            else if(!drawn_menu.binding && touch.px >= 111 && touch.px < 209 &&
-                    drawn_menu.page + 1 < drawn_menu.pages) action = Ac3dsMenuTouch::Next;
-            else return;
-        }
-        else
-        {
-            const int y = int(touch.py) - menu_top;
-            if(y < 0 || y / menu_row_height >= Ac3dsMenuView::row_count || y % menu_row_height >= 24) return;
-            const Ac3dsMenuRow &row = drawn_menu.rows[y / menu_row_height];
-            if(row.index < 0) return;
-            index = row.index;
-            if(row.kind == Ac3dsMenuItem::Slider && touch.px >= menu_minus)
-                action = touch.px >= menu_plus ? Ac3dsMenuTouch::Increase : Ac3dsMenuTouch::Decrease;
-        }
+        constexpr int columns = Ac3dsMenuView::weapon_columns;
+        const int x = int(touch.px) - weapon_left, y = int(touch.py) - weapon_top;
+        if(x < 0 || y < 0 || x / weapon_stride_x >= columns ||
+           x % weapon_stride_x >= weapon_width || y % weapon_stride_y >= weapon_height) return -1;
+        const int cell = y / weapon_stride_y * columns + x / weapon_stride_x;
+        return cell < Ac3dsMenuView::row_count ? cell : -1;
+    }
+
+    void post_menu_touch(unsigned revision, int index, Ac3dsMenuTouch action)
+    {
         SDL_Event event = {};
         event.type = SDL_USEREVENT;
         event.user.code = AC3DS_MENU_TOUCH_EVENT;
-        event.user.windowID = drawn_menu.revision;
+        event.user.windowID = revision;
         event.user.data1 = reinterpret_cast<void *>(intptr_t(index));
         event.user.data2 = reinterpret_cast<void *>(intptr_t(action));
         pushevent(event);
+    }
+
+    MenuTouchTarget menu_target(const touchPosition &touch)
+    {
+        if(!drawn_menu.revision || touch.px < 8 || touch.px >= 312) return {};
+        if(drawn_menu.weapon_picker)
+        {
+            const int cell = weapon_touch_cell(touch);
+            if(cell < 0 || drawn_menu.rows[cell].disabled) return {};
+            const int index = drawn_menu.rows[cell].index;
+            return {index, index < 0 ? Ac3dsMenuTouch::Back : Ac3dsMenuTouch::Activate};
+        }
+        if(touch.py >= menu_footer)
+        {
+            if(touch.py >= menu_footer + menu_footer_height) return {};
+            if(touch.px >= 214) return {-1, Ac3dsMenuTouch::Back};
+            if(drawn_menu.binding) return {};
+            if(touch.px < 106 && drawn_menu.page > 0) return {-1, Ac3dsMenuTouch::Previous};
+            if(touch.px >= 111 && touch.px < 209 && drawn_menu.page + 1 < drawn_menu.pages)
+                return {-1, Ac3dsMenuTouch::Next};
+            return {};
+        }
+        if(drawn_menu.binding) return {};
+        const int y = int(touch.py) - menu_top;
+        if(y < 0 || y / menu_row_height >= Ac3dsMenuView::row_count || y % menu_row_height >= menu_tile_height) return {};
+        const Ac3dsMenuRow &row = drawn_menu.rows[y / menu_row_height];
+        if(row.index < 0 || row.disabled) return {};
+        if(row.kind == Ac3dsMenuItem::Slider && touch.px >= menu_minus)
+            return {row.index, touch.px >= menu_plus ? Ac3dsMenuTouch::Increase : Ac3dsMenuTouch::Decrease};
+        return {row.index, Ac3dsMenuTouch::Activate};
     }
 }
 
@@ -634,6 +931,63 @@ static float measure_cpu_boost()
     return fast ? float(double(slow) / double(fast)) : 0.0f;
 }
 
+// Selects the game data, from the first place that has it: the .3dsx itself
+// (an asset-embedded build), the one-file image on the SD card (what the
+// first-run download writes), or loose config and packages folders on the SD
+// card (a manual installation, or a download by build 24). NULL when the game
+// can start; otherwise what to tell the player, "" if that has been done.
+static const char *find_assets()
+{
+    romfs_ready = R_SUCCEEDED(romfsInit());
+    if(romfs_ready && select_assets("romfs:/"))
+    {
+        copystring(asset_source, "built into the .3dsx");
+        return NULL;
+    }
+    if(romfs_ready)
+    {
+        // A RomFS without the game in it: the image needs the device name.
+        chdir("sdmc:/");
+        romfsExit();
+        romfs_ready = false;
+    }
+    bool found = mount_image();
+    if(!found && select_assets(game_dir))
+    {
+        found = true;
+        if(image_problem[0]) formatstring(asset_source)("folders on the SD card (%s not used: %s)", romfsimage::file_name, image_problem);
+        else copystring(asset_source, "folders on the SD card");
+    }
+    static string problem;
+#ifdef AC3DS_FIRSTRUN
+    if(found)
+    {
+        ac3ds_first_run_tidy(game_dir);
+        return NULL;
+    }
+    // No usable game data anywhere: offer to fetch the official package. The
+    // offer draws on the lower screen with the console font, so it needs the
+    // display but none of the game's own files.
+    gfxInit(GSP_BGR8_OES, GSP_RGB565_OES, false);
+    gfx_ready = true;
+    if(ac3ds_first_run(game_dir, image_problem[0] ? image_problem : NULL) != AC3DS_FIRSTRUN_INSTALLED)
+        return ""; // declined or failed, and already explained
+    if(mount_image()) return NULL;
+    formatstring(problem)("The game data was downloaded but /3ds/assaultcube/%s cannot be used: %s.", romfsimage::file_name,
+                          image_problem[0] ? image_problem : "it is missing");
+    return problem;
+#else
+    if(found) return NULL;
+    if(!image_problem[0])
+        return "AssaultCube assets were not found. Install the Lockdown Edition config and packages directories under /3ds/assaultcube.";
+    formatstring(problem)("The game data file /3ds/assaultcube/%s is damaged: %s. Delete it and install the game data again.",
+                          romfsimage::file_name, image_problem);
+    return problem;
+#endif
+}
+
+const char *ac3ds_asset_source() { return asset_source; }
+
 const char *ac3ds_system_init()
 {
     SDL_SetMainReady();
@@ -643,14 +997,16 @@ const char *ac3ds_system_init()
     ac3ds_cpu_clock_ratio = measure_cpu_boost(); // leaves the boost on
     mkdir("sdmc:/3ds", 0777);
     mkdir(game_dir, 0777);
-    romfs_ready = R_SUCCEEDED(romfsInit());
-    if(!(romfs_ready && select_assets("romfs:/")) && !select_assets(game_dir))
-        return "AssaultCube assets were not found. Install the Lockdown Edition config and packages directories under /3ds/assaultcube.";
+    if(const char *problem = find_assets()) return problem;
 
-    gfxInit(GSP_BGR8_OES, GSP_RGB565_OES, false);
-    gfx_ready = true;
-    gfxSetDoubleBuffering(GFX_BOTTOM, false);
-    gfxScreenSwapBuffers(GFX_BOTTOM, false);
+    // Both screens stay double buffered (the gfxInit default). Citro3D presents
+    // the top one; the lower one is drawn and swapped by bottom_begin() and
+    // bottom_present() below.
+    if(!gfx_ready)
+    {
+        gfxInit(GSP_BGR8_OES, GSP_RGB565_OES, false);
+        gfx_ready = true;
+    }
     if(R_SUCCEEDED(gspLcdInit()))
     {
         lcd_ready = R_SUCCEEDED(GSPLCD_GetBrightness(GSPLCD_SCREEN_TOP, &original_brightness));
@@ -663,6 +1019,7 @@ const char *ac3ds_system_init()
 
 void ac3ds_system_shutdown()
 {
+    netkeep_end(); // nothing may use the sockets past this point
     if(apt_hooked)
     {
         aptUnhook(&apt_cookie);
@@ -711,9 +1068,24 @@ void ac3ds_show_error(const char *message)
 
 bool ac3ds_main_loop()
 {
-    while(aptMainLoop())
+    for(;;)
     {
-        active = aptIsActive();
+        bool running;
+        {
+            Ac3dsPhaseScope phase("APT: main loop");
+            running = aptMainLoop();
+        }
+        if(!running)
+        {
+            ac3ds_crash_note_event("APT main loop returned false");
+            break;
+        }
+        const bool was_active = active;
+        {
+            Ac3dsPhaseScope phase("APT: check active state");
+            active = aptIsActive();
+        }
+        if(active != was_active) ac3ds_crash_note_event("APT active state changed", active);
         if(active)
         {
             if(clock_reset) release_input();
@@ -721,8 +1093,13 @@ bool ac3ds_main_loop()
         }
         release_input();
         clock_reset = true;
+        Ac3dsPhaseScope phase("APT: inactive VBlank");
         gspWaitForVBlank();
     }
+    // HOME -> Close wakes the app with APTCMD_WAKEUP_CANCEL, for which libctru
+    // runs no restore hook: stop the keepalive thread here, before the caller
+    // tears ENet down.
+    netkeep_end();
     active = false;
     ac3ds_audio_lifecycle_event(true);
     ac3ds_audio_service();
@@ -789,6 +1166,48 @@ void ac3ds_default_binds()
     _defaultbinds = previous;
 }
 
+void ac3ds_upgrade_scope_binding()
+{
+    // Older saves could explicitly record the hold-to-scope default.
+    keym *binding = findbindc(KEYCODE_SCOPE);
+    if(binding && !strcmp(binding->actions[keym::ACTION_DEFAULT], "altaction"))
+        bindkey(binding, controls[KEYCODE_SCOPE - KEYCODE_A].normal);
+}
+
+namespace
+{
+    // A physical button as the player knows it.
+    const char *button_label(int code)
+    {
+        switch(code)
+        {
+            case KEYCODE_UP: return "D-Pad Up";
+            case KEYCODE_DOWN: return "D-Pad Down";
+            case KEYCODE_LEFT: return "D-Pad Left";
+            case KEYCODE_RIGHT: return "D-Pad Right";
+            case KEYCODE_CPAD_UP: return "Circle Pad Up";
+            case KEYCODE_CPAD_DOWN: return "Circle Pad Down";
+            case KEYCODE_CPAD_LEFT: return "Circle Pad Left";
+            case KEYCODE_CPAD_RIGHT: return "Circle Pad Right";
+            default: return controls[code - KEYCODE_A].name + 4; // "3DS_L" -> "L"
+        }
+    }
+}
+
+const char *ac3ds_spectator_button(const char *action)
+{
+    for(const auto &button : buttons)
+    {
+        const keym *binding = findbindc(button.code);
+        if(!binding) continue;
+        // The binding execbind() runs for a dead or spectating player.
+        const char *bound = binding->actions[keym::ACTION_SPECTATOR][0] ? binding->actions[keym::ACTION_SPECTATOR] :
+                                                                           binding->actions[keym::ACTION_DEFAULT];
+        if(!strcmp(bound, action)) return button_label(button.code);
+    }
+    return NULL;
+}
+
 int ac3ds_menu_key(int code)
 {
     switch(code)
@@ -838,6 +1257,7 @@ bool ac3ds_binding_cancel_key(int code)
 bool ac3ds_edit_text(const char *title, const char *initial, char *out, size_t capacity,
                      int maxchars, bool password)
 {
+    Ac3dsPhaseScope phase("APT: software keyboard setup");
     if(capacity < 2 || maxchars < 1 || aptShouldClose() || !aptIsActive()) return false;
     ac3ds_gl_end_frame();
     extern void ac3ds_discard_pending_input();
@@ -854,13 +1274,19 @@ bool ac3ds_edit_text(const char *title, const char *initial, char *out, size_t c
     swkbdSetButton(&keyboard, SWKBD_BUTTON_LEFT, "Cancel", false);
     swkbdSetButton(&keyboard, SWKBD_BUTTON_RIGHT, "OK", true);
     if(password) swkbdSetPasswordMode(&keyboard, SWKBD_PASSWORD_HIDE);
-    ac3ds_crash_pause(true); // the keyboard applet blocks the main loop
     netkeep_begin();         // ...so keep the server connection serviced meanwhile
     in_keyboard_applet = true;
-    SwkbdButton button = swkbdInputText(&keyboard, out, capacity);
+    ac3ds_crash_pause(true); // the keyboard applet blocks the main loop
+    SwkbdButton button;
+    {
+        Ac3dsPhaseScope applet("APT: software keyboard applet");
+        ac3ds_crash_note_event("keyboard opened");
+        button = swkbdInputText(&keyboard, out, capacity);
+        ac3ds_crash_note_event("keyboard returned", int(button));
+    }
     in_keyboard_applet = false;
-    netkeep_end();
     ac3ds_crash_pause(false);
+    netkeep_end();
 
     hidScanInput();
     inhibited_buttons |= hidKeysHeld();
@@ -910,9 +1336,8 @@ namespace
 
 // ---------------------------------------------------------------------------
 // Match screen: the lower screen during play. The map fills the whole screen
-// and doubles as the stylus look area. Only the two actions players reach for
-// mid-fight sit on it (RELOAD top centre, GRENADE bottom centre), plus a small
-// MAP/RADAR toggle; everything else lives in a drawer that slides out from a
+// and doubles as the stylus look area. Reload, grenades, weapon selection and
+// the MAP/RADAR toggle sit on it. Other actions live in a drawer that slides out from a
 // small tab in the top-left corner, so it is always reachable but never in
 // the way.
 namespace
@@ -920,8 +1345,11 @@ namespace
     constexpr int radar_top = 0, radar_bottom = touch_height;
     struct HudButton { int x0, y0, x1, y1, code; const char *label; bool large; };
     enum { HUD_MAPTOGGLE = 1 }; // local actions, not key codes
+    const HudButton weapon_button = {224, 4, 316, 40, KEYCODE_WEAPONS, "WEAPON", false};
+    const HudButton scope_button = {4, 200, 88, 236, KEYCODE_SCOPE, "SCOPE", false};
     const HudButton hud_buttons[] = {
         {100, 4, 220, 40, KEYCODE_RELOAD, "RELOAD", true},
+        weapon_button,
         {92, 200, 228, 236, KEYCODE_GRENADE, "GRENADE", true},
         {262, 206, 316, 236, HUD_MAPTOGGLE, "MAP", false},
     };
@@ -933,13 +1361,14 @@ namespace
     const HudButton drawer_items[] = {
         {6, 48, 118, 88, KEYCODE_MATCHMENU, "MENU", false},
         {6, 94, 118, 134, KEYCODE_SCORES, "SCORES", false},
-        {6, 140, 118, 180, KEYCODE_NEXTWEAPON, "WEAPON", false},
-        {6, 186, 118, 226, KEYCODE_CHAT, "CHAT", false},
+        {6, 140, 118, 180, KEYCODE_CHAT, "CHAT", false},
     };
     constexpr int drawer_item_count = sizeof(drawer_items) / sizeof(drawer_items[0]);
     bool drawer_open = false;
     int drawer_offset = -drawer_width; // slides from -drawer_width (hidden) to 0
     bool map_overview = false;          // whole map, north up, instead of the close radar
+
+    bool drawer_active() { return drawer_open || drawer_offset > -drawer_width; }
 
     // Vote buttons below RELOAD while a vote waits for this player.
     const HudButton vote_buttons[] = {
@@ -948,6 +1377,18 @@ namespace
     };
     u64 vote_shown_tick = 0;
     const void *vote_shown_for = NULL;
+
+    // RESPAWN, across the middle of the map while the player is dead or
+    // spectating. It presses a key bound to the fire action, so a tap does
+    // exactly what the fire button does and the game's own rules (the wait,
+    // arena rounds, one request a second) decide the outcome.
+    const HudButton respawn_button = {16, 92, 304, 148, KEYCODE_RESPAWN, "", true};
+
+    int respawn_state()
+    {
+        int secs;
+        return player1 ? respawnstatus(secs) : RS_NONE;
+    }
 
     bool vote_pending()
     {
@@ -976,9 +1417,9 @@ namespace
     const u16 radar_void = RGB565(1, 3, 2), hud_rvsf = RGB565(6, 26, 31), hud_cla = RGB565(31, 12, 8);
     const u16 hud_self = RGB565(31, 61, 10), hud_outline = RGB565(0, 0, 0);
 
-    inline bool hit(const HudButton &b, const touchPosition &t)
+    inline bool hit(const HudButton &b, const touchPosition &t, int dx = 0)
     {
-        return t.px >= b.x0 && t.px < b.x1 && t.py >= b.y0 && t.py < b.y1;
+        return t.px >= b.x0 + dx && t.px < b.x1 + dx && t.py >= b.y0 && t.py < b.y1;
     }
 
     inline void plot(u16 *screen, int x, int y, u16 color)
@@ -1041,15 +1482,23 @@ namespace
         }
     }
 
+    bool scope_visible()
+    {
+        return !drawer_active() && player1 && player1->state == CS_ALIVE && !watchingdemo &&
+               player1->weaponsel && player1->weaponsel->type == GUN_SNIPER && *getclientmap();
+    }
+
     bool hud_button_enabled(int code)
     {
         if(code == HUD_MAPTOGGLE || code == KEYCODE_MATCHMENU || code == KEYCODE_SCORES || code == KEYCODE_CHAT) return true;
+        if(code == KEYCODE_WEAPONS) return player1 && !watchingdemo && *getclientmap();
         if(!player1 || player1->state != CS_ALIVE) return false;
         const weapon *gun = player1->weaponsel;
         switch(code)
         {
             case KEYCODE_RELOAD: return gun && reloadable_gun(gun->type) && gun->ammo > 0 && gun->mag < gun->info.magsize;
             case KEYCODE_GRENADE: return player1->weapons[GUN_GRENADE] && player1->weapons[GUN_GRENADE]->mag > 0;
+            case KEYCODE_SCOPE: return ac3ds_can_toggle_scope();
             default: return true;
         }
     }
@@ -1068,9 +1517,12 @@ namespace
         shade_rect(screen, x0 + 2, b.y0 + 2, x1 - 2, b.y1 - 2, active ? accent : RGB565(2, 6, 4));
         frame_rect(screen, x0, b.y0, x1, b.y1, active ? accent : enabled ? border : surface);
         const u16 color = enabled ? text : muted;
-        const char *label = b.code == HUD_MAPTOGGLE && map_overview ? "RADAR" : b.label;
+        const char *label = b.code == HUD_MAPTOGGLE && map_overview ? "RADAR" :
+                            b.code == KEYCODE_SCOPE && ac3ds_scope_latched() ? "UNSCOPE" : b.label;
         const int len = int(strlen(label));
-        if(b.large)
+        if(b.code == KEYCODE_SCOPE)
+            draw_menu_text(screen, (x0 + x1 - 9 * len) / 2, (b.y0 + b.y1 - 12) / 2, label, color, x1);
+        else if(b.large)
             draw_label_large(screen, (x0 + x1 - 16 * len) / 2, (b.y0 + b.y1 - 16) / 2, label, color);
         else if(x0 >= 0)
             draw_label(screen, (x0 + x1 - 8 * len) / 2, (b.y0 + b.y1 - 8) / 2, label, color, x1);
@@ -1097,10 +1549,8 @@ namespace
 
     bool tab_hit(const touchPosition &t)
     {
-        HudButton tab = drawer_tab;
         const int tx = max(0, drawer_width + drawer_offset - 34);
-        tab.x0 += tx; tab.x1 += tx;
-        return hit(tab, t);
+        return hit(drawer_tab, t, tx);
     }
 
     void radar_probe()
@@ -1225,29 +1675,87 @@ namespace
         }
     }
 
-    // The whole match screen: map, then the overlays.
+    void draw_respawn(u16 *screen)
+    {
+        int secs = 0;
+        const int state = player1 ? respawnstatus(secs) : RS_NONE;
+        if(state == RS_NONE) return;
+        const bool ready = state == RS_READY || state == RS_JOIN; // a tap does something now
+        string title, hint = "";
+        switch(state)
+        {
+            case RS_WAIT: formatstring(title)("RESPAWN IN %d", secs); break;
+            case RS_READY:
+            case RS_JOIN:
+            {
+                copystring(title, state == RS_JOIN ? "TAP TO JOIN" : "TAP TO RESPAWN");
+                const char *fire = ac3ds_spectator_button("attack");
+                if(fire) formatstring(hint)("or press %s", fire);
+                break;
+            }
+            case RS_SENT: copystring(title, "RESPAWNING"); break;
+            case RS_ROUND:
+                copystring(title, "ROUND IN PROGRESS");
+                copystring(hint, "You respawn next round");
+                break;
+            case RS_NEXTROUND: formatstring(title)("NEXT ROUND IN %d", secs); break;
+            default:
+                copystring(title, "PLEASE WAIT");
+                copystring(hint, spawnpermission == SP_WRONGMAP ? "Waiting for the map" : "Waiting for the server");
+                break;
+        }
+        const HudButton &b = respawn_button;
+        if(ready)
+        {
+            // Lit and solid, so it cannot be mistaken for the dim countdown.
+            fill_rect(screen, b.x0, b.y0, b.x1, b.y1, accent);
+            fill_rect(screen, b.x0 + 3, b.y0 + 3, b.x1 - 3, b.y1 - 3,
+                      pressed_hud_code == b.code ? RGB565(13, 33, 11) : RGB565(6, 17, 8));
+        }
+        else
+        {
+            shade_rect(screen, b.x0 + 2, b.y0 + 2, b.x1 - 2, b.y1 - 2, RGB565(1, 4, 2));
+            shade_rect(screen, b.x0 + 2, b.y0 + 2, b.x1 - 2, b.y1 - 2, RGB565(1, 4, 2));
+            frame_rect(screen, b.x0, b.y0, b.x1, b.y1, surface);
+        }
+        const u16 color = ready ? text : muted;
+        const int cx = (b.x0 + b.x1) / 2;
+        draw_label_large(screen, cx - 8 * int(strlen(title)), b.y0 + (hint[0] ? 12 : 20), title, color);
+        if(hint[0]) draw_label(screen, cx - 4 * int(strlen(hint)), b.y0 + 36, hint, color, b.x1);
+    }
+
+    // The whole match screen: map, then the overlays. draw_radar() writes
+    // every pixel, which is what lets this draw into either buffer without a
+    // fill first.
     void draw_match_screen(u16 *screen)
     {
         draw_radar(screen);
         for(const HudButton &b : hud_buttons)
             draw_hud_button(screen, b, hud_button_enabled(b.code),
                             pressed_hud_code == b.code || (b.code == KEYCODE_RELOAD && reloading_now()));
+        if(scope_visible())
+            draw_hud_button(screen, scope_button, ac3ds_can_toggle_scope(),
+                            pressed_hud_code == KEYCODE_SCOPE || ac3ds_scope_latched());
         if(vote_pending())
         {
             const bool armed = vote_armed();
             for(const HudButton &b : vote_buttons) draw_hud_button(screen, b, armed, false);
         }
+        draw_respawn(screen);
         draw_drawer(screen);
     }
 
-    // Advances the drawer slide; true while it is still moving.
-    bool animate_drawer()
+    bool drawer_moving()
+    {
+        return drawer_offset != (drawer_open ? 0 : -drawer_width);
+    }
+
+    // Advances the drawer slide by one drawn frame.
+    void animate_drawer()
     {
         const int target = drawer_open ? 0 : -drawer_width;
-        if(drawer_offset == target) return false;
         const int step = 31; // about 4 frames end to end
         drawer_offset = drawer_offset < target ? min(target, drawer_offset + step) : max(target, drawer_offset - step);
-        return true;
     }
 
     // Handles a new touch on the match screen. Returns the key code to press
@@ -1255,20 +1763,28 @@ namespace
     int match_touch(const touchPosition &t, bool &aim)
     {
         aim = false;
-        if(drawer_open)
+        if(hit(weapon_button, t))
         {
-            if(tab_hit(t)) { drawer_open = false; return 0; }
-            if(t.px < drawer_width)
+            if(!hud_button_enabled(weapon_button.code)) return 0;
+            drawer_open = false;
+            return weapon_button.code;
+        }
+        if(tab_hit(t)) { drawer_open = !drawer_open; return 0; }
+        if(drawer_active())
+        {
+            if(t.px >= drawer_width + drawer_offset) drawer_open = false;
+            else if(drawer_open)
             {
                 for(const HudButton &b : drawer_items)
-                    if(hit(b, t) && hud_button_enabled(b.code)) return b.code;
-                return 0;
+                    if(hit(b, t, drawer_offset) && hud_button_enabled(b.code)) return b.code;
             }
-            drawer_open = false; // a tap outside closes it
             return 0;
         }
-        if(tab_hit(t)) { drawer_open = true; return 0; }
+        if(scope_visible() && hit(scope_button, t)) return ac3ds_can_toggle_scope() ? KEYCODE_SCOPE : 0;
         if(vote_armed()) for(const HudButton &b : vote_buttons) if(hit(b, t)) return b.code;
+        // Too early or in an arena round, the tap still goes to the game, which
+        // answers as it does for the fire button.
+        if(respawn_state() != RS_NONE && hit(respawn_button, t)) return KEYCODE_RESPAWN;
         for(const HudButton &b : hud_buttons)
         {
             if(!hit(b, t)) continue;
@@ -1298,6 +1814,24 @@ namespace
     };
     Uint32 browser_repeat_at = 0;
 
+    struct ServerCard
+    {
+        Ac3dsServerRow row{};
+        const void *menu = nullptr;
+        int count = 0, pressed = 0;
+        bool selected = false;
+
+        bool operator==(const ServerCard &other) const
+        {
+            if(menu != other.menu || count != other.count || pressed != other.pressed || selected != other.selected) return false;
+            if(!selected) return true;
+            const Ac3dsServerRow &r = other.row;
+            return row.id == r.id && row.responded == r.responded && row.full == r.full && row.password == r.password &&
+                   row.players == r.players && row.maxclients == r.maxclients && row.ping == r.ping &&
+                   !strcmp(row.desc, r.desc) && !strcmp(row.map, r.map) && !strcmp(row.mode, r.mode);
+        }
+    } drawn_server_card;
+
     void draw_arrow_glyph(u16 *screen, int cx, int cy, bool up, u16 color)
     {
         for(int row = 0; row < 12; ++row)
@@ -1308,65 +1842,45 @@ namespace
         }
     }
 
-    void draw_server_panel(u16 *screen)
+    void draw_server_panel(u16 *screen, const ServerCard &card)
     {
-        static Ac3dsServerRow rows[256];
-        int selected = -1;
-        const int count = ac3ds_server_rows(const_cast<void *>(ac3ds_menu_identity()), rows, 256, selected);
         fill_rect(screen, 0, 0, touch_width, 28, surface);
         fill_rect(screen, 0, 27, touch_width, 28, border);
-        draw_label(screen, 10, 10, "Server browser", text);
+        draw_menu_text<12, 16>(screen, 10, 6, card.pressed == SDLK_RETURN ? "Release to join" : "Server browser", text);
         char total[24];
-        snprintf(total, sizeof(total), "%d servers", count);
-        draw_label(screen, touch_width - 10 - 8 * int(strlen(total)), 10, total, muted);
+        snprintf(total, sizeof(total), "%d servers", card.count);
+        draw_menu_text(screen, touch_width - 10 - 9 * int(strlen(total)), 9, total, muted);
         // Card: the selected server in the large font.
         fill_rect(screen, 4, 32, 316, 102, surface);
         fill_rect(screen, 4, 32, 7, 102, accent);
-        if(selected >= 0)
+        if(card.selected)
         {
-            const Ac3dsServerRow &r = rows[selected];
+            const Ac3dsServerRow &r = card.row;
             char line[128];
-            const int len = int(strlen(r.desc));
-            if(len > 18) snprintf(line, sizeof(line), "%.16s..", r.desc);
-            else snprintf(line, sizeof(line), "%s", r.desc);
-            draw_label_large(screen, 12, 36, line, text);
+            draw_menu_text<12, 16>(screen, 12, 37, r.desc, text, 310);
             if(r.map[0]) snprintf(line, sizeof(line), "%.12s %s", r.map, r.mode);
             else snprintf(line, sizeof(line), "%s", r.responded ? "Empty" : "Waiting...");
-            draw_label_large(screen, 12, 58, line, accent);
+            draw_menu_text(screen, 12, 59, line, accent, 310);
             if(r.responded)
             {
                 snprintf(line, sizeof(line), "%d/%d  %dms%s", r.players, r.maxclients, r.ping, r.password ? " *" : "");
-                draw_label_large(screen, 12, 80, line, r.full ? RGB565(31, 30, 12) : muted);
+                draw_menu_text(screen, 12, 81, line, r.full ? RGB565(31, 30, 12) : muted);
             }
         }
-        else draw_label_large(screen, 12, 58, count ? "Pick a server" : "Tap SCAN", muted);
+        else draw_menu_text(screen, 12, 59, card.count ? "Pick a server" : "Tap SCAN", muted);
         for(const BrowserButton &b : browser_buttons)
         {
-            const bool active = touch_key == b.code;
+            const bool active = card.pressed == b.code;
             fill_rect(screen, b.x0, b.y0, b.x1, b.y1, active ? accent : border);
             fill_rect(screen, b.x0 + 2, b.y0 + 2, b.x1 - 2, b.y1 - 2, active ? RGB565(8, 22, 10) : surface);
             if(b.code == SDLK_UP || b.code == SDLK_DOWN)
                 draw_arrow_glyph(screen, (b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2, b.code == SDLK_UP, text);
             else if(b.large)
                 draw_label_large(screen, (b.x0 + b.x1 - 16 * int(strlen(b.label))) / 2, (b.y0 + b.y1 - 16) / 2, b.label,
-                                 b.code == SDLK_RETURN && selected < 0 ? muted : text); // only JOIN needs a server
+                                 b.code == SDLK_RETURN && !card.selected ? muted : text); // only JOIN needs a server
             else
                 draw_label(screen, (b.x0 + b.x1 - 8 * int(strlen(b.label))) / 2, (b.y0 + b.y1 - 8) / 2, b.label, text, b.x1);
         }
-    }
-
-    // Change key for redraws: the selection and what the card shows.
-    void server_panel_status(char *out, size_t size)
-    {
-        static Ac3dsServerRow rows[256];
-        int selected = -1;
-        const int count = ac3ds_server_rows(const_cast<void *>(ac3ds_menu_identity()), rows, 256, selected);
-        if(selected >= 0)
-        {
-            const Ac3dsServerRow &r = rows[selected];
-            snprintf(out, size, "S%d|%d|%s|%s|%d|%d|%d|%d", count, selected, r.desc, r.map, r.players, r.ping / 10, r.responded, touch_key);
-        }
-        else snprintf(out, size, "S%d|-|%d", count, touch_key);
     }
 
     int server_touch(const touchPosition &t)
@@ -1375,6 +1889,29 @@ namespace
             if(t.px >= b.x0 && t.px < b.x1 && t.py >= b.y0 && t.py < b.y1) return b.code;
         return 0;
     }
+
+    unsigned displayed_server_id()
+    {
+        return drawn_panel == SERVER_PANEL && drawn_server_card.selected &&
+               drawn_server_card.menu == ac3ds_menu_identity() && loading_percent < 0 ? drawn_server_card.row.id : 0;
+    }
+
+    void post_server_join(unsigned context, unsigned id)
+    {
+        SDL_Event event = {};
+        event.type = SDL_USEREVENT;
+        event.user.code = AC3DS_SERVER_JOIN_EVENT;
+        event.user.windowID = context;
+        event.user.data1 = reinterpret_cast<void *>(uintptr_t(id));
+        pushevent(event);
+    }
+}
+
+void ac3ds_dispatch_server_join(unsigned context, unsigned id)
+{
+    ac3ds_sync_input_context();
+    if(context == button_context && current_panel() == SERVER_PANEL && loading_percent < 0)
+        ac3ds_join_server_from_menu(id);
 }
 
 // QA: a tap at (x, y) on the match screen or server browser, through the
@@ -1385,8 +1922,13 @@ void ac3ds_qa_tap(int x, int y)
     t.px = u16(max(0, min(x, touch_width - 1)));
     t.py = u16(max(0, min(y, touch_height - 1)));
     bool aim = false;
-    const int code = current_panel() == SERVER_PANEL ? server_touch(t) : match_touch(t, aim);
-    if(code)
+    const bool browser = current_panel() == SERVER_PANEL;
+    const int code = browser ? server_touch(t) : match_touch(t, aim);
+    if(browser && code == SDLK_RETURN)
+    {
+        if(const unsigned id = displayed_server_id()) post_server_join(button_context, id);
+    }
+    else if(code)
     {
         push_key(code, true, false, button_context);
         push_key(code, false, false, button_context);
@@ -1410,12 +1952,34 @@ void ac3ds_qa_touch(int x, int y, int presses, int hold_ms, int gap_ms)
     qa_touch.active = true;
 }
 
+// QA: hold the named physical button (3DS_L, ...) for hold_ms, through the
+// same edge detection, input context and menu handling as a real press.
+void ac3ds_qa_button(const char *name, int hold_ms)
+{
+    for(const auto &button : buttons)
+    {
+        if(strcmp(controls[button.code - KEYCODE_A].name, name)) continue;
+        qa_button.mask = button.mask;
+        qa_button.until = SDL_GetTicks() + Uint32(max(1, hold_ms));
+        return;
+    }
+    conoutf("no button named %s", name);
+}
+COMMANDF(ac3dsqabutton, "si", (char *name, int *hold) { ac3ds_qa_button(name, *hold); });
+
 bool ac3ds_minimap_info(unsigned &tex, float &x0, float &y0, float &span);
+
+void ac3ds_minimap_reset()
+{
+    minimap_request = minimap_valid = false;
+    minimap_wait = 0;
+    controls_dirty = true;
+}
 
 void ac3ds_minimap_updated()
 {
+    ac3ds_minimap_reset();
     minimap_request = true;
-    minimap_valid = false;
 }
 
 namespace
@@ -1473,8 +2037,6 @@ void ac3ds_poll_input()
     hidScanInput();
     if(!dedicated_display) ac3ds_sync_input_context();
     u32 held = hidKeysHeld();
-    inhibited_buttons &= held;
-    held &= ~inhibited_buttons;
     bool qa_pressed = false;
     if(qa_touch.active)
     {
@@ -1491,6 +2053,13 @@ void ac3ds_poll_input()
         }
     }
     if(qa_pressed) held |= KEY_TOUCH;
+    if(qa_button.mask)
+    {
+        if(Sint32(SDL_GetTicks() - qa_button.until) < 0) held |= qa_button.mask;
+        else qa_button.mask = 0;
+    }
+    inhibited_buttons &= held;
+    held &= ~inhibited_buttons;
     if(dedicated_display)
     {
         if((held & KEY_B) && !(held_buttons & KEY_B)) push_key(KEYCODE_B, true);
@@ -1540,12 +2109,11 @@ void ac3ds_poll_input()
                 bool aim = false;
                 touch_key = match_touch(touch, aim);
                 touch_aim = aim && touchaim;
-                controls_dirty = true;
                 if(touch_key)
                 {
                     touch_key_context = button_context;
                     pressed_hud_code = touch_key;
-                    push_key(touch_key, true, false, touch_key_context);
+                    if(touch_key != KEYCODE_SCOPE) push_key(touch_key, true, false, touch_key_context);
                 }
                 else if(aim && doubletapjump && double_tap.down(now, touch.px, touch.py, Uint32(doubletapms)))
                 {
@@ -1557,11 +2125,28 @@ void ac3ds_poll_input()
                 }
                 if(!aim || !doubletapjump) double_tap.reset();
             }
-            else if(drawn_panel == panel && panel == MENU_PANEL) queue_menu_touch(touch);
+            else if(drawn_panel == panel && panel == MENU_PANEL && loading_percent < 0)
+            {
+                const MenuTouchTarget target = menu_target(touch);
+                if(target.action != Ac3dsMenuTouch::None)
+                {
+                    menu_touch = {target, drawn_menu.revision};
+                    controls_dirty = true;
+                }
+            }
             else if(drawn_panel == panel && panel == SERVER_PANEL)
             {
                 touch_key = server_touch(touch);
-                if(touch_key)
+                if(touch_key == SDLK_RETURN)
+                {
+                    touch_key = 0;
+                    if(const unsigned id = displayed_server_id())
+                    {
+                        server_join_touch = {id, button_context};
+                        controls_dirty = true;
+                    }
+                }
+                else if(touch_key)
                 {
                     touch_key_context = button_context;
                     push_key(touch_key, true, false, touch_key_context);
@@ -1583,6 +2168,25 @@ void ac3ds_poll_input()
                 }
             }
         }
+        else if(menu_touch.revision)
+        {
+            if(panel != MENU_PANEL || drawn_menu.revision != menu_touch.revision ||
+               !(menu_target(touch) == menu_touch.target)) cancel_menu_touch();
+        }
+        else if(server_join_touch.id)
+        {
+            if(panel != SERVER_PANEL || server_join_touch.context != button_context ||
+               server_touch(touch) != SDLK_RETURN || loading_percent >= 0) cancel_server_join();
+        }
+        else if(touch_key == KEYCODE_SCOPE)
+        {
+            if(panel != GAME_PANEL || touch_key_context != button_context ||
+               !hit(scope_button, touch) || !scope_visible() || !ac3ds_can_toggle_scope())
+            {
+                touch_key = pressed_hud_code = 0;
+                controls_dirty = true;
+            }
+        }
         else if(panel == SERVER_PANEL && (touch_key == SDLK_UP || touch_key == SDLK_DOWN) &&
                 (Sint32)(now - browser_repeat_at) >= 0)
         {
@@ -1601,8 +2205,25 @@ void ac3ds_poll_input()
     }
     else if(touch_held)
     {
+        if(panel == MENU_PANEL && menu_touch.revision &&
+           menu_touch.revision == drawn_menu.revision && loading_percent < 0)
+        {
+            post_menu_touch(menu_touch.revision, menu_touch.target.index, menu_touch.target.action);
+        }
+        cancel_menu_touch();
+        if(server_join_touch.id && panel == SERVER_PANEL && server_join_touch.context == button_context && loading_percent < 0)
+            post_server_join(server_join_touch.context, server_join_touch.id);
+        cancel_server_join();
         double_tap.up(now);
-        if(touch_key && touch_key_context == button_context) push_key(touch_key, false, false, touch_key_context);
+        if(touch_key && touch_key_context == button_context)
+        {
+            if(touch_key != KEYCODE_SCOPE) push_key(touch_key, false, false, touch_key_context);
+            else if(panel == GAME_PANEL && scope_visible() && ac3ds_can_toggle_scope())
+            {
+                push_key(touch_key, true, false, touch_key_context);
+                push_key(touch_key, false, false, touch_key_context);
+            }
+        }
         // One-shot drawer actions close the drawer once used (SCORES is held).
         if(drawer_open && touch_key && touch_key != KEYCODE_SCORES) drawer_open = false;
         if(pressed_hud_code) { pressed_hud_code = 0; controls_dirty = true; }
@@ -1659,68 +2280,63 @@ void ac3ds_draw_controls()
                           player1 && player1->isspectating() ? keym::ACTION_SPECTATOR : keym::ACTION_DEFAULT;
     Ac3dsMenuView menu;
     if(panel == MENU_PANEL) ac3ds_menu_view(menu);
+    // Change key: what the picture depends on besides the moving map. The
+    // match screen shows no weapon or ammo text, so neither is in it and a
+    // shot does not force a redraw.
     string status = "";
-    if(panel == GAME_PANEL && player1)
+    ServerCard server_card;
+    if(panel == SERVER_PANEL)
     {
-        extern int paused;
-        if(watchingdemo) copystring(status, "Demo playback");
-        else if(paused) copystring(status, "Match paused");
-        else if(player1->isspectating()) copystring(status, "Spectating");
-        else if(player1->state == CS_ALIVE && player1->weaponsel)
-        {
-            const weapon &gun = *player1->weaponsel;
-            const bool reloading = gun.reloading && lastmillis < gun.reloading + gun.info.reloadtime;
-            if(reloadable_gun(gun.type))
-                formatstring(status)("%s  %s%d/%d", gun.info.title, reloading ? "Reloading  " : "", gun.mag, gun.ammo);
-            else if(gun.type == GUN_GRENADE) formatstring(status)("%s  %d", gun.info.title, gun.mag);
-            else copystring(status, gun.info.title);
-        }
-        else copystring(status, "Match");
+        server_card.menu = ac3ds_menu_identity();
+        const unsigned pending = server_join_touch.id;
+        const Ac3dsServerList list = ac3ds_server_window(server_card.menu, &server_card.row, 1, pending);
+        server_card.count = list.count;
+        server_card.selected = list.selected >= 0;
+        if(pending && (!server_card.selected || server_card.row.id != pending)) cancel_server_join();
+        server_card.pressed = server_join_touch.id ? SDLK_RETURN : touch_key;
     }
-
-    if(panel == SERVER_PANEL) server_panel_status(status, sizeof(status));
-    // Button enable states are part of the match screen's look.
     if(panel == GAME_PANEL)
     {
-        concatstring(status, "|");
         for(const HudButton &b : hud_buttons)
             concatstring(status, hud_button_enabled(b.code) ? (pressed_hud_code == b.code ? "P" : "1") : "0");
         concatstring(status, reloading_now() ? "R" : "");
+        if(scope_visible())
+            concatstring(status, !ac3ds_can_toggle_scope() ? "s" : ac3ds_scope_latched() ? "Z" : "S");
         concatstring(status, vote_pending() ? (vote_armed() ? "V" : "v") : "");
         concatstring(status, map_overview ? "M" : "");
-        defformatstring(drawer)("D%d%d", drawer_open ? 1 : 0, pressed_hud_code);
-        concatstring(status, drawer);
+        // The respawn countdown itself rides on the ten-a-second map refresh.
+        defformatstring(state)("D%d%dS%d", drawer_open ? 1 : 0, pressed_hud_code, respawn_state());
+        concatstring(status, state);
     }
     const bool unchanged = !controls_dirty && drawn_panel == panel && drawn_bind_type == bind_type &&
        drawn_touch_aim == touchaim && !strcmp(status, drawn_status) &&
-       (panel != MENU_PANEL || same_menu_view(menu, drawn_menu));
+       (panel != MENU_PANEL || same_menu_view(menu, drawn_menu)) &&
+       (panel != SERVER_PANEL || server_card == drawn_server_card);
     const u64 now_tick = svcGetSystemTick();
-    if(unchanged)
-    {
-        // The map moves: refresh it ten times a second, every frame while the
-        // drawer slides.
-        if(panel != GAME_PANEL) return;
-        const bool sliding = animate_drawer();
-        if(!sliding && now_tick - radar_drawn_tick < SYSCLOCK_ARM11 / 10) return;
-        u16 *screen = reinterpret_cast<u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
-        if(!screen) return;
-        draw_match_screen(screen);
-        radar_drawn_tick = now_tick;
-        GSPGPU_FlushDataCache(screen, touch_width * touch_height * sizeof(*screen));
+    // An unchanged menu keeps its picture. The map moves: refresh it ten times
+    // a second, every frame while the drawer slides.
+    if(unchanged && (panel != GAME_PANEL || (!drawer_moving() && now_tick - radar_drawn_tick < SYSCLOCK_ARM11 / 10)))
         return;
-    }
-    u16 *screen = reinterpret_cast<u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
+    // Nothing is recorded as drawn until the picture is presented, so a frame
+    // skipped here (the last swap has not reached the LCD) is retried on the
+    // next one with the same dirty state.
+    u16 *screen = bottom_begin();
     if(!screen) return;
-    fill_rect(screen, 0, 0, touch_width, touch_height, background);
 
-    if(panel == MENU_PANEL) draw_handheld_menu(screen, menu);
+    // The match screen's map covers every pixel, so it needs no clear.
+    if(panel != GAME_PANEL) fill_rect(screen, 0, 0, touch_width, touch_height, background);
+
+    if(panel == MENU_PANEL)
+    {
+        if(menu.weapon_picker) draw_weapon_picker(screen, menu);
+        else draw_handheld_menu(screen, menu);
+    }
     else if(panel == GAME_PANEL)
     {
         animate_drawer();
         draw_match_screen(screen);
-        radar_drawn_tick = now_tick;
     }
-    else if(panel == SERVER_PANEL) draw_server_panel(screen);
+    else if(panel == SERVER_PANEL) draw_server_panel(screen, server_card);
     else
     {
         const char *title = panel == GAME_PANEL ? "Match controls" :
@@ -1777,8 +2393,15 @@ void ac3ds_draw_controls()
                             cell_width - 3, cell_height - 3, label);
             }
     }
-    controls_dirty = R_FAILED(GSPGPU_FlushDataCache(screen, touch_width * touch_height * sizeof(*screen)));
+    if(!bottom_present(screen))
+    {
+        controls_dirty = true;
+        return;
+    }
+    controls_dirty = false;
+    if(panel == GAME_PANEL) radar_drawn_tick = now_tick;
     drawn_panel = panel;
+    if(panel == SERVER_PANEL) drawn_server_card = server_card;
     drawn_bind_type = bind_type;
     drawn_menu = menu;
     drawn_touch_aim = touchaim;
@@ -1793,14 +2416,14 @@ void ac3ds_controls_changed()
 void ac3ds_draw_server_controls()
 {
     dedicated_display = true;
-    u16 *screen = reinterpret_cast<u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
+    u16 *screen = bottom_begin(true);
     if(!screen) return;
     fill_rect(screen, 0, 0, touch_width, touch_height, RGB565(2, 5, 3));
     fill_rect(screen, 0, 0, touch_width, 26, RGB565(4, 13, 7));
     draw_label(screen, 12, 9, "ASSAULTCUBE", RGB565(25, 60, 19));
     draw_label(screen, 12, 51, "Dedicated server", RGB565(29, 58, 29));
     draw_label(screen, 12, 79, "Press B or START to stop.", RGB565(20, 42, 21));
-    GSPGPU_FlushDataCache(screen, touch_width * touch_height * sizeof(*screen));
+    bottom_present(screen);
 }
 
 
@@ -1810,6 +2433,11 @@ void ac3ds_loading_screen(const char *title, const char *stage, float progress)
     // and the main thread are busy loading.
     if(dedicated_display) return;
     if(!title && !loading_title[0]) return; // progress outside a load (e.g. a model loaded mid-match)
+    if(loading_percent < 0)
+    {
+        cancel_menu_touch();
+        cancel_server_join();
+    }
     const bool newtitle = title && strcmp(title, loading_title);
     if(newtitle && strcmp(title, "Starting up") && strcmp(title, "Applying settings"))
         minimap_valid = false; // a new map: the old minimap no longer matches
@@ -1819,11 +2447,15 @@ void ac3ds_loading_screen(const char *title, const char *stage, float progress)
     const u64 now = svcGetSystemTick();
     if(!changed && percent == loading_percent) return;
     if(!changed && now - loading_drawn_tick < SYSCLOCK_ARM11 / 30) return; // at most 30 redraws a second
+    // A new title or stage waits out a swap still on its way to the LCD. A
+    // progress step does not hold up the load: it is dropped, with nothing
+    // recorded, and the next step draws.
+    u16 *screen = bottom_begin(changed);
+    if(!screen && !changed) return;
     if(title) copystring(loading_title, title, sizeof(loading_title));
     if(stage) copystring(loading_stage, stage, sizeof(loading_stage));
     loading_percent = percent;
     loading_drawn_tick = now;
-    u16 *screen = reinterpret_cast<u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
     if(!screen) return;
     fill_rect(screen, 0, 0, touch_width, touch_height, background);
     fill_rect(screen, 0, 0, touch_width, 34, surface);
@@ -1841,7 +2473,7 @@ void ac3ds_loading_screen(const char *title, const char *stage, float progress)
     snprintf(pct, sizeof(pct), "%d%%", percent);
     draw_label(screen, x1 - 8 * int(strlen(pct)), 148, pct, muted);
     draw_label(screen, 16, 212, "The first load of a map takes longest.", muted);
-    GSPGPU_FlushDataCache(screen, touch_width * touch_height * sizeof(*screen));
+    bottom_present(screen);
     // QA: capture one loading frame when sdmc:/3ds/assaultcube/qa-loadshot exists.
     static int qaload = -1;
     if(qaload < 0) { struct stat st; qaload = stat("sdmc:/3ds/assaultcube/qa-loadshot", &st) == 0; }
@@ -1856,10 +2488,13 @@ void ac3ds_loading_screen(const char *title, const char *stage, float progress)
 bool ac3ds_save_bottom_screen(const char *path)
 {
     // The lower framebuffer is RGB565, stored as 320 columns of 240 pixels
-    // bottom-to-top. Writes a 24-bit BMP for QA captures.
-    const u16 *screen = reinterpret_cast<const u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
+    // bottom-to-top. Writes a 24-bit BMP for QA captures. The picture saved is
+    // the one last presented, which is the one on the LCD (or about to be, at
+    // the next VBlank); the other buffer holds the picture before it.
+    const u16 *screen = bottom_shown;
     FILE *f = screen ? fopen(path, "wb") : NULL;
     if(!f) return false;
+    clientlogf("lower screen: capturing buffer %08x, present %u", unsigned(uintptr_t(screen)), bottom_presents);
     const int w = touch_width, h = touch_height, row = w * 3, size = 54 + row * h;
     u8 header[54] = { 'B', 'M' };
     auto put32 = [&](int at, u32 v) { for(int i = 0; i < 4; ++i) header[at + i] = u8(v >> (8 * i)); };
@@ -1890,18 +2525,79 @@ void ac3ds_loading_done()
 
 void ac3ds_show_startup_report(const char *const *lines, int count)
 {
-    // Software-drawn, so it stays readable when the GPU path has stopped.
-    u16 *screen = reinterpret_cast<u16 *>(gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, NULL, NULL));
+    // Software-drawn, so it stays readable when the GPU path has stopped. It
+    // is shown when something has already gone wrong, so it does not count on
+    // the swap being applied: the report goes into both buffers. The second
+    // copy lands in the one the swap took off the LCD or, if the swap never
+    // happens, in the one still on it.
+    for(int pass = 0; pass < 2; ++pass)
+    {
+        u16 *screen = bottom_begin(true);
+        if(!screen) break;
+        fill_rect(screen, 0, 0, touch_width, touch_height, background);
+        fill_rect(screen, 0, 0, touch_width, 29, surface);
+        fill_rect(screen, 0, 28, touch_width, 29, border);
+        draw_label(screen, 10, 10, "AssaultCube startup check", text);
+        for(int i = 0; i < count && i < 16; ++i)
+            draw_label(screen, 6, 38 + i * 12, lines[i], i ? muted : accent);
+        if(pass) GSPGPU_FlushDataCache(screen, bottom_bytes);
+        else bottom_present(screen, true);
+    }
+    controls_dirty = true;
+}
+
+#ifdef AC3DS_FIRSTRUN
+void ac3ds_text_page(const Ac3dsTextPage &page)
+{
+    // Software-drawn with the console font, like the startup report: usable
+    // before any game data exists.
+    u16 *screen = bottom_begin(true);
     if(!screen) return;
     fill_rect(screen, 0, 0, touch_width, touch_height, background);
     fill_rect(screen, 0, 0, touch_width, 29, surface);
     fill_rect(screen, 0, 28, touch_width, 29, border);
-    draw_label(screen, 10, 10, "AssaultCube startup check", text);
-    for(int i = 0; i < count && i < 16; ++i)
-        draw_label(screen, 6, 38 + i * 12, lines[i], i ? muted : accent);
-    GSPGPU_FlushDataCache(screen, touch_width * touch_height * sizeof(*screen));
-    controls_dirty = true;
+    draw_label(screen, 10, 10, page.title, text);
+    for(int i = 0; i < page.count && i < Ac3dsTextPage::max_lines; ++i)
+    {
+        const char *line = page.lines[i];
+        // A full 40-column line (a web address) starts at the screen edge.
+        draw_label(screen, strlen(line) > 39 ? 0 : 8, 38 + i * 12, line, page.bright & (1u << i) ? text : muted);
+    }
+    if(page.percent >= 0)
+    {
+        const int x0 = 8, x1 = touch_width - 8, y0 = 180, y1 = 194, percent = min(100, page.percent);
+        fill_rect(screen, x0, y0, x1, y1, border);
+        fill_rect(screen, x0 + 2, y0 + 2, x1 - 2, y1 - 2, background);
+        fill_rect(screen, x0 + 2, y0 + 2, x0 + 2 + (x1 - x0 - 4) * percent / 100, y1 - 2, accent);
+    }
+    if(page.footer)
+    {
+        fill_rect(screen, 0, 212, touch_width, touch_height, surface);
+        fill_rect(screen, 0, 212, touch_width, 213, border);
+        draw_label(screen, 8, 222, page.footer, accent);
+    }
+    bottom_present(screen, true);
 }
+
+void ac3ds_blank_top_screen()
+{
+    // Nothing draws the upper screen until the renderer starts; without this
+    // it would show whatever the memory held. Both buffers, so the picture is
+    // black whichever one the LCD takes.
+    if(!gfx_ready) return;
+    for(int pass = 0; pass < 2; ++pass)
+    {
+        u16 width = 0, height = 0;
+        u8 *top = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &width, &height);
+        if(!top) return;
+        const size_t bytes = size_t(width) * height * 3; // BGR8
+        memset(top, 0, bytes);
+        GSPGPU_FlushDataCache(top, bytes);
+        gfxScreenSwapBuffers(GFX_TOP, false);
+        gspWaitForVBlank();
+    }
+}
+#endif
 
 int ac3ds_set_brightness(int percent)
 {
@@ -1920,7 +2616,39 @@ bool ac3ds_install_config(const char *basename, stream *config)
 {
     long size = config->size();
     if(size <= 0 || size > max_config_size) return false;
-    filerotate(basename, "cfg", CONFIGROTATEMAX, NULL, true);
     defformatstring(path)("%s.cfg", basename);
-    return installfile3ds(path, config, max_config_size);
+
+    // Settings are saved on every HOME press, lid close and exit. Rotating the
+    // five backups and rewriting the file costs about twenty SD directory
+    // operations per file, so skip all of it when the text is unchanged. The
+    // first save of a session compares against the file on the card.
+    struct Written { const char *name; bool known; long size; uLong crc; };
+    static Written written[] = { { "config/init", false, 0, 0 }, { "config/saved", false, 0, 0 } };
+    Written *slot = NULL;
+    for(Written &w : written) if(!strcmp(w.name, basename)) slot = &w;
+    uchar chunk[1024];
+    uLong crc = crc32(0, Z_NULL, 0);
+    if(slot && config->seek(0, SEEK_SET))
+    {
+        for(int n; (n = config->read(chunk, sizeof(chunk))) > 0;) crc = crc32(crc, chunk, n);
+        if(!slot->known)
+        {
+            if(FILE *current = fopen(findfile(path, "wb"), "rb"))
+            {
+                uLong disk = crc32(0, Z_NULL, 0);
+                long length = 0;
+                for(size_t n; (n = fread(chunk, 1, sizeof(chunk), current)) > 0; length += long(n))
+                    disk = crc32(disk, chunk, uInt(n));
+                const bool complete = !ferror(current);
+                fclose(current);
+                if(complete) { slot->known = true; slot->size = length; slot->crc = disk; }
+            }
+        }
+        if(slot->known && slot->size == size && slot->crc == crc) return true;
+    }
+
+    filerotate(basename, "cfg", CONFIGROTATEMAX, NULL, true);
+    const bool installed = installfile3ds(path, config, max_config_size);
+    if(slot) { slot->known = installed; slot->size = size; slot->crc = crc; }
+    return installed;
 }

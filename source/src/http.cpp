@@ -6,9 +6,92 @@
 #define CR 13
 #define LF 10
 #define TCP_TIMEOUT 5678      // only re-use quite fresh connections
-#define GETERROR(msg) { err = msg; goto geterror; }
+#define GETERROR(msg) do { err = msg; goto geterror; } while(0)
 
 const char lfcrlf[] = { LF, CR, LF, 0x00 }, *crlf = lfcrlf + 1;
+
+static bool parsecontentlength(const char *header, int &length)
+{
+    length = -1;
+    const char *line = strchr(header, LF);
+    while(line && *++line)
+    {
+        const char *end = strchr(line, LF);
+        if(!end || end == line || (end == line + 1 && *line == CR)) break;
+        const char field[] = "Content-Length:";
+        if(end - line >= int(sizeof(field) - 1) && !strncasecmp(line, field, sizeof(field) - 1))
+        {
+            const char *p = line + sizeof(field) - 1;
+            while(p < end && (*p == ' ' || *p == '\t')) ++p;
+            if(p == end || *p < '0' || *p > '9') return false;
+            int value = 0;
+            while(p < end && *p >= '0' && *p <= '9')
+            {
+                const int digit = *p++ - '0';
+                if(value > (INT_MAX - digit) / 10) return false;
+                value = value * 10 + digit;
+            }
+            while(p < end && (*p == ' ' || *p == '\t')) ++p;
+            if(p != end && !(p == end - 1 && *p == CR)) return false;
+            if(length >= 0 && length != value) return false;
+            length = value;
+        }
+        line = end;
+    }
+    return true;
+}
+
+// raw contains a complete or partial chunk, without a string terminator.
+// A zero-size chunk is followed by optional trailers and a final empty line.
+static int consumehttpchunks(vector<char> &raw, vector<char> &body, int limit, bool &trailing)
+{
+    while(raw.length())
+    {
+        const char *line = raw.getbuf();
+        const char *lf = static_cast<const char *>(memchr(line, LF, raw.length()));
+        if(!lf) break;
+        const char *end = lf - (lf > line && lf[-1] == CR ? 1 : 0);
+        const int head = lf + 1 - line;
+        if(trailing)
+        {
+            if(end == line) return 1;
+            raw.remove(0, head);
+            continue;
+        }
+
+        int size = 0;
+        const char *p = line;
+        for(; p < end && *p != ';'; ++p)
+        {
+            const int c = static_cast<unsigned char>(*p);
+            const int lower = c | 32;
+            const int digit = c >= '0' && c <= '9' ? c - '0' : lower >= 'a' && lower <= 'f' ? lower - 'a' + 10 : -1;
+            if(digit < 0 || size > (INT_MAX - digit) / 16) return -1;
+            size = size * 16 + digit;
+        }
+        if(p == line || size > limit - body.length()) return -1;
+        if(!size)
+        {
+            trailing = true;
+            raw.remove(0, head);
+            continue;
+        }
+        const int available = raw.length() - head;
+        if(size >= available) break;
+        const char *tail = line + head + size;
+        int footer = 1;
+        if(*tail == CR)
+        {
+            if(available - size < 2) break;
+            ++tail;
+            ++footer;
+        }
+        if(*tail != LF) return -1;
+        body.put(line + head, size);
+        raw.remove(0, head + size + footer);
+    }
+    return 0;
+}
 
 void httpget::reset(int keep) // keep == 0: delete all, keep == 1: keep connection, keep == 2: keep connection and url
 {
@@ -31,7 +114,7 @@ void httpget::reset(int keep) // keep == 0: delete all, keep == 1: keep connecti
     datarec.setsize(0);
 }
 
-bool httpget::set_host(const char *newhostname) // set and resolve host
+bool httpget::set_host(const char *newhostname, enet_uint32 knownip) // set host; resolve it unless the caller already has its address
 {
     if(!hostname || strcmp(hostname, newhostname))
     {
@@ -39,10 +122,34 @@ bool httpget::set_host(const char *newhostname) // set and resolve host
         disconnect(); // new or different host name -> close connection (if still open)
 
         ENetAddress newhost;
-        if(enet_address_set_host(&newhost, newhostname) < 0)
+        if(knownip) newhost.host = knownip;
+        else
         {
-            err = "failed to resolve hostname";
-            return false;
+            bool resolved;
+#ifdef __3DS__
+            if(service_dns)
+            {
+                void *lookup = enet_3ds_resolve_begin(newhostname);
+                if(!lookup) { err = "DNS lookup worker unavailable"; return false; }
+                stopwatch watch;
+                watch.start();
+                int state;
+                while((state = enet_3ds_resolve_poll(lookup, &newhost, 50)) > 0)
+                {
+                    const uint elapsed = watch.elapsed();
+                    if(execcallback(-float(elapsed) / (connecttimeout | 1)) || elapsed >= uint(connecttimeout))
+                    {
+                        enet_3ds_resolve_abandon(lookup);
+                        if(elapsed >= uint(connecttimeout)) err = "DNS lookup timed out";
+                        return false;
+                    }
+                }
+                resolved = state == 0;
+            }
+            else
+#endif
+                resolved = enet_address_set_host(&newhost, newhostname) == 0;
+            if(!resolved) { err = "failed to resolve hostname"; return false; }
         }
         ip.host = newhost.host;
         hostname = newstring(newhostname);
@@ -172,6 +279,7 @@ int httpget::get(const char *url1, uint timeout, uint totaltimeout, int range, b
 {
     int redirects = 0, res = 0, transferred = 0;
     vector<char> *content = NULL;
+    vector<char> decoded;
     ASSERT(timeout && totaltimeout); // zero is not allowed
     stopwatch to;
     to.start();
@@ -182,6 +290,7 @@ int httpget::get(const char *url1, uint timeout, uint totaltimeout, int range, b
     bool reconnected = false, retry = false;
     for(;;)
     { // (in a loop because of possible redirects)
+        if(execcallback(0)) goto geterror;
         if(!connect()) goto geterror;
 
         // assemble GET request
@@ -195,7 +304,6 @@ int httpget::get(const char *url1, uint timeout, uint totaltimeout, int range, b
         cvecprintf(rawsnd, "%s", crlf);
 
         // send request
-        execcallback(0);
         ENetBuffer buf;
         buf.data = rawsnd.getbuf();
         buf.dataLength = rawsnd.length();
@@ -226,14 +334,15 @@ int httpget::get(const char *url1, uint timeout, uint totaltimeout, int range, b
         }
 
         // get response
-        bool again = false, haveheader = false;
+        bool again = false, haveheader = false, trailing = false;
+        int declared = -1;
         if(!retry) for(;;)
         {
             elapsedtime = to.elapsed();
             if(elapsedtime > totaltimeout || elapsedtime > lastresponse + timeout) GETERROR(elapsedtime > totaltimeout ? "timeout 2" : "timeout 3");
             float progress = -float(elapsedtime - lastresponse) / timeout;
             enet_uint32 events = ENET_SOCKET_WAIT_RECEIVE;
-            if(rawrec.length() > maxsize || datarec.length() > maxsize) break;
+            if(rawrec.length() > maxsize || datarec.length() > maxsize) GETERROR("response exceeds size limit");
             if(enet_socket_wait(tcp, &events, 250) >= 0 && events)
             {
                 if(rawrec.length() >= rawrec.capacity()) rawrec.reserve(4096);
@@ -243,6 +352,9 @@ int httpget::get(const char *url1, uint timeout, uint totaltimeout, int range, b
                 if(recv <= 0)
                 {
                     if(!haveheader && !reconnected) retry = true; // line may be half dead - retry once
+                    else if(recv < 0 || !haveheader || declared >= 0 || chunked) GETERROR("incomplete HTTP response");
+                    else content = &rawrec; // a close-delimited response ended normally
+                    disconnect();
                     break;
                 }
                 rawrec.advance(recv);
@@ -266,13 +378,13 @@ int httpget::get(const char *url1, uint timeout, uint totaltimeout, int range, b
                         haveheader = true;
 
                         // parse header
-                        char *header_uc = filtertext(newstring(headlen), header, FTXT_TOUPPER, headlen);
                         char *p = strstr(header, "HTTP/");
                         if(p) p = strchr(p, ' ');
                         response = p ? atoi(p + 1) : -1;
                         if(p) p = strchr(p, '\n');
                         if(!p) GETERROR("server error"); // header frame error
-                        if(response >= 300 && response < 308) // handle redirects
+                        char *header_uc = filtertext(newstring(headlen), header, FTXT_TOUPPER, headlen);
+                        if(response == 301 || response == 302 || response == 303 || response == 307 || response == 308)
                         {
                             p = strstr(header_uc + (p - header), "LOCATION: ");
                             if(p) p = header + (p - header_uc);
@@ -288,6 +400,7 @@ int httpget::get(const char *url1, uint timeout, uint totaltimeout, int range, b
                                 *r = '\0';
                                 again = set_host(p);
                                 *r = '/';
+                                if(!again) goto geterror;
                                 p = r + strcspn(r, " \n\r");
                                 *p = '\0';
                                 const char *nurl = newstring(r);
@@ -305,48 +418,41 @@ int httpget::get(const char *url1, uint timeout, uint totaltimeout, int range, b
                             if((f = strstr(f, "GZIP")) && f < n) gzipped = 1; // untested: I could not find a server who delivers that
                         }
                         if((f = strstr(u, "CONTENT-ENCODING: ")) && (n = strchr(f, LF)) && (f = strstr(f, "GZIP")) && f < n) gzipped = 1;
-                        if((f = strstr(u, "CONTENT-LENGTH: ")) && (f = strchr(f, ' '))) contentlength = atoi(f + 1);
                         if((f = strstr(u, "CONTENT-RANGE: ")) && (n = strchr(f, LF)) && (f = strstr(f, "BYTES ")) && (f = strchr(f, ' ')) && f < n) offset = atoi(f + 1);
                         DELSTRING(header_uc);
-                    }
-                }
-                if(haveheader)
-                { // check if data is complete
-                    const char *d = rawrec.getbuf(), *e = d;
-                    if(chunked)
-                    { // n * "chunksize\r\nchunkdata\r\n" + "0\r\n\r\n"
-                        while(strchr(d, LF))
+                        if(!parsecontentlength(header, declared)) GETERROR("invalid Content-Length");
+                        contentlength = max(declared, 0);
+                        if(head || response == 204 || response == 304)
                         {
-                            int chunklen = (int) strtol(d, (char**) &e, 16);
-                            if(*e == CR) e++;
-                            if(*e == LF && rawrec.length() >= chunklen + (e - d) + 2 && (e[chunklen + 1] == LF || (e[chunklen + 1] == CR && e[chunklen + 2] == LF)))
-                            { // chunk is fully in buffer
-                                e++;
-                                loopi(chunklen) datarec.add(*e++);
-                                if(*e == CR) e++;
-                                if(*e++ != LF) GETERROR("chunk frame error");
-                                rawrec.remove(0, int(e - d));
-                                if(chunklen == 0)
-                                {
-                                    contentlength = datarec.length();
-                                    content = &datarec;
-                                }
-                            }
-                            else break;
+                            if(rawrec.length() > 1) disconnect(); // unexpected body on a header-only response
+                            goto geterror;
                         }
-                        progress = float(datarec.length()) / (maxtransfer | 1); // not accurate, but moving
-                    }
-                    else
-                    {
-                        if(contentlength > 0)
-                        {
-                            progress = float(rawrec.length() - 1) / contentlength; // get a real progress bar
-                            if(rawrec.length() - 1 >= contentlength) content = &rawrec;
-                        }
-                        else progress = float(rawrec.length() - 1) / (maxtransfer | 1); // not accurate, but moving
+                        if(chunked && declared >= 0) GETERROR("ambiguous HTTP response length");
+                        if(declared > maxtransfer || declared > maxsize) GETERROR("response exceeds size limit");
                     }
                 }
                 rawrec.drop();
+                if(haveheader)
+                { // check if data is complete
+                    if(chunked)
+                    {
+                        const int state = consumehttpchunks(rawrec, datarec, maxsize, trailing);
+                        if(state < 0) GETERROR("chunk frame error");
+                        if(state > 0) { contentlength = datarec.length(); content = &datarec; }
+                        progress = float(datarec.length()) / (maxtransfer | 1); // not accurate, but moving
+                    }
+                    else if(declared >= 0)
+                    {
+                        if(rawrec.length() >= declared)
+                        {
+                            if(rawrec.length() > declared) disconnect();
+                            rawrec.setsize(declared);
+                            content = &rawrec;
+                        }
+                        progress = declared ? float(rawrec.length()) / declared : 1.0f;
+                    }
+                    else progress = float(rawrec.length()) / (maxtransfer | 1); // not accurate, but moving
+                }
             }
             if(execcallback(progress)) goto geterror; // show progress bar, check for user interrupt
             if(content || (haveheader && head)) break;
@@ -361,45 +467,39 @@ int httpget::get(const char *url1, uint timeout, uint totaltimeout, int range, b
         if(again) continue; // redirect
         else break;
     }
-    if(!content) content = &rawrec; // end by "server close connection" - this should maybe be flagged as error instead
+    if(!content) GETERROR("incomplete HTTP response");
     if(gzipped)
     {
         z_stream zs;
         memset((void *)&zs, 0, sizeof(zs));
-        if(inflateInit2(&zs, 15 + 32) == Z_OK)
+        if(inflateInit2(&zs, 15 + 32) != Z_OK) GETERROR("gunzip initialization failed");
+        zs.next_in = (Bytef*)content->getbuf();
+        zs.avail_in = content->length();
+        uchar outbuf[1<<15];
+        int zstat;
+        do
         {
-            zs.next_in = (Bytef*)content->getbuf();
-            zs.avail_in = content->length();
-            uchar outbuf[1<<15];
-            int zstat;
-            do
+            zs.next_out = (Bytef*)outbuf;
+            zs.avail_out = sizeof(outbuf);
+            zstat = inflate(&zs, Z_NO_FLUSH);
+            int got = sizeof(outbuf) - zs.avail_out;
+            if(got > maxsize - decoded.length())
             {
-                zs.next_out = (Bytef*)outbuf;
-                zs.avail_out = sizeof(outbuf);
-                zstat = inflate(&zs, Z_NO_FLUSH);
-                if(zstat == Z_OK || zstat == Z_STREAM_END)
-                {
-                    int got = sizeof(outbuf) - zs.avail_out;
-                    if(got > 0)
-                    {
-                        res += got;
-                        if(outvec) loopi(got) outvec->add(outbuf[i]);
-                        if(outstream) outstream->write(outbuf, got);
-                    }
-                }
-                else GETERROR("gunzip error");
-                if(res > maxsize) break;
+                inflateEnd(&zs);
+                GETERROR("output exceeds size limit");
             }
-            while(zstat == Z_OK);
-            inflateEnd(&zs);
+            if(got) decoded.put(reinterpret_cast<const char *>(outbuf), got);
+            if(zstat == Z_STREAM_END && zs.avail_in) zstat = inflateReset(&zs); // another gzip member
         }
+        while(zstat == Z_OK);
+        inflateEnd(&zs);
+        if(zstat != Z_STREAM_END) GETERROR("incomplete or invalid gzip response");
+        content = &decoded;
     }
-    else
-    {
-        res = content->length();
-        if(outvec) outvec->insert(outvec->length(), (const uchar *)content->getbuf(), res);
-        if(outstream) outstream->write(content->getbuf(), res);
-    }
+    res = content->length();
+    if(res > maxsize) GETERROR("output exceeds size limit");
+    if(res && outstream && outstream->write(content->getbuf(), res) != res) GETERROR("could not store response");
+    if(res && outvec) outvec->insert(outvec->length(), (const uchar *)content->getbuf(), res);
 
 geterror:
     if(res > maxsize) err = "output truncated";

@@ -671,7 +671,25 @@ void setupworld(int factor)
     ssize = 1<<(sfactor = factor);
     cubicsize = ssize*ssize;
     mipsize = cubicsize*134/100;
+#ifdef __3DS__
+    // One buffer for the life of the process, grown to the largest map seen
+    // and never returned (callers do not delete world on 3DS). A 512-square
+    // map needs 5.6 MB in one piece; asking the heap for that again after
+    // smaller maps had split the old block is what ran it out of room.
+    static sqr *storage = NULL;
+    static int capacity = 0;
+    if(mipsize > capacity)
+    {
+        delete[] storage;
+        storage = NULL;
+        capacity = 0;
+        storage = new sqr[mipsize];
+        capacity = mipsize;
+    }
+    sqr *w = world = storage;
+#else
     sqr *w = world = new sqr[mipsize];
+#endif
     memset(world, 0, mipsize*sizeof(sqr));
     loopi(LARGEST_FACTOR*2) { wmip[i] = w; w += cubicsize>>(i*2); }
 }
@@ -716,14 +734,16 @@ bool empty_world(int factor, bool force)    // main empty world creation routine
     bool copy = false;
     if(world && factor<0) { factor = sfactor + (factor == -2 ? -1 : 1); copy = true; }
     if(factor<SMALLEST_FACTOR) factor = SMALLEST_FACTOR;
-    if(factor>LARGEST_FACTOR) factor = LARGEST_FACTOR;
+    if(factor>CLIENTMAXMAPFACTOR) factor = CLIENTMAXMAPFACTOR;
     if(copy && oldfactor == factor) return false;
     bool shrink = factor < oldfactor;
     bool clearmap = !copy && world;
     if(clearmap && unsavededits) { xmapbackup("newmap", ""); unsavededits = 0; }
     if(copy) ow = blockcopy(shrink ? bs : be);
 
-    DELETEA(world);
+#ifndef __3DS__
+    DELETEA(world); // on 3DS setupworld() owns one persistent buffer
+#endif
 
     setupworld(factor);
     loop(x,ssize) loop(y,ssize)
@@ -806,7 +826,7 @@ void newmap(int *i)
     if(m_botmode) { conoutf("newmap not supported in bot mode"); return; }
     if(empty_world(*i, false))
     {
-        addmsg(SV_NEWMAP, "ri", max(*i, 0));
+        addmsg(SV_NEWMAP, "ri", min(max(*i, 0), CLIENTMAXMAPFACTOR)); // the size this client could build
         exechook(HOOK_SP_MP, "onNewMap", "");
     }
     defformatstring(startmillis)("%d", totalmillis);

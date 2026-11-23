@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; worker-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<title>AC-3DS builder</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+<header>
+  <h1>AC-3DS builder</h1>
+  <p class="lead">Makes the one file that puts AssaultCube on your New Nintendo 3DS, New 3DS XL or New 2DS XL. It joins the official AssaultCube download with the AC-3DS engine.</p>
+  <p class="private"><strong>Nothing is uploaded.</strong> The work happens inside this browser tab, on your own computer. The page loads only its own files and sends nothing anywhere.</p>
+</header>
+
+<noscript><p class="message error">This page needs JavaScript to build the file. Nothing is sent anywhere; the script only runs on your computer.</p></noscript>
+
+<ol class="steps">
+  <li>
+    <h2>Get AssaultCube</h2>
+    <p>Open the <a href="https://assault.cubers.net/download.html" target="_blank" rel="noopener noreferrer">official AssaultCube download page</a> and download the <strong>Linux</strong> package of version 1.3.0.2. The file is named exactly:</p>
+    <p><code class="filename">AssaultCube_v1.3.0.2_LockdownEdition_RC1.tar.bz2</code> <span class="size">(52 MB)</span></p>
+    <p>This is the right file on Windows and macOS too. Do not unpack it. The Windows installer (<code>.exe</code>) and the Mac disk image (<code>.dmg</code>) will not work here. <a href="https://github.com/assaultcube/AC/releases/download/v1.3.0.2/AssaultCube_v1.3.0.2_LockdownEdition_RC1.tar.bz2" target="_blank" rel="noopener noreferrer">Direct link to the same file on AssaultCube's GitHub releases.</a></p>
+  </li>
+
+  <li>
+    <h2>Drop it here</h2>
+    <label class="drop" id="drop" for="picker">
+      <span class="drop-title">Drop the file anywhere on this page</span>
+      <span class="drop-or">or choose it:</span>
+      <input type="file" id="picker" multiple>
+    </label>
+    <dl class="inputs">
+      <dt>Game archive</dt>
+      <dd id="archive-status" class="pending">Not chosen yet.</dd>
+      <dt>AC-3DS engine</dt>
+      <dd id="engine-status" class="pending">Looking for assaultcube.3dsx beside this page…</dd>
+    </dl>
+    <p id="engine-help" hidden>This copy of the page does not have the engine with it. Download the latest <code>AC-3DS0v….zip</code> from the <a href="https://github.com/rzkowskii/AC3DS/releases" target="_blank" rel="noopener noreferrer">AC-3DS releases page</a>, unzip it, and drop its <code>assaultcube.3dsx</code> here as well.</p>
+    <p id="input-message" class="message error" role="alert" hidden></p>
+  </li>
+
+  <li>
+    <h2>Build</h2>
+    <p><button type="button" id="build" disabled>Build assaultcube.3dsx</button></p>
+    <progress id="progress" max="100" value="0" aria-label="Build progress" hidden></progress>
+    <p id="build-status" class="status" role="status" aria-live="polite"></p>
+    <p id="build-message" class="message error" role="alert" hidden></p>
+  </li>
+
+  <li>
+    <h2>Save the file</h2>
+    <p id="save-waiting">The finished file appears here after the build. It is about 64 MB.</p>
+    <p id="save-ready" hidden><a id="save" class="button" download="assaultcube.3dsx">Save assaultcube.3dsx</a> <span id="save-size" class="size"></span></p>
+  </li>
+
+  <li>
+    <h2>Copy it to the SD card</h2>
+    <p>Put the saved file on the console's SD card as:</p>
+    <p><code class="filename">/3ds/assaultcube/assaultcube.3dsx</code></p>
+    <p>Create the <code>assaultcube</code> folder if it is not there, and replace any older <code>assaultcube.3dsx</code>. The right file is the one of about 64 MB; if your browser saved it as <code>assaultcube (1).3dsx</code>, rename it. When a new AC-3DS release comes out, build again with it: copying the release's small file over this one removes the game data. Then start <strong>AC-3DS0</strong> from the Homebrew Launcher. Your settings stay in <code>/3ds/assaultcube/profile/</code>.</p>
+  </li>
+</ol>
+
+<section aria-labelledby="help-title">
+  <h2 id="help-title">Questions</h2>
+  <details>
+    <summary>What do I need on the console?</summary>
+    <p>A New Nintendo 3DS, New 3DS XL or New 2DS XL that can run the Homebrew Launcher (for example with Luma3DS). The original 3DS and 2DS do not have enough memory. Sound needs the file <code>/3ds/dspfirm.cdc</code> on the SD card, which you make once from your own console (Luma3DS: hold L + Down + Select, then Miscellaneous options, Dump DSP firmware). Without it the game still runs, silently.</p>
+  </details>
+  <details>
+    <summary>Can it make a .cia or a .3ds instead?</summary>
+    <p>No. An installable <code>.cia</code> and a <code>.3ds</code> cartridge image keep their data in a signed, hashed container that has to be built with a separate packaging program, which a web page cannot run. A <code>.3dsx</code> with the game data attached does the same job from the Homebrew Launcher and is one file.</p>
+  </details>
+  <details>
+    <summary>It says my file is the wrong one.</summary>
+    <p>The page accepts only the unchanged official file <code>AssaultCube_v1.3.0.2_LockdownEdition_RC1.tar.bz2</code>, 52,071,427 bytes. It checks the file's size and its SHA-256 fingerprint:</p>
+    <p><code class="hash">9b3118e7929253f0114fa06cad8310faab646d177b4660406011152f34086b55</code></p>
+    <p>If your browser unpacked the download or it was cut short, download it again. Other versions of AssaultCube are not supported.</p>
+  </details>
+  <details>
+    <summary>Is anything sent over the internet?</summary>
+    <p>No. The page reads the files you give it in this tab and builds the result in memory. It has no analytics and is blocked by its own security policy from contacting any other site. You can save the page's folder and use it offline.</p>
+  </details>
+  <details>
+    <summary>Can I do this without a browser?</summary>
+    <p>Yes. The AC-3DS repository has <code>scripts/make-3dsx.py</code>, which needs only Python 3 and writes the same file byte for byte:</p>
+    <p><code class="command">python3 make-3dsx.py AssaultCube_v1.3.0.2_LockdownEdition_RC1.tar.bz2 assaultcube.3dsx out/assaultcube.3dsx</code></p>
+  </details>
+</section>
+
+<footer>
+  <p><strong>Keep the built file to yourself.</strong> AssaultCube is the work of Rabid Viper Productions and its contributors. Its maps, textures, models and sounds are covered by the <a href="https://assault.cubers.net/docs/license.html" target="_blank" rel="noopener noreferrer">AssaultCube license</a>, which allows them to be shared only inside the unmodified official package. The file built here contains them, so it is for your own console: do not share or upload it.</p>
+  <p>AC-3DS is a free, unofficial port. It is not affiliated with or endorsed by the AssaultCube team or Nintendo. <a href="https://github.com/rzkowskii/AC3DS" target="_blank" rel="noopener noreferrer">Source and license notices.</a></p>
+</footer>
+</main>
+<script src="bzip2.js"></script>
+<script src="sha256.js"></script>
+<script src="package.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

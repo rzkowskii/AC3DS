@@ -3,8 +3,12 @@
 #include "cube.h"
 #include "bot/bot.h"
 #ifdef __3DS__
+#include "crash_3ds.h"
 #include "performance.h"
+#include "system.h"
 #include "world_batch_3ds.h"
+#include <cerrno>
+#include <sys/stat.h>
 #endif
 
 bool hasTE = false, hasMT = false, hasMDA = false, hasDRE = false, hasstencil = false, hasST2 = false, hasSTW = false, hasSTS = false, hasAF;
@@ -111,6 +115,272 @@ void ac3dsstats()
 }
 COMMAND(ac3dsstats, "");
 
+// Diagnostic: log where the camera is and what the renderer just drew, so a
+// glitch seen on the handheld can be replayed in the emulator with ac3dspose.
+// Bind it together with screenshot to capture both at once.
+static int ac3dsLastWorldVertices = 0;
+void ac3dsmark()
+{
+    extern int ac3dspixelfog, ac3dslineardepth, ac3dsworldcache, minlod, fog;
+    extern bool ocull;
+    extern int lod_factor();
+    extern bool outsidemap(physent *pl);
+    char stats[256];
+    ac3ds_gl_stats(stats, sizeof(stats));
+    clientlogf("AC3DS_MARK map=%s mode=%d pos %.2f %.2f %.2f yaw %.1f pitch %.1f camera=%s state=%d spect=%d outside=%d",
+               getclientmap(), gamemode, camera1->o.x, camera1->o.y, camera1->o.z, camera1->yaw, camera1->pitch,
+               camera1 == player1 ? "player" : "other", int(player1->state), int(player1->spectatemode), outsidemap(camera1) ? 1 : 0);
+    clientlogf("AC3DS_MARK world_vertices=%d lod=%d minlod=%d fog=%d ocull=%d worldcache=%d pixelfog=%d lineardepth=%d online=%d",
+               ac3dsLastWorldVertices, lod_factor(), minlod, fog, ocull ? 1 : 0, ac3dsworldcache, ac3dspixelfog, ac3dslineardepth,
+               multiplayer(NULL) ? 1 : 0);
+    clientlogf("AC3DS_MARK %s", stats);
+    if(clientlogfile) clientlogfile->fflush();
+    conoutf("marked: %.0f %.0f %.0f yaw %.0f pitch %.0f", camera1->o.x, camera1->o.y, camera1->o.z, camera1->yaw, camera1->pitch);
+}
+COMMAND(ac3dsmark, "");
+
+// Benchmark aid: degrees added to the player's yaw every frame (offline
+// only). 2.713 never lands on the same yaw twice, so no view repeats and gets
+// cached: it measures a camera that keeps turning.
+FVAR(ac3dsautoturn, 0, 0, 45);
+// Test aids, offline only: hold forward/back or strafe for the player, as the
+// circle pad would, so a walking view can be captured without input.
+VAR(ac3dsautomove, -1, 0, 1);
+VAR(ac3dsautostrafe, -1, 0, 1);
+// Hold fire, offline only.
+VAR(ac3dsautofire, 0, 0, 1);
+// Extra degrees on every other frame, to turn unevenly as a stylus does.
+FVAR(ac3dsturnjitter, 0, 0, 45);
+// One log line with the diagnostic switches, what the hud gun did and how
+// frames were paced since the last one. Written every 30 s of play and
+// whenever a switch on the Diagnostics menu changes.
+void ac3dsdiag()
+{
+    extern int ac3dsgunfog, ac3dsgunband, ac3dspresentguard, ac3dslatevblank, nosway;
+    uint32_t gl[5];
+    ac3ds_gl_runtime_state(gl);
+    static uint32_t lastwaits = 0;
+    clientlogf("AC3DS_DIAG aim %d sway %d guard %d late %d band %d fog %d | gun jump %d/1000 depth %d/1000 weapon %d %d ms after shot, aim off %.2f deg | %u frames held, %u queue recoveries",
+        ac3dsgunaim, nosway ? 0 : 1, ac3dspresentguard, ac3dslatevblank, ac3dsgunband, ac3dsgunfog,
+        ac3dsGunTrace.jump, ac3dsGunTrace.depth, ac3dsGunTrace.weapon, ac3dsGunTrace.sinceShot, ac3dsGunTrace.aimoff,
+        unsigned(gl[4]-lastwaits), unsigned(ac3ds_gl_queue_recoveries()));
+    lastwaits = gl[4];
+    ac3dsGunTrace = Ac3dsGunTrace();
+}
+COMMAND(ac3dsdiag, "");
+
+// Frame recorder for faults only the handheld shows (the weapon flashing while
+// moving in build 13). "ac3dsgunburst [frames]" counts down three seconds, then
+// keeps the right half of every finished top-screen frame for a short run and
+// writes them to gunburst_N.bin in the profile folder. scripts/decode-gunburst.py
+// turns that into pictures. Compare these pre-transfer pixels with what the
+// LCD showed in the same area during those frames.
+static int ac3dsBurstAt = 0, ac3dsBurstFrames = 0, ac3dsBurstShown = 0;
+void ac3dsgunburst(int *frames)
+{
+    if(ac3dsBurstAt || ac3ds_gl_burst_state() != Ac3dsBurstState::Idle) { conoutf("already recording"); return; }
+    ac3dsBurstFrames = *frames > 0 ? *frames : 16;
+    ac3dsBurstAt = lastmillis + 3000;
+    ac3dsBurstShown = 0;
+}
+COMMAND(ac3dsgunburst, "i");
+
+static const char *savegunburst(const Ac3dsBurstReadout &capture, string &name)
+{
+    Ac3dsPhaseScope phase("gunburst save");
+    loopi(100)
+    {
+        formatstring(name)("gunburst_%d.bin", i);
+        struct stat existing;
+        if(stat(findfile(name, "wb"), &existing) == 0) continue;
+        if(errno != ENOENT) return "file lookup failed";
+        // The frame recorder, not the stream, owns this GPU allocation.
+        int references = 0;
+        stream *data = openmemfile(static_cast<const uchar *>(capture.data), int(capture.bytes), &references);
+        const bool saved = installfile3ds(name, data, int(capture.bytes));
+        delete data;
+        return saved ? NULL : "file write failed";
+    }
+    return "all recording slots are in use";
+}
+
+void ac3dsburstframe()
+{
+    if(ac3dsBurstAt)
+    {
+        const int left = (ac3dsBurstAt - lastmillis + 999) / 1000;
+        if(left > 0)
+        {
+            if(left != ac3dsBurstShown) hudoutf("\f2recording frames in %d - keep moving", ac3dsBurstShown = left);
+            return;
+        }
+        ac3dsBurstAt = 0;
+        const unsigned frames = ac3ds_gl_burst_start(ac3dsBurstFrames);
+        if(!frames) hudoutf("\f3could not allocate memory to record frames");
+        else if(frames != unsigned(ac3dsBurstFrames)) conoutf("recording %u frames (requested %d)", frames, ac3dsBurstFrames);
+        return;
+    }
+    if(ac3ds_gl_burst_state() != Ac3dsBurstState::Ready) return;
+    const Ac3dsBurstReadout capture = ac3ds_gl_burst_data();
+    if(capture.failure) conoutf("AC3DS_BURST %s failed (0x%08x) after %u/%u frames",
+                                 capture.failure, unsigned(capture.result), capture.captured, capture.planned);
+    string name = "";
+    const char *failure = capture.data ? savegunburst(capture, name) : "no readable frames";
+    ac3ds_gl_burst_free();
+    if(failure)
+    {
+        hudoutf("\f3could not save the recorded frames");
+        conoutf("AC3DS_BURST save failed: %s", failure);
+        return;
+    }
+    if(capture.captured < capture.planned) hudoutf("\f2saved %u/%u frames to %s", capture.captured, capture.planned, name);
+    else hudoutf("\f0saved %s", name);
+    conoutf("AC3DS_BURST %s %u bytes (%u/%u frames)", name, capture.bytes, capture.captured, capture.planned);
+}
+
+// Handheld benchmark: one command plays a fixed bot match with a turning
+// camera and profiles each renderer option in turn. Results go to the client
+// log as AC3DS_BENCH / AC3DS_PERF / AC3DS_PHASE / AC3DS_GPU lines (about
+// two and a half minutes). The emulator does not model GPU time; run it on
+// the console. Fog and depth start from, and return to, the current
+// settings, so a startup fallback is respected. Once the player goes online
+// or any map loads that the benchmark did not ask for, the run is cancelled
+// in that frame, the settings are put back and the steps still queued do
+// nothing.
+static bool ac3dsBenchActive = false;
+static int ac3dsBenchDrained = 0; // lastmillis after which no step of an earlier run is still queued
+static int ac3dsBenchLoad = 0;    // ac3ds_load_generation as of the benchmark's own last map load
+static bool ac3dsBenchOwed = false; // a map load the benchmark asked for has yet to happen
+static string ac3dsBenchMap;      // the map of that load
+// Draw as if stencilshadow were 0. Not saved: the benchmark must never leave
+// a changed setting in saved.cfg, whenever the game is suspended or closed.
+VAR(ac3dsnostencilshadow, 0, 0, 1);
+static const char *const ac3dsBenchVars[6] = { "ac3dsnostencilshadow", "ac3dspixelfog", "ac3dslineardepth", "ac3dssharedworldverts", "ac3dsfastvertexoffsets", "ac3dsworldcache" };
+static int ac3dsBenchSaved[6];    // the player's values of those at entry
+
+// Each variant starts from the same base: the player's shadows, fog and depth
+// with the port's default renderer options. At the end everything goes back
+// to what the player had.
+static void ac3dsbenchsettings(bool base)
+{
+    static const int defaults[6] = { 0, 0, 0, 0, 0, 1 };
+    loopi(6) setvar(ac3dsBenchVars[i], base && i >= 3 ? defaults[i] : ac3dsBenchSaved[i], true);
+}
+// Report the variant's profile now, with the frames it has, before anything
+// changes: below about 25 fps the 240 intervals do not fit in a step.
+void ac3ds_report_profile();
+static void ac3dsbenchflush(bool report = true)
+{
+    if(report)
+    {
+        ac3ds_gl_profile_finish();
+        ac3ds_report_profile();
+    }
+    else ac3ds_gl_profile_start(0); // cancelled: another map and mode may be loaded already; drop the take
+    ac3dsTimingPhases = ac3dsTimingPending = false; // a profile with no frames yet reports nothing
+}
+// Online, or a map was loaded that the benchmark did not ask for. Checked
+// every frame, so the player's next game never starts with the camera
+// turning and the bots idle.
+bool ac3dsbenchleft()
+{
+    extern int ac3ds_load_generation;
+    if(!ac3dsBenchActive) return false;
+    if(multiplayer(NULL)) return true;
+    if(ac3dsBenchLoad != ac3ds_load_generation)
+    {
+        if(!ac3dsBenchOwed || strcmp(getclientmap(), ac3dsBenchMap)) return true;
+        ac3dsBenchOwed = false;
+        ac3dsBenchLoad = ac3ds_load_generation;
+    }
+    return false;
+}
+void ac3dsbenchend(const char *how)
+{
+    if(!ac3dsBenchActive) return;
+    ac3dsBenchActive = false;
+    ac3dsbenchflush(!strcmp(how, "done"));
+    ac3dsbenchsettings(false);
+    setfvar("ac3dsautoturn", 0);
+    execute("idlebots 0");
+    conoutf("AC3DS_BENCH %s", how);
+    if(clientlogfile) clientlogfile->fflush();
+}
+COMMANDF(ac3dsbenchstep, "ss", (char *map, char *body)
+{
+    if(!ac3dsBenchActive) return;
+    if(ac3dsbenchleft() || strcmp(getclientmap(), map)) { ac3dsbenchend("cancelled"); return; }
+    execute(body);
+});
+COMMANDF(ac3dsbenchmap, "s", (char *map)
+{
+    if(!ac3dsBenchActive) return;
+    ac3dsBenchOwed = true;
+    copystring(ac3dsBenchMap, map);
+    defformatstring(load)("mode 8; map %s", map);
+    execute(load);
+});
+COMMANDF(ac3dsbenchreset, "", () { if(ac3dsBenchActive) { ac3dsbenchflush(); ac3dsbenchsettings(true); } });
+COMMANDF(ac3dsbenchrun, "s", (char *name)
+{
+    if(!ac3dsBenchActive) return;
+    conoutf("AC3DS_BENCH %s", name);
+    defformatstring(profile)("ac3dsbenchstep %s [ ac3dsprofile 240 ]", getclientmap());
+    addsleep(1500, profile, true);
+});
+COMMANDF(ac3dsbenchdone, "", () { ac3dsbenchend("done"); });
+
+void ac3dsbench()
+{
+    if(multiplayer("ac3dsbench")) return;
+    if(ac3dsBenchActive) { conoutf("a benchmark is already running"); return; }
+    if(lastmillis < ac3dsBenchDrained) { conoutf("the last benchmark needs %d more seconds to wind down", (ac3dsBenchDrained - lastmillis + 999) / 1000); return; }
+    extern int ac3dspixelfog, ac3dslineardepth, ac3dssharedworldverts, ac3dsfastvertexoffsets, ac3dsworldcache, ac3ds_load_generation;
+    const int now[6] = { ac3dsnostencilshadow, ac3dspixelfog, ac3dslineardepth, ac3dssharedworldverts, ac3dsfastvertexoffsets, ac3dsworldcache };
+    loopi(6) ac3dsBenchSaved[i] = now[i];
+    ac3dsBenchActive = true;
+    ac3dsBenchOwed = false;
+    ac3dsBenchLoad = ac3ds_load_generation;
+    ac3dsBenchDrained = lastmillis + 150000;
+    static const char *const script =
+        "closecurmenu; closecurmenu; ac3dsautoturn 0; ac3dsbenchmap ac_douze;"
+        "sleep 14000 [ ac3dsbenchstep ac_douze [ kickallbots; idlebots 1; addnbot 6 random good ] ] 1;"
+        "sleep 16000 [ ac3dsbenchstep ac_douze [ attack ] ] 1;"
+        "sleep 17000 [ ac3dsbenchstep ac_douze [ attack ] ] 1;"
+        "sleep 18000 [ ac3dsbenchstep ac_douze [ ac3dspose 64 64 4.5 0 0; ac3dsautoturn 2.713 ] ] 1;"
+        "sleep 19000 [ ac3dsbenchstep ac_douze [ ac3dsbenchreset; ac3dsbenchrun douze_default ] ] 1;"
+        "sleep 30000 [ ac3dsbenchstep ac_douze [ ac3dsbenchreset; ac3dssharedworldverts 1; ac3dsbenchrun douze_sharedworldverts ] ] 1;"
+        "sleep 41000 [ ac3dsbenchstep ac_douze [ ac3dsbenchreset; ac3dsfastvertexoffsets 1; ac3dsbenchrun douze_fastvertexoffsets ] ] 1;"
+        "sleep 52000 [ ac3dsbenchstep ac_douze [ ac3dsbenchreset; ac3dssharedworldverts 1; ac3dsfastvertexoffsets 1; ac3dsbenchrun douze_shared_and_fast ] ] 1;"
+        "sleep 63000 [ ac3dsbenchstep ac_douze [ ac3dsbenchreset; ac3dsnostencilshadow 1; ac3dsbenchrun douze_no_stencil_shadows ] ] 1;"
+        "sleep 74000 [ ac3dsbenchstep ac_douze [ ac3dsbenchreset; ac3dspixelfog 0; ac3dslineardepth 1; ac3dsbenchrun douze_build11_fog ] ] 1;"
+        "sleep 85000 [ ac3dsbenchstep ac_douze [ ac3dsbenchreset; ac3dsworldcache 0; ac3dsbenchrun douze_no_world_cache ] ] 1;"
+        "sleep 96000 [ ac3dsbenchstep ac_douze [ ac3dsbenchreset; ac3dsautoturn 0; kickallbots; ac3dsbenchmap ac_venison ] ] 1;"
+        "sleep 110000 [ ac3dsbenchstep ac_venison [ kickallbots; idlebots 1; addnbot 8 random good ] ] 1;"
+        "sleep 112000 [ ac3dsbenchstep ac_venison [ attack ] ] 1;"
+        "sleep 113000 [ ac3dsbenchstep ac_venison [ attack ] ] 1;"
+        "sleep 114000 [ ac3dsbenchstep ac_venison [ ac3dspose 203.5 180.5 6.5 136 0; ac3dsautoturn 2.713 ] ] 1;"
+        "sleep 115000 [ ac3dsbenchstep ac_venison [ ac3dsbenchreset; ac3dsbenchrun venison_default ] ] 1;"
+        "sleep 126000 [ ac3dsbenchstep ac_venison [ ac3dsbenchreset; ac3dssharedworldverts 1; ac3dsfastvertexoffsets 1; ac3dsbenchrun venison_shared_and_fast ] ] 1;"
+        "sleep 137000 [ ac3dsbenchstep ac_venison [ ac3dsbenchreset; ac3dsnostencilshadow 1; ac3dsbenchrun venison_no_stencil_shadows ] ] 1;"
+        "sleep 148000 [ ac3dsbenchstep ac_venison [ kickallbots; ac3dsbenchdone; ac3dsstats ] ] 1;";
+    conoutf("benchmark running: about two and a half minutes, results in the log");
+    execute(script);
+}
+COMMAND(ac3dsbench, "");
+
+#ifdef AC3DS_HEAPTRACK
+// Development build only: log the code addresses holding the most heap.
+COMMANDF(ac3dsheap, "s", (char *tag)
+{
+    extern void ac3ds_heap_report(void (*log)(const char *), const char *tag);
+    extern void ac3ds_heap_map(void (*log)(const char *), const char *tag);
+    ac3ds_heap_report([](const char *line) { clientlogf("%s", line); }, tag && *tag ? tag : "-");
+    ac3ds_heap_map([](const char *line) { clientlogf("%s", line); }, tag && *tag ? tag : "-");
+    if(clientlogfile) clientlogfile->fflush();
+});
+#endif
+
 void ac3dsprofile(int *intervals)
 {
     if(*intervals < 60 || *intervals > 3600)
@@ -187,10 +457,11 @@ void ac3ds_report_profile()
                    gpuTiming.samples, gpuTiming.drawSum / gpuTiming.samples, gpuTiming.drawPeak,
                    gpuTiming.procSum / gpuTiming.samples, gpuTiming.procPeak);
     extern float ac3ds_cpu_clock_ratio;
-    clientlogf("AC3DS_PERF map=%s mode=%d intervals=%u fps=%.3f p99_ms=%.3f max_ms=%.3f over20ms=%u vblanks=%u missed_vblanks=%u cpu_clock_ratio=%.2f",
+    extern int lod_factor();
+    clientlogf("AC3DS_PERF map=%s mode=%d intervals=%u fps=%.3f p99_ms=%.3f max_ms=%.3f over20ms=%u vblanks=%u missed_vblanks=%u cpu_clock_ratio=%.2f lod=%d",
                getclientmap(), gamemode, intervals, intervals * ticksPerSecond / ticks,
                p99Ticks * 1000.0 / ticksPerSecond, maxTicks * 1000.0 / ticksPerSecond,
-               over20ms, vblanks, missed, ac3ds_cpu_clock_ratio);
+               over20ms, vblanks, missed, ac3ds_cpu_clock_ratio, lod_factor());
     if(clientlogfile) clientlogfile->fflush();
 }
 #endif
@@ -816,18 +1087,44 @@ VAR(ac3dswaterworldcache, 0, 0, 1);
 VAR(ac3dssharedrefraction, 0, 1, 1);
 VARF(ac3dslatevblank, 0, 0, 1, ac3ds_gl_set_late_vblank(ac3dslatevblank));
 VARF(ac3dsfastvertexoffsets, 0, 0, 1, ac3ds_gl_set_fast_vertex_offsets(ac3dsfastvertexoffsets));
+// Upload the world vertex array once per pass and index every batch into it.
+// Off until timed on the handheld: Azahar's CPU timers show it 0.4 ms faster
+// on ac_douze, but Azahar does not model GPU time.
+VARF(ac3dssharedworldverts, 0, 0, 1, ac3ds_gl_set_shared_world_vertices(ac3dssharedworldverts != 0));
 VARF(ac3dsjoinedwatercommands, 0, 0, 1, ac3ds_gl_set_joined_water_commands(ac3dsjoinedwatercommands));
 // Clear the top screen's colour every frame. AssaultCube only clears it outside
 // the map because the world covers every pixel; any pixel left uncovered on the
 // handheld would otherwise keep old frames and smear moving objects into
 // stretched, repeated copies. One GPU fill; identical output where the world draws.
 VARP(ac3dsclearcolor, 0, 1, 1);
+// Diagnostic, not saved: clear the main view to magenta instead of the fog
+// colour, so a pixel no world or sky polygon covered cannot be mistaken for
+// fog. Magenta = nothing was drawn there; another room or a player showing
+// with no magenta = a depth-ordering fault.
+VAR(ac3dscleardebug, 0, 0, 1);
 // Diagnostic: near plane in hundredths of a unit (AssaultCube uses 0.15).
 VAR(ac3dsnear, 5, 15, 100);
-// Linear (W-buffer) depth for perspective draws, so fog matches desktop
-// AssaultCube. 0 restores the hyperbolic Z-buffer, whose fog table greys out
-// everything past about 19 units.
-VARF(ac3dslineardepth, 0, 1, 1, ac3ds_gl_set_linear_depth(ac3dslineardepth != 0));
+// Fog is computed per pixel from eye distance (procedural texture plus one
+// combiner stage), so it matches desktop AssaultCube with the ordinary
+// Z-buffer. 0 falls back to the GPU fog table, which is indexed by stored
+// depth and greys out everything past about 19 units under the Z-buffer.
+VARF(ac3dspixelfog, 0, 1, 1, ac3ds_gl_set_pixel_fog(ac3dspixelfog != 0));
+// Diagnostic: linear (W-buffer) depth for perspective draws, the build 11
+// default. Per-pixel fog does not need it, and it was the one depth change
+// before a see-through-walls report on the handheld (cause not isolated), so
+// the default is the Z-buffer that builds 1-10 used.
+VARF(ac3dslineardepth, 0, 0, 1, ac3ds_gl_set_linear_depth(ac3dslineardepth != 0));
+// The weapon in hand flashed and looked see-through while moving on the
+// handheld in build 13; Azahar never showed it. Build 14 takes the gun pass out
+// of the fog stage and gives it the top of the depth range to itself. These
+// two put either back, to tell on the handheld which one mattered.
+extern int ac3dsgunband;
+VARF(ac3dsgunfog, 0, 0, 1, ac3ds_gl_set_gun_isolation(ac3dsgunfog != 0, ac3dsgunband != 0));
+VARF(ac3dsgunband, 0, 1, 1, ac3ds_gl_set_gun_isolation(ac3dsgunfog != 0, ac3dsgunband != 0));
+// 1 holds a finished frame until the previous one is on screen. Without it a
+// quick frame straight after a late one is copied into the buffer still being
+// shown (a tear) and the late frame is never displayed.
+VARF(ac3dspresentguard, 0, 1, 1, ac3ds_gl_set_present_guard(ac3dspresentguard != 0));
 namespace
 {
     struct WaterWorldKey
@@ -893,6 +1190,22 @@ void drawreflection(float hf, int w, int h, float changelod, bool refract)
         if(refracttex) glDeleteTextures(1, &refracttex);
         reflecttex = refracttex = 0;
     }
+#ifdef __3DS__
+    GLuint &texture = refract ? refracttex : reflecttex;
+    if(!texture)
+    {
+        glGenTextures(1, &texture);
+        createtexture(texture, size, size, NULL, 3, false, false, GL_RGB);
+        if(!ac3ds_gl_texture_ready(texture))
+            clientlogf("PICA: %s render target allocation failed (%dx%d)", refract ? "refraction" : "reflection", size, size);
+        reflectlastsize = size;
+    }
+    if(!ac3ds_gl_render_to_texture(texture))
+    {
+        reflecting = refracting = false;
+        return;
+    }
+#else
     if(!reflecttex || (waterrefract && !refracttex))
     {
         if(!reflecttex)
@@ -906,13 +1219,6 @@ void drawreflection(float hf, int w, int h, float changelod, bool refract)
             createtexture(refracttex, size, size, NULL, 3, false, false, GL_RGB);
         }
         reflectlastsize = size;
-    }
-
-#ifdef __3DS__
-    if(!ac3ds_gl_render_to_texture(refract ? refracttex : reflecttex))
-    {
-        reflecting = refracting = false;
-        return;
     }
 #endif
     extern float wsx1, wsx2, wsy1, wsy2;
@@ -1151,6 +1457,19 @@ void clearminimap()
 COMMAND(clearminimap, "");
 VARFP(minimapres, 7, 9, 10, clearminimap());
 #ifdef __3DS__
+void ac3ds_reset_map_targets()
+{
+    // Keep failed IDs during a map to avoid retrying allocations every frame.
+    // A new map can have more VRAM available, even at the same target size.
+    GLuint *targets[] = { &minimaptex, &reflecttex, &refracttex };
+    for(GLuint *texture : targets) if(*texture && !ac3ds_gl_texture_ready(*texture))
+    {
+        glDeleteTextures(1, texture);
+        *texture = 0;
+    }
+    ac3ds_minimap_reset();
+}
+
 // World-space square the minimap texture covers, for the lower-screen radar.
 bool ac3ds_minimap_info(unsigned &tex, float &x0, float &y0, float &span)
 {
@@ -1184,6 +1503,10 @@ void drawminimap(int w, int h)
         glGenTextures(1, &minimaptex);
         createtexture(minimaptex, size, size, NULL, 3, false, false, GL_RGB);
         minimaplastsize = size;
+#ifdef __3DS__
+        if(!ac3ds_gl_texture_ready(minimaptex))
+            clientlogf("PICA: minimap render target allocation failed (%dx%d)", size, size);
+#endif
     }
 #ifdef __3DS__
     if(!ac3ds_gl_render_to_texture(minimaptex)) return;
@@ -1252,6 +1575,8 @@ void drawminimap(int w, int h)
     minimap = false;
 #ifdef __3DS__
     ac3ds_gl_render_to_screen();
+    extern void ac3ds_trim_world_vertices();
+    ac3ds_trim_world_vertices();
 #else
     glBindTexture(GL_TEXTURE_2D, minimaptex);
     glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, size, size);
@@ -1263,7 +1588,6 @@ void drawminimap(int w, int h)
     glViewport(0, 0, w, h);
     glClearDepth(1.0);
 #ifdef __3DS__
-    extern void ac3ds_minimap_updated();
     ac3ds_minimap_updated();
 #endif
 }
@@ -1428,6 +1752,7 @@ COMMANDF(ac3dsqaaim, "", ()
 // QA: move the player along the view direction to `dist` units from the wall ahead.
 COMMANDF(ac3dsqaapproach, "f", (float *dist)
 {
+    if(multiplayer("ac3dsqaapproach")) return; // QA teleports never run on a server
     const vec dir(sinf(RAD*player1->yaw)*cosf(RAD*player1->pitch), -cosf(RAD*player1->yaw)*cosf(RAD*player1->pitch), sinf(RAD*player1->pitch));
     const vec far = vec(dir).mul(500).add(player1->o);
     vec hit = far;
@@ -1443,6 +1768,7 @@ COMMANDF(ac3dsqaapproach, "f", (float *dist)
 // QA: stand on dry ground near the first water cell and look at it.
 static void qawater()
 {
+    if(multiplayer("ac3dsqawater")) return;
     for(int y = MINBORD; y < ssize-MINBORD; ++y) for(int x = MINBORD; x < ssize-MINBORD; ++x)
     {
         sqr *w = S(x, y);
@@ -1465,6 +1791,7 @@ static void qawater()
             player1->vel = vec(0, 0, 0);
             player1->resetinterp();
             player1->yaw = atan2f(float(x - sx), float(sy - y))/RAD;
+            if(player1->yaw < 0) player1->yaw += 360; // the world LOD rectangle assumes 0..360
             player1->pitch = -20;
             clientlogf("qa: water at %d %d, standing at %d %d facing yaw %.0f", x, y, sx, sy, player1->yaw);
             return;
@@ -1477,6 +1804,7 @@ COMMANDN(ac3dsqawater, qawater, "");
 // QA: stand `dist` units from the nearest live player or bot, facing it.
 static void qafacebot(float *dist)
 {
+    if(multiplayer("ac3dsqafacebot")) return;
     playerent *best = NULL;
     float bestd = 1e9f;
     loopv(players) if(players[i] && players[i]->state == CS_ALIVE)
@@ -1494,6 +1822,7 @@ static void qafacebot(float *dist)
     player1->vel = vec(0, 0, 0);
     player1->resetinterp();
     player1->yaw = atan2f(-back.x, back.y)/RAD;
+    if(player1->yaw < 0) player1->yaw += 360;
     player1->pitch = -8;
     clientlogf("qa: facing %s from %.1f units", best->name, *dist);
 }
@@ -1541,6 +1870,10 @@ void gl_drawframe(int w, int h, float changelod, float curfps, int elapsed)
 #endif
     extern int mapoverride_nostencilshadows, mapoverride_nowaterreflect;
     effective_stencilshadow = mapoverride_nostencilshadows && !ignoreoverride_nostencilshadows ? 0 : stencilshadow;
+#ifdef __3DS__
+    extern int ac3dsnostencilshadow;
+    if(ac3dsnostencilshadow) effective_stencilshadow = 0;
+#endif
     bool effective_waterreflect = waterreflect && !editmode && (!mapoverride_nowaterreflect || ignoreoverride_nowaterreflect);
 
 #ifdef __3DS__
@@ -1611,11 +1944,16 @@ void gl_drawframe(int w, int h, float changelod, float curfps, int elapsed)
 
     if(effective_stencilshadow && hasstencil && stencilbits >= 8) glClearStencil((hasSTS || hasST2) && !hasSTW ? 128 : 0);
 #ifdef __3DS__
-    const bool clearcolor = outsidemap(camera1) || ac3dsclearcolor;
+    const bool clearcolor = outsidemap(camera1) || ac3dsclearcolor || ac3dscleardebug;
+    if(ac3dscleardebug) glClearColor(1, 0, 1, 1);
 #else
     const bool clearcolor = outsidemap(camera1);
 #endif
     glClear((clearcolor ? GL_COLOR_BUFFER_BIT : 0) | GL_DEPTH_BUFFER_BIT | (effective_stencilshadow && hasstencil && stencilbits >= 8 ? GL_STENCIL_BUFFER_BIT : 0));
+#ifdef __3DS__
+    // The water passes clear their own targets with the current clear colour.
+    if(ac3dscleardebug) glClearColor(fogc[0], fogc[1], fogc[2], 1.0f);
+#endif
 
     glEnable(GL_TEXTURE_2D);
 
@@ -1661,6 +1999,7 @@ void gl_drawframe(int w, int h, float changelod, float curfps, int elapsed)
     worldPhase.stop();
     extern vector<vertex> verts;
     const int mainWorldVertices = verts.length();
+    ac3dsLastWorldVertices = mainWorldVertices;
     const bool projectWater = !underwater && effective_waterreflect && ac3ds_water_bounds(hf);
     if(projectWater) ac3ds_begin_scene_models();
     if(projectWater)
@@ -1671,7 +2010,7 @@ void gl_drawframe(int w, int h, float changelod, float curfps, int elapsed)
         const float mainSkyFloor = skyfloor;
         resettmu(0);
         drawreflection(hf, w, h, 1.f, false);
-        if(waterrefract) drawreflection(hf, w, h, 1.f, true);
+        if(waterrefract && ac3ds_gl_texture_ready(reflecttex)) drawreflection(hf, w, h, 1.f, true);
         nquads = mainQuads;
         skyfloor = mainSkyFloor;
         glEnable(GL_TEXTURE_2D);
@@ -1741,7 +2080,7 @@ void gl_drawframe(int w, int h, float changelod, float curfps, int elapsed)
     GLuint waterrefraction = !effective_waterreflect || !waterrefract || underwater ? 0 : refracttex;
 #ifdef __3DS__
     if(!projectWater || !ac3ds_gl_texture_ready(waterreflection)) waterreflection = 0;
-    if(!projectWater || !ac3ds_gl_texture_ready(waterrefraction)) waterrefraction = 0;
+    if(!waterreflection || !ac3ds_gl_texture_ready(waterrefraction)) waterrefraction = 0;
 #endif
 #ifdef __3DS__
     Ac3dsPhaseTimer waterPhase(Ac3dsPhase::Water);

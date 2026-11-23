@@ -1,19 +1,22 @@
 ; Projection-texture program for unit zero (water reflection and refraction).
 ; Same uniform layout as cube_vertex.v.pica. The homogeneous q has its own
 ; output register so every register is still written in full, exactly once.
-.fvec transform[4], tex0[3], tex1[3], flatColor, colorScale
+.fvec transform[4], tex0[3], tex1[3], flatColor, colorScale, fogCoord
 .constf constants(0.0, 1.0, 0.0, 0.0)
 .out outpos position
 .out outclr color
 .out uv0 texcoord0
 .out uv1 texcoord1
 .out outq texcoord0w
+.out fog texcoord2
 .entry projective_main
 .proc projective_main
     dp4 r2.x, transform[0], v0
     dp4 r2.y, transform[1], v0
     dp4 r2.z, transform[2], v0
     dp4 r2.w, transform[3], v0
+    mov r7, constants.xxxy
+    dp4 r7.x, fogCoord, v0
     mul r3, colorScale.xxxx, v1
     add r3, flatColor, r3
     mov r0.xyz, v2
@@ -34,5 +37,6 @@
     mov uv0, r4
     mov uv1, r5
     mov outq, r6.xxxx
+    mov fog, r7
     end
 .end

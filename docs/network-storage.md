@@ -2,7 +2,7 @@
 
 The 3DS client uses the Lockdown Edition v1.3.0.2 gameplay and network code with a libctru socket adapter for the bundled ENet 1.3.6. The AssaultCube wire protocol remains 1300. The original server browser, favourites, LAN discovery, direct IPv4 or hostname connections, master list, authentication, votes, administration, coop editing and HTTP media downloads use the same engine entry points as the desktop game. Offline play can start if the 3DS socket service fails to initialize.
 
-Base assets are read from the 3DSX RomFS when present. An SD asset layout uses `sdmc:/3ds/assaultcube/` with the release’s `config/`, `packages/` and `bot/` directories. In either layout, the default writable profile is `sdmc:/3ds/assaultcube/profile/`. The game looks there for overrides before falling back to base assets. The directory is created as needed.
+Base assets are read from the 3DSX RomFS when present. Otherwise they come from `sdmc:/3ds/assaultcube/assets.romfs`, one RomFS image file that the game mounts as `romfs:` in place of the built-in one, or, without that file, from loose `config/`, `packages/` and `bot/` directories of the release in `sdmc:/3ds/assaultcube/`. An engine-only build that finds none of the three offers to download the official package and write the image file itself ([first-run download](first-run-download.md)). The image is read-only and is only ever replaced whole; deleting it removes the game data and nothing else. In every layout, the default writable profile is `sdmc:/3ds/assaultcube/profile/`. The game looks there for overrides before falling back to base assets. The directory is created as needed.
 
 | Relative to `sdmc:/3ds/assaultcube/profile/` | Contents |
 | --- | --- |
@@ -13,7 +13,7 @@ Base assets are read from the 3DSX RomFS when present. An SD asset layout uses `
 | `demos/`, `screenshots/` | Demo files, screenshots and map shots. |
 | `logs/` | Dedicated server logs by default. The client uses `clientlog.txt` in the profile root. |
 
-Native initialization and saved settings retain the original rotated backups. The port stages each replacement on SD and flushes its data before renaming it into place. If an interrupted replacement leaves the target missing, reads can fall back to its `.ac-prev` copy. The same staged write is used for individual downloaded media files and incoming map files. A multi-file upload or media archive is written one file at a time.
+Native initialization and saved settings retain the original rotated backups. The port stages each replacement on SD and flushes its data before renaming it into place. If an interrupted replacement leaves the target missing, reads can fall back to its `.ac-prev` copy. Incoming map files use the same staged write. A downloaded media file that is not on the card yet is written beside its target and renamed when complete, without the flush: nothing is replaced, and each extra SD operation is felt on a map change. A multi-file upload or media archive is written one file at a time.
 
 ## Hosting a dedicated server
 
