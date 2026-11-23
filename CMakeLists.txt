@@ -121,7 +121,7 @@ target_include_directories(assaultcube PRIVATE source/src source/src/bot source/
     "${DEVKITPRO}/portlibs/3ds/include" "${DEVKITPRO}/libctru/include")
 target_compile_definitions(assaultcube PRIVATE $<$<BOOL:${AC3DS_PRODUCTION}>:PRODUCTION> AC3DS_BUILD_NUMBER=${AC3DS_BUILD_NUMBER} "AC3DS_RELEASE_NAME=\"${AC3DS_LAUNCHER_TITLE}\"")
 target_compile_options(assaultcube PRIVATE -O3 -fsigned-char -ffunction-sections -fdata-sections -fno-strict-aliasing)
-target_link_options(assaultcube PRIVATE -Wl,--gc-sections -Wl,--wrap=GX_ProcessCommandList -Wl,--wrap=gspSubmitGxCommand -Wl,--wrap=abort -Wl,--wrap=svcBreak "-Wl,-Map,${CMAKE_CURRENT_BINARY_DIR}/assaultcube.map")
+target_link_options(assaultcube PRIVATE -Wl,--gc-sections -Wl,--wrap=GX_ProcessCommandList -Wl,--wrap=gspSubmitGxCommand -Wl,--wrap=GX_BindQueue -Wl,--wrap=abort -Wl,--wrap=svcBreak "-Wl,-Map,${CMAKE_CURRENT_BINARY_DIR}/assaultcube.map")
 # The small-block allocator (source/3ds/smallpool_3ds.cpp) sits in front of newlib's malloc family.
 target_link_options(assaultcube PRIVATE -Wl,--wrap=_malloc_r -Wl,--wrap=_free_r -Wl,--wrap=_realloc_r
     -Wl,--wrap=_calloc_r -Wl,--wrap=_memalign_r)

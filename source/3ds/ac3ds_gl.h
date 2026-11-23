@@ -186,6 +186,8 @@ void ac3ds_gl_startup_state(uint32_t out[6]);
 // Watchdog samples, without service calls: GX count/command id, GX result,
 // command-list bytes, last observed top VBlank and completed present waits.
 void ac3ds_gl_runtime_state(uint32_t out[5]);
+// Times a GX queue that stopped advancing with the GPU idle was cleared.
+uint32_t ac3ds_gl_queue_recoveries();
 bool ac3ds_gl_queue_readback_565(GLuint id, uint16_t **out, int *outw, int *outh);
 bool ac3ds_gl_drain_startup_frame(uint32_t &gpuStatus, int32_t &readResult);
 void ac3ds_gl_set_late_vblank(bool enabled);

@@ -27,6 +27,16 @@ extern const unsigned int cube_vertex_shbin_size;
 Result __real_GX_ProcessCommandList(u32 *buffer, u32 bytes, u8 flags);
 
 Result __real_gspSubmitGxCommand(const u32 command[8]);
+// Citro3D keeps its GX queue private; remember it when it is bound so a queue
+// that stops advancing can be cleared.
+void __real_GX_BindQueue(gxCmdQueue_s *queue);
+gxCmdQueue_s *ac3dsGxQueue = nullptr;
+std::atomic<u32> ac3dsQueueRecoveries{0};
+void __wrap_GX_BindQueue(gxCmdQueue_s *queue)
+{
+    ac3dsGxQueue = queue;
+    __real_GX_BindQueue(queue);
+}
 
 Result __wrap_gspSubmitGxCommand(const u32 command[8])
 {
@@ -506,6 +516,20 @@ bool startFrame(bool sync, const char *vblankPhase = "GPU frame start VBlank", c
     bool started;
     {
         Ac3dsPhaseScope phase(queuePhase);
+        // On the handheld the queue has twice stopped advancing with the GPU
+        // idle (builds 14 and 22): a command finished and its completion never
+        // reached the queue, and the wait below then never returned. Give the
+        // queue two seconds; if the GPU is idle by then, drop what is left of
+        // that frame and carry on. One picture is lost instead of the game.
+        while(ac3dsGxQueue && !gxCmdQueueWait(ac3dsGxQueue, 2000000000LL))
+        {
+            u32 busy = 0;
+            if(R_SUCCEEDED(GSPGPU_ReadHWRegs(0x400034,&busy,sizeof(busy))) && (busy & 0xcc000000)) continue;
+            gxCmdQueueStop(ac3dsGxQueue);
+            gxCmdQueueClear(ac3dsGxQueue);
+            ac3ds_crash_note_event("gx queue cleared", int(ac3dsQueueRecoveries.fetch_add(1, std::memory_order_relaxed)+1));
+            break;
+        }
         started = C3D_FrameBegin(0);
     }
     queue.stop();
@@ -2105,6 +2129,7 @@ void ac3ds_gl_startup_state(uint32_t out[6])
     out[5] = osGetMemRegionFree(MEMREGION_APPLICATION);
 }
 
+uint32_t ac3ds_gl_queue_recoveries() { return ac3dsQueueRecoveries.load(std::memory_order_relaxed); }
 void ac3ds_gl_runtime_state(uint32_t out[5])
 {
     out[0] = ac3dsGxSubmit.load(std::memory_order_relaxed);

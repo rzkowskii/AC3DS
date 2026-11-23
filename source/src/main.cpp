@@ -2148,6 +2148,13 @@ int main(int argc, char **argv)
             ac3dsdiag();
             if(clientlogfile) clientlogfile->fflush();
         }
+        static uint32_t queueRecoveries = 0;
+        if(ac3ds_gl_queue_recoveries() != queueRecoveries)
+        {
+            queueRecoveries = ac3ds_gl_queue_recoveries();
+            clientlogf("AC3DS_QUEUE cleared a stuck GX queue at frame %d (%u so far)", frames, unsigned(queueRecoveries));
+            if(clientlogfile) clientlogfile->fflush();
+        }
 #endif
         pollautodownloadresponse();
         if(onceauthed && sk)

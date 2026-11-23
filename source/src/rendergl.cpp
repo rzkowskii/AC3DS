@@ -160,10 +160,10 @@ void ac3dsdiag()
     uint32_t gl[5];
     ac3ds_gl_runtime_state(gl);
     static uint32_t lastwaits = 0;
-    clientlogf("AC3DS_DIAG aim %d sway %d guard %d late %d band %d fog %d | gun jump %d/1000 depth %d/1000 weapon %d %d ms after shot, aim off %.2f deg | %u frames held",
+    clientlogf("AC3DS_DIAG aim %d sway %d guard %d late %d band %d fog %d | gun jump %d/1000 depth %d/1000 weapon %d %d ms after shot, aim off %.2f deg | %u frames held, %u queue recoveries",
         ac3dsgunaim, nosway ? 0 : 1, ac3dspresentguard, ac3dslatevblank, ac3dsgunband, ac3dsgunfog,
         ac3dsGunTrace.jump, ac3dsGunTrace.depth, ac3dsGunTrace.weapon, ac3dsGunTrace.sinceShot, ac3dsGunTrace.aimoff,
-        unsigned(gl[4]-lastwaits));
+        unsigned(gl[4]-lastwaits), unsigned(ac3ds_gl_queue_recoveries()));
     lastwaits = gl[4];
     ac3dsGunTrace = Ac3dsGunTrace();
 }
