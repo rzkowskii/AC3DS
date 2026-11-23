@@ -1,5 +1,35 @@
 # Development and verification status
 
+## Where things stand (build 26, `AC-3DS0v1.14`)
+
+This summary is kept current. Everything below it is the development log in the order it happened, and is left as written; earlier entries describe earlier builds.
+
+**On a real console (New 2DS XL, Luma3DS, Homebrew Launcher)**
+
+- The game starts, runs in 804 MHz mode with 124 MB of application memory, and plays bot matches and online matches on public PC servers (protocol 1300). Logged frames during online play are mostly 13 to 19 ms.
+- Maps timed on the console load in 1.1 to 3.3 seconds, and in 2.5 to 4 seconds from the data build 24 downloaded.
+- The first-run download of build 24 completed on the console, verified the official package, unpacked it and the game ran from it. It took 1,881 seconds, about 31 minutes.
+- Builds run on the console so far: 10 to 14, 21, 22 and 24.
+
+**In the Azahar emulator only**
+
+- Build 26's one-file download (`assets.romfs`, 74 seconds in the emulator), mounting that file and loading maps from it.
+- A file made by the one-file builder booting and loading maps.
+- The scripted checks of what builds 21 and 22 added: the touch weapon picker, the SCOPE button, the scoreboard paging, release-to-select menus, the server browser JOIN behaviour and the Diagnostics page. Builds 21, 22 and 24 have been played on the console, but these have no recorded console test.
+- The GPU queue recovery of build 23. It cannot be triggered in the emulator, and no recovery has been recorded on the console yet.
+- The dedicated server, demo playback, the map editor and all 44 maps with bots in rotation.
+- All frame-rate figures given as FPS. Azahar does not model GPU time.
+
+**Open**
+
+- The weapon in hand can ghost or flicker while moving on the console, most noticeably with the sniper rifle. Not reproduced in the emulator and not fixed.
+- A rare freeze where the GPU queue stops advancing (builds 14 and 22 on the console). Build 23 recovers instead of hanging; the cause is unknown.
+- Build 26's download has not been timed on a console.
+
+These are described for players in [Known issues](known-issues.md).
+
+## Development log
+
 The native ARM 3DSX builds with devkitARM and packages 1,979 assets from the supplied Lockdown Edition release. Azahar 2126.1.2 ran the application in New 3DS mode with its Vulkan backend at native resolution. The tested build, emulator configuration, guest log and observed files are retained per run in `build-azahar/`. See [emulator QA](emulator-qa.md) for reproduction and coverage.
 
 | Surface | Observed in Azahar | Remaining |

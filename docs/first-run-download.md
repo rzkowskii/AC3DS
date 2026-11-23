@@ -6,6 +6,13 @@ The manual route still works and gives the game the same files: stage the archiv
 
 ## What the player sees
 
+| | | |
+| :---: | :---: | :---: |
+| ![The offer on the touch screen](screenshots/first-run-offer.png) | ![The progress page on the touch screen](screenshots/first-run-progress.png) | ![The result page: the official AssaultCube 1.3.0.2 game data is on the SD card, starting AssaultCube](screenshots/first-run-installed.png) |
+| The offer | The transfer | The result |
+
+All three are the touch screen of build 26 in Azahar, fetching from the official address.
+
 The game takes its data from the first of three places that has it (it looks for `config/font.cfg` and `packages/misc/notexture.jpg`): the `.3dsx` itself (RomFS, an asset-embedded build), the file `sdmc:/3ds/assaultcube/assets.romfs`, or loose `config` and `packages` folders in `sdmc:/3ds/assaultcube/`. The offer appears only when none has it. A build or SD card that already has the data starts exactly as before, and that includes a card with loose folders from a manual installation or from the download of build 24: they are read where they are and never converted or touched.
 
 1. **Offer.** The lower screen says that the game data is AssaultCube's, that it is fetched unmodified from the official AssaultCube 1.3.0.2 release and is free for non-commercial use under the AssaultCube licence, and names <https://assault.cubers.net/download.html> and the licence page. It shows the download size (about 52 MB), the SD card space needed and free, and that Wi-Fi is needed. **A** downloads; **B** or **START** quits. Nothing is contacted before A is pressed.
@@ -91,6 +98,8 @@ worker=0                          unpack on the main thread, as on a console wit
 and trusts one more root from `firstrun-test-root.pem` beside it. `scripts/qa/firstrun-server.py OUT` serves a stand-in archive over HTTPS on `localhost` with a throwaway certificate authority, and writes both files for each scenario (`ok`, `redirect`, `wrong-hash`, `404`, `truncated`, `stall`, `short`) under `OUT/`; pass them to `scripts/run-azahar.py` with `--sd-file`. The scenarios also cover a redirect to another host (`away`), a redirect to plain http (`downgrade`), a certificate from an unknown authority (`untrusted`) and a certificate for another name (`wrong-name`).
 
 ## Test status
+
+This section describes build 26 (`AC-3DS0v1.14`). The open points are summarised for players in [known issues](known-issues.md).
 
 The one-file layout has been run on the host and in Azahar. **It has not been run on a console.** The only console run of the download is build 24's, into loose folders, on a New 2DS XL: it installed a working game and took 1,881 s (see above). Azahar's timings say nothing about a New 3DS: its SD card and CPU costs are the emulator's, and its SD card writes are nearly free where the console's are the main cost.
 

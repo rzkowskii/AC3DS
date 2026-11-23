@@ -1,5 +1,7 @@
 # AssaultCube emulator QA
 
+The runner targets Azahar 2126.2. Build 26 was checked in it for the first-run download, mounting `assets.romfs` and loading maps; the fixture results in [development status](port-status.md) name the build each was run on. Nothing on this page is a console result; what has been run on a New 2DS XL is summarised at the top of that page.
+
 Use Azahar in New 3DS mode and keep its emulated CPU clock at 100% for baseline measurements. Record the emulator build, graphics backend, CPU clock, 3DSX and ELF digests, and DSP firmware digest with each result. Measurements at another CPU clock can help diagnose a bottleneck. Frame submission timing and missed VBlanks in Azahar measure the emulator guest. Measure sustained delivery on the target handheld separately.
 
 ## Run a fixture
@@ -90,3 +92,19 @@ build-azahar/azahar-keys "$azahar_pid" UP .7 WAIT .2 Q .6 WAIT .3 Z .2 WAIT 2.8 
 ```
 
 The helper requires macOS Accessibility access. Focus Azahar’s game view before driving it. The sequence fires before each reload, first with X and then with the touchscreen. Verify the guest’s movement, fire, physical and touch reload markers and inspect `screenshots/qa_hid_touch.png`. If the virtual touch fails to reach the guest, focus the game view and click RELOAD on the bottom screen after firing the second time.
+
+## Screenshots of both screens
+
+`screenshot NAME` saves the top screen (400×240) and `bottomshot NAME` the touch screen (320×240, BMP) to `profile/screenshots/` at native resolution, from the game itself and not from the emulator window. `screenshottype 2` selects PNG for the top screen. `ac3dsqatouch X Y TAPS HOLD_MS GAP_MS` taps the touch screen through the normal input path, `showmenu NAME` opens a menu, and `ac3dspose X Y Z YAW PITCH` places the camera offline. The pictures in the README were made this way: a script of timed `sleep MS [ ... ] 1` steps passed through `--guest-args` as `-eexec "config/qa.cfg"`, with the script in the seeded profile.
+
+## First-run download and builder
+
+These have their own checks, outside the fixture table:
+
+| Check | What it covers |
+| --- | --- |
+| `scripts/qa/firstrun-test.py --archive ARCHIVE` | Host build of the download's portable half: hash, address and header parsing, path rules, hostile archives, and the written image read back the way libctru reads it |
+| `scripts/qa/firstrun-server.py OUT` with a `-DAC3DS_FIRSTRUN_TEST=ON` development build | The console half in Azahar against a local HTTPS server: redirects, wrong hash, truncated and stalled bodies, untrusted certificates |
+| `scripts/qa/check-make-3dsx.py ARCHIVE ENGINE.3dsx` | The one-file builder, Python and JavaScript, against the archive and against `3dsxtool` |
+
+Results are in [first-run download](first-run-download.md#test-status) and [builder](builder.md#tests).

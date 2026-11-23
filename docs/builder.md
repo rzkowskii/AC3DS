@@ -7,7 +7,14 @@ There are two front ends with the same result, byte for byte:
 - `tools/builder/`: a web page that does the work in the browser tab. Nothing is installed and nothing is uploaded.
 - `scripts/make-3dsx.py`: a command-line script that needs only Python 3.
 
-Neither needs devkitPro.
+Neither needs devkitPro. Step-by-step instructions for players are in the [README](../README.md#route-2-build-one-file-in-your-browser).
+
+| | |
+| :---: | :---: |
+| ![The builder page as it opens, light mode](screenshots/builder-light.png) | ![The builder page after a build, light mode, with the Save button](screenshots/builder-light-done.png) |
+| As it opens | After a build |
+| ![The builder page as it opens, dark mode](screenshots/builder-dark.png) | ![The builder page after a build, dark mode](screenshots/builder-dark-done.png) |
+| Dark mode follows the system setting | |
 
 ## Inputs
 
@@ -78,3 +85,14 @@ python3 scripts/qa/check-make-3dsx.py ARCHIVE ENGINE.3dsx \
 - Feeds both builders a wrong file, a cut-off archive, an archive with one changed bit, an engine that already has RomFS, a non-3DSX file and another program's 3DSX, and checks that nothing is written.
 
 These checks run on the host. Booting the built file is a separate test, and an Azahar boot is not a handheld result.
+
+## Status
+
+Build 26. What has and has not been run:
+
+- The host checks above pass for the official archive and the build 26 engine, Python and JavaScript (`--node`). The command-line builder writes a 63,724,412-byte file from them.
+- The page was driven in Chrome from `http://localhost` for the pictures on this page: both files accepted, the build completed, and the page offered a 63.7 MB file to save. The page checks its own result against the pinned image size and SHA-256 before it offers the file.
+- A built file has booted and loaded maps in Azahar. **None has been run on a console yet.**
+- **Safari has not been tested.**
+
+See [known issues](known-issues.md).
